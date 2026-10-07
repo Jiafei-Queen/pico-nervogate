@@ -1,0 +1,6 @@
+FROM scratch
+COPY pico-nervogate /pico-nervogate
+COPY examples/gateway.min.toml /gateway.toml
+ENV GATEWAY_CONFIG=/gateway.toml
+EXPOSE 8787
+ENTRYPOINT ["/pico-nervogate"]

@@ -1,0 +1,26 @@
+# Minimal generic config. Point base_url at any OpenAI-compatible endpoint.
+
+listen = "0.0.0.0:8787"
+
+# Bearer key is read from this env var.
+api_key_env = "MY_API_KEY"
+
+default_base_url = "https://api.example.com/v1"
+
+# Optional: values advertised by GET /v1/models.
+# owned_by = "my-provider"
+# provider = "my-provider"
+
+# Optional: send a stable session header upstream.
+# session_header = "x-session-id"
+# session_id = "my-client"
+
+# Optional: extra headers applied to every upstream request.
+# [extra_headers]
+# X-Custom = "value"
+
+# protocol: "chat" | "anthropic" | "responses"
+[[models]]
+name = "my-model"
+protocol = "chat"
+vision = false

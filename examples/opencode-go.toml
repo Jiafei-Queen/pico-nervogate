@@ -1,0 +1,165 @@
+# Example: a coding-model subscription service (OpenCode Go).
+# Provided as a working reference. This project is not affiliated with that
+# service; the header names / model ids below are service-specific examples.
+
+listen = "0.0.0.0:8787"
+
+# API key (Bearer). Prefer the env var over an inline key.
+api_key_env = "OPENCODE_GO_API_KEY"
+
+# The service asks for a stable session id header so requests are attributed
+# consistently (value is arbitrary). The gateway just forwards it verbatim.
+session_header = "x-opencode-session"
+session_id = "webui"
+user_agent = "pico-nervogate/0.1"
+
+# All three protocols share the same host/version prefix.
+default_base_url = "https://opencode.ai/zen/go/v1"
+
+# Advertised via GET /v1/models.
+owned_by = "opencode-go"
+provider = "opencode-go"
+
+# `vision = true` marks models that accept image input; it is advertised to
+# clients via /v1/models as info.meta.capabilities.vision.
+
+# --- /v1/chat/completions (OpenAI-compatible, pass-through) ---
+[[models]]
+name = "glm-5.3-flash"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "glm-5.3"
+protocol = "chat"
+
+[[models]]
+name = "glm-5.2"
+protocol = "chat"
+
+[[models]]
+name = "kimi-k3"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "kimi-k2.7-code"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "kimi-k2.6"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "longcat-2.0"
+protocol = "chat"
+
+[[models]]
+name = "longcat-2.5-preview-free"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "deepseek-v4.1-flash"
+protocol = "chat"
+
+[[models]]
+name = "deepseek-v4-pro"
+protocol = "chat"
+
+[[models]]
+name = "deepseek-v4-flash"
+protocol = "chat"
+
+[[models]]
+name = "deepseek-v4-flash-vision-exp"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "mimo-v2.6-flash"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "mimo-v2.6-pro"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "mimo-v2.5"
+protocol = "chat"
+vision = true
+
+[[models]]
+name = "mimo-v2.5-pro"
+protocol = "chat"
+
+[[models]]
+name = "hy4-preview"
+protocol = "chat"
+
+[[models]]
+name = "hy3"
+protocol = "chat"
+
+[[models]]
+name = "space-bunny"
+protocol = "chat"
+vision = true
+
+# --- /v1/messages (Anthropic Messages, translated) ---
+[[models]]
+name = "minimax-m3"
+protocol = "anthropic"
+vision = true
+
+[[models]]
+name = "minimax-m2.7"
+protocol = "anthropic"
+
+[[models]]
+name = "qwen3.8-max"
+protocol = "anthropic"
+vision = true
+
+[[models]]
+name = "qwen3.8-flash"
+protocol = "anthropic"
+vision = true
+
+[[models]]
+name = "qwen3.7-plus"
+protocol = "anthropic"
+vision = true
+
+# --- /v1/responses (OpenAI Responses, translated) ---
+[[models]]
+name = "grok-4.7"
+protocol = "responses"
+vision = true
+
+[[models]]
+name = "grok-4.6"
+protocol = "responses"
+vision = true
+
+[[models]]
+name = "gpt-6-luna"
+protocol = "responses"
+vision = true
+
+[[models]]
+name = "gpt-5.6-luna"
+protocol = "responses"
+vision = true
+
+[[models]]
+name = "muse-spark-1.3-contributor"
+protocol = "responses"
+
+[[models]]
+name = "muse-spark-1.2-contributor"
+protocol = "responses"

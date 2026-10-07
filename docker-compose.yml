@@ -1,0 +1,12 @@
+services:
+  pico-nervogate:
+    image: pico-nervogate:arm64
+    container_name: pico-nervogate
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GATEWAY_CONFIG: /gateway.toml
+    volumes:
+      - ./gateway.local.toml:/gateway.toml:ro
+    ports:
+      - "127.0.0.1:8787:8787"
