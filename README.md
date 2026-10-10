@@ -16,13 +16,17 @@ under 1 MB of resident memory.
 
 ## Features
 
-- **Three protocol surfaces**, one upstream:
+- **Three protocol surfaces**, one upstream, all translated both ways:
   - `POST /v1/chat/completions` — OpenAI Chat Completions (pass-through)
   - `POST /v1/responses` — OpenAI Responses API (translated to/from Chat)
-  - Anthropic Messages (`/v1/messages` upstream, translated to/from Chat via `/v1/chat/completions`)
+  - `POST /v1/messages` — Anthropic Messages (translated to/from Chat)
+  Each model's `protocol` picks the upstream wire format (`chat` /
+  `anthropic` / `responses`), so any client surface can reach any upstream.
 - **Full header pass-through** plus global (`[extra_headers]`) and per-model headers.
-- **Streaming**: server-sent events are parsed and re-emitted so streamed
-  responses also come back in the client's protocol.
+- **Streaming**: server-sent events are parsed and re-emitted in the client's
+  own framing — Chat (`data:` chunks + `[DONE]`), Responses (`response.*`
+  events), and Anthropic (`event:` + `data:` lines, `message_start` …
+  `message_stop`).
 - **Config-driven models**: each model declares a `protocol`, optional
   `base_url`, `upstream` id and `vision` flag.
 - **models.dev enrichment** (opt-in `[models_dev]`): vision/modality, prices,
@@ -42,6 +46,7 @@ under 1 MB of resident memory.
 | GET | `/v1/models` | list configured models (OpenAI model list shape) |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions in/out |
 | POST | `/v1/responses` | OpenAI Responses in → Chat up → Responses out |
+| POST | `/v1/messages` | Anthropic Messages in → Chat up → Anthropic out |
 
 ## Quick start
 
@@ -143,6 +148,24 @@ The upstream service is expected to own protocol correctness. This gateway does
 not invent endpoints: it forwards to whichever endpoint each model declares and
 only translates the request/response bodies (and re-frames SSE) so a client can
 use a protocol the upstream does not natively expose.
+
+Translation details worth knowing:
+
+- **Tool calls** round-trip in all directions (`function_calls` ↔ `tool_use` ↔
+  `function_call` items), including multi-call turns and tool results.
+- **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
+  Chat shape (with `reasoning_effort` ↔ `thinking.budget_tokens` ↔
+  `reasoning.effort` parameter mapping). Anthropic thinking block *signatures*
+  are not preserved across protocols (they arrive as `""`), so multi-turn
+  thinking replay against a strict Anthropic upstream may be rejected.
+- **Responses statefulness**: the gateway is stateless. `previous_response_id`
+  and `background` are rejected with HTTP 400 (they need server-side response
+  storage and polling endpoints); `store` is ignored (upstream requests always
+  carry `store: false`); `include` is passed through to `responses` upstreams.
+- **Usage** is remapped per protocol (`prompt_tokens` ↔ `input_tokens` ↔
+  `usage`, including `cached_tokens` / `reasoning_tokens` details).
+- The request key `x_nervogate` is reserved for gateway-internal passthrough
+  (e.g. `include`, `top_k`) and is never sent upstream.
 
 ## Disclaimer
 

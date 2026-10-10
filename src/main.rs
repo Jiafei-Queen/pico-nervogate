@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::StreamExt;
@@ -20,8 +20,10 @@ use serde_json::{json, Value};
 use config::{Config, ModelCfg, Protocol};
 use discovery::refresh_discovery;
 use translate::{
-    anthropic_to_openai, chat_to_responses_request, openai_to_anthropic, responses_to_chat_request,
-    responses_to_openai, AnthropicStream, ResponsesStream,
+    anthropic_to_chat_request, anthropic_to_openai, chat_to_anthropic_response,
+    chat_to_responses_request, chat_to_responses_response, frame_data, frame_event,
+    openai_to_anthropic, responses_stateful_error, responses_to_chat_request, responses_to_openai,
+    AnthropicStream, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream,
 };
 
 struct Inner {
@@ -264,6 +266,7 @@ async fn main() {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses_ingress))
+        .route("/v1/messages", post(messages_ingress))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -515,7 +518,12 @@ fn upstream_url(base: &str, m: &ModelCfg) -> String {
 fn build_body(m: &ModelCfg, req: &Value, stream: bool) -> Value {
     let upstream = m.upstream_model();
     let mut body = match m.protocol {
-        Protocol::Chat => req.clone(),
+        Protocol::Chat => {
+            let mut v = req.clone();
+            // The reserved passthrough key never goes on the wire.
+            v.as_object_mut().map(|o| o.remove("x_nervogate"));
+            v
+        }
         Protocol::Anthropic => openai_to_anthropic(req),
         Protocol::Responses => chat_to_responses_request(req),
     };
@@ -534,19 +542,45 @@ enum UpstreamError {
     Message(String),
 }
 
-impl IntoResponse for UpstreamError {
-    fn into_response(self) -> Response {
-        match self {
-            UpstreamError::Status(code, body) => {
+/// Error response in the shape the ingress protocol expects.
+fn ingress_error(ingress: Ingress, status: StatusCode, msg: &str) -> Response {
+    match ingress {
+        Ingress::Anthropic => json_response(
+            status,
+            json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
+        ),
+        _ => error_json(status, msg),
+    }
+}
+
+/// Upstream failure in the ingress protocol's error shape (the raw upstream
+/// body would not make sense to a client speaking a different protocol).
+fn upstream_error_response(ingress: Ingress, e: UpstreamError) -> Response {
+    match e {
+        UpstreamError::Message(msg) => ingress_error(ingress, StatusCode::BAD_GATEWAY, &msg),
+        UpstreamError::Status(code, body) => {
+            if ingress != Ingress::Anthropic {
                 let mut resp = Response::new(Body::from(body));
                 *resp.status_mut() = code;
                 resp.headers_mut().insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
                 );
-                resp
+                return resp;
             }
-            UpstreamError::Message(msg) => error_json(StatusCode::BAD_GATEWAY, &msg),
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .or_else(|| v.get("message"))
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or(body);
+            json_response(
+                code,
+                json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
+            )
         }
     }
 }
@@ -622,157 +656,225 @@ async fn call_upstream(
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/chat/completions
+// Ingress handlers: POST /v1/chat/completions, /v1/responses, /v1/messages
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq)]
+enum Ingress {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
 async fn chat(State(st): State<St>, body: Bytes) -> Response {
+    handle_ingress(st, body, Ingress::Chat).await
+}
+
+async fn responses_ingress(State(st): State<St>, body: Bytes) -> Response {
+    handle_ingress(st, body, Ingress::Responses).await
+}
+
+async fn messages_ingress(State(st): State<St>, body: Bytes) -> Response {
+    let mut resp = handle_ingress(st, body, Ingress::Anthropic).await;
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static("2023-06-01"),
+    );
+    resp
+}
+
+/// One pipeline for all three ingress surfaces: normalize to the canonical
+/// chat request, call upstream, translate back into the ingress protocol.
+async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return error_json(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}")),
+        Err(e) => {
+            return ingress_error(
+                ingress,
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+            )
+        }
     };
     let name = match req.get("model").and_then(|x| x.as_str()) {
         Some(n) => n.to_string(),
-        None => return error_json(StatusCode::BAD_REQUEST, "missing field: model"),
+        None => return ingress_error(ingress, StatusCode::BAD_REQUEST, "missing field: model"),
     };
     let m = match find_model(&st, &name) {
         Some(m) => m,
         None => {
             eprintln!("[gw] req unknown-model={name}");
-            return error_json(StatusCode::NOT_FOUND, &format!("unknown model: {name}"));
+            return ingress_error(
+                ingress,
+                StatusCode::NOT_FOUND,
+                &format!("unknown model: {name}"),
+            );
         }
     };
+    if ingress == Ingress::Responses {
+        if let Some(msg) = responses_stateful_error(&req) {
+            return ingress_error(ingress, StatusCode::BAD_REQUEST, &msg);
+        }
+    }
     let stream = req.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    let resp = match call_upstream(&st, &m, &req, stream).await {
+    // Normalize the ingress request to the canonical chat shape.
+    let chat_req = match ingress {
+        Ingress::Chat => req,
+        Ingress::Responses => responses_to_chat_request(&req),
+        Ingress::Anthropic => anthropic_to_chat_request(&req),
+    };
+
+    let resp = match call_upstream(&st, &m, &chat_req, stream).await {
         Ok(r) => r,
-        Err(e) => return e.into_response(),
+        Err(e) => return upstream_error_response(ingress, e),
     };
 
     if stream {
-        let b = match m.protocol {
-            Protocol::Chat => passthrough_body(resp),
-            Protocol::Anthropic => sse_body(resp, SseState::Anthropic(AnthropicStream::new(&name))),
-            Protocol::Responses => sse_body(resp, SseState::Responses(ResponsesStream::new(&name))),
+        let inbound = match m.protocol {
+            Protocol::Chat => Inbound::Chat {
+                name: name.clone(),
+                held: None,
+            },
+            Protocol::Anthropic => Inbound::Anthropic(AnthropicStream::new(&name)),
+            Protocol::Responses => Inbound::Responses(ResponsesStream::new(&name)),
         };
-        sse_response(b)
+        let egress = match ingress {
+            Ingress::Chat => Egress::Chat,
+            Ingress::Responses => Egress::Responses(ChatToResponsesStream::new(&name)),
+            Ingress::Anthropic => Egress::Anthropic(ChatToAnthropicStream::new(&name)),
+        };
+        sse_response(sse_body(resp, inbound, egress))
     } else {
         let text = match resp.text().await {
             Ok(t) => t,
-            Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+            Err(e) => {
+                return ingress_error(
+                    ingress,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("read upstream: {e}"),
+                )
+            }
         };
         let up: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(_) => {
-                return raw_json_response(StatusCode::OK, text);
-            }
+            Err(_) => return raw_json_response(StatusCode::OK, text),
         };
-        let out = match m.protocol {
+        let chat = match m.protocol {
             Protocol::Chat => {
                 let mut v = up;
-                v["model"] = json!(name);
+                v["model"] = json!(name.clone());
                 v
             }
             Protocol::Anthropic => anthropic_to_openai(&up, &name),
             Protocol::Responses => responses_to_openai(&up, &name),
+        };
+        let out = match ingress {
+            Ingress::Chat => chat,
+            Ingress::Responses => chat_to_responses_response(&chat, &name),
+            Ingress::Anthropic => chat_to_anthropic_response(&chat, &name),
         };
         json_response(StatusCode::OK, out)
     }
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/responses (ingress -> chat canonical -> upstream)
+// SSE pipeline: upstream -> canonical chat chunks -> client framing
 // ---------------------------------------------------------------------------
 
-async fn responses_ingress(State(st): State<St>, body: Bytes) -> Response {
-    let req: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return error_json(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}")),
-    };
-    let name = match req.get("model").and_then(|x| x.as_str()) {
-        Some(n) => n.to_string(),
-        None => return error_json(StatusCode::BAD_REQUEST, "missing field: model"),
-    };
-    let m = match find_model(&st, &name) {
-        Some(m) => m,
-        None => {
-            eprintln!("[gw] req unknown-model={name}");
-            return error_json(StatusCode::NOT_FOUND, &format!("unknown model: {name}"));
-        }
-    };
-    let stream = req.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
-
-    // Responses ingress is normalized to a chat request, then routed normally.
-    let chat_req = responses_to_chat_request(&req);
-
-    let resp = match call_upstream(&st, &m, &chat_req, stream).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-
-    // For simplicity the gateway always answers Responses ingress with the chat
-    // completion translated back into a Responses-shaped object (non-stream).
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
-    };
-    let chat: Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return raw_json_response(StatusCode::OK, text),
-    };
-    let openai = match m.protocol {
-        Protocol::Chat => {
-            let mut v = chat;
-            v["model"] = json!(name);
-            v
-        }
-        Protocol::Anthropic => anthropic_to_openai(&chat, &name),
-        Protocol::Responses => responses_to_openai(&chat, &name),
-    };
-    json_response(StatusCode::OK, chat_to_responses_response(&openai, &name))
-}
-
-fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
-    let content = chat
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    json!({
-        "id": translate::gen_id("resp_"),
-        "object": "response",
-        "created_at": translate::now_ts(),
-        "model": model,
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "id": translate::gen_id("msg_"),
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": content, "annotations": []}]
-        }],
-        "usage": chat.get("usage").cloned().unwrap_or(json!({}))
-    })
-}
-
-// ---------------------------------------------------------------------------
-// SSE helpers
-// ---------------------------------------------------------------------------
-
-enum SseState {
+/// Upstream SSE -> canonical OpenAI chat chunks.
+enum Inbound {
+    /// Chat Completions upstream: chunks pass through, model rewritten.
+    Chat {
+        name: String,
+        held: Option<Value>,
+    },
     Anthropic(AnthropicStream),
     Responses(ResponsesStream),
 }
 
-fn passthrough_body(resp: reqwest::Response) -> Body {
-    let s = resp
-        .bytes_stream()
-        .map(|r| r.map_err(io::Error::other));
-    Body::from_stream(s)
+impl Inbound {
+    /// Handle one upstream SSE `data:` payload (a JSON object).
+    fn handle(&mut self, ev: &Value) -> Vec<Value> {
+        match self {
+            Inbound::Chat { name, held } => {
+                // OpenAI sends usage in a trailing `choices: []` chunk; merge
+                // it into the held finish chunk so translated egresses still
+                // see usage.
+                if ev.pointer("/choices/0").is_none() {
+                    if let (Some(h), Some(u)) = (held.as_mut(), ev.get("usage")) {
+                        h["usage"] = u.clone();
+                        return held.take().into_iter().collect();
+                    }
+                    return vec![];
+                }
+                let mut out: Vec<Value> = held.take().into_iter().collect();
+                let mut v = ev.clone();
+                v["model"] = json!(name.clone());
+                if v.pointer("/choices/0/finish_reason").is_some() && v.get("usage").is_none() {
+                    *held = Some(v);
+                } else {
+                    out.push(v);
+                }
+                out
+            }
+            Inbound::Anthropic(s) => s.handle(ev),
+            Inbound::Responses(s) => s.handle(ev),
+        }
+    }
+
+    /// Flush a held finish chunk at end of stream.
+    fn flush(&mut self) -> Vec<Value> {
+        match self {
+            Inbound::Chat { held, .. } => held.take().into_iter().collect(),
+            _ => vec![],
+        }
+    }
 }
 
-fn sse_body(resp: reqwest::Response, mut state: SseState) -> Body {
+/// Canonical OpenAI chat chunks -> client-protocol SSE framing.
+enum Egress {
+    Chat,
+    Responses(ChatToResponsesStream),
+    Anthropic(ChatToAnthropicStream),
+}
+
+impl Egress {
+    fn handle(&mut self, chunk: &Value) -> Vec<String> {
+        match self {
+            Egress::Chat => vec![frame_data(chunk)],
+            Egress::Responses(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
+            Egress::Anthropic(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
+        }
+    }
+
+    /// Trailer: Chat streams end with the `[DONE]` sentinel; the other two
+    /// end with their terminal event (already emitted).
+    fn finish(&mut self) -> Vec<String> {
+        match self {
+            Egress::Chat => vec!["data: [DONE]\n\n".to_string()],
+            _ => vec![],
+        }
+    }
+
+    /// Mid-stream upstream error, in the client protocol's framing.
+    fn fail(&mut self, msg: &str) -> Vec<String> {
+        match self {
+            Egress::Chat => vec![],
+            Egress::Responses(_) => vec![frame_data(&json!({"type": "error", "message": msg}))],
+            Egress::Anthropic(_) => vec![frame_event(
+                "error",
+                &json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
+            )],
+        }
+    }
+}
+
+fn sse_body(resp: reqwest::Response, mut inbound: Inbound, mut egress: Egress) -> Body {
     Body::from_stream(async_stream::stream! {
         let mut buf: Vec<u8> = Vec::new();
         let mut bs = resp.bytes_stream();
+        let mut failed = false;
         while let Some(chunk) = bs.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -799,17 +901,36 @@ fn sse_body(resp: reqwest::Response, mut state: SseState) -> Body {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let chunks = match &mut state {
-                    SseState::Anthropic(s) => s.handle(&ev),
-                    SseState::Responses(s) => s.handle(&ev),
-                };
-                for c in chunks {
-                    let line = format!("data: {}\n\n", serde_json::to_string(&c).unwrap());
-                    yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                // An upstream error event ends the stream early.
+                if ev.get("type").and_then(|t| t.as_str()) == Some("error")
+                    || ev.get("error").is_some()
+                {
+                    let msg = trunc(&data, 500);
+                    eprintln!("[gw] upstream stream error: {msg}");
+                    for line in egress.fail(msg) {
+                        yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                    }
+                    failed = true;
+                    break;
+                }
+                for c in inbound.handle(&ev) {
+                    for line in egress.handle(&c) {
+                        yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                    }
                 }
             }
+            if failed {
+                break;
+            }
         }
-        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        for c in inbound.flush() {
+            for line in egress.handle(&c) {
+                yield Ok::<Bytes, io::Error>(Bytes::from(line));
+            }
+        }
+        for line in egress.finish() {
+            yield Ok::<Bytes, io::Error>(Bytes::from(line));
+        }
     })
 }
 
