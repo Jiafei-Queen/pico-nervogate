@@ -735,6 +735,7 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
             Protocol::Chat => Inbound::Chat {
                 name: name.clone(),
                 held: None,
+                usage: None,
             },
             Protocol::Anthropic => Inbound::Anthropic(AnthropicStream::new(&name)),
             Protocol::Responses => Inbound::Responses(ResponsesStream::new(&name)),
@@ -787,7 +788,11 @@ enum Inbound {
     /// Chat Completions upstream: chunks pass through, model rewritten.
     Chat {
         name: String,
+        /// Finish chunk parked until its usage shows up (or the stream ends).
         held: Option<Value>,
+        /// Usage seen so far, held independently of `held` so that upstream
+        /// sending usage *before* the finish chunk still counts.
+        usage: Option<Value>,
     },
     Anthropic(AnthropicStream),
     Responses(ResponsesStream),
@@ -797,22 +802,37 @@ impl Inbound {
     /// Handle one upstream SSE `data:` payload (a JSON object).
     fn handle(&mut self, ev: &Value) -> Vec<Value> {
         match self {
-            Inbound::Chat { name, held } => {
-                // OpenAI sends usage in a trailing `choices: []` chunk; merge
-                // it into the held finish chunk so translated egresses still
-                // see usage.
+            Inbound::Chat { name, held, usage } => {
+                // OpenAI sends usage in a trailing `choices: []` chunk. Buffer
+                // it separately from `held` so the order of the two chunks
+                // does not decide whether usage survives.
+                if let Some(u) = ev.get("usage").filter(|u| !u.is_null()) {
+                    *usage = Some(u.clone());
+                }
+                // A usage-only chunk carries no choices and no content.
                 if ev.pointer("/choices/0").is_none() {
-                    if let (Some(h), Some(u)) = (held.as_mut(), ev.get("usage")) {
-                        h["usage"] = u.clone();
-                        return held.take().into_iter().collect();
-                    }
                     return vec![];
                 }
                 let mut out: Vec<Value> = held.take().into_iter().collect();
                 let mut v = ev.clone();
-                v["model"] = json!(name.clone());
-                if v.pointer("/choices/0/finish_reason").is_some() && v.get("usage").is_none() {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("model".into(), json!(name.clone()));
+                }
+                if let Some(u) = v.get("usage").cloned().filter(|u| !u.is_null()) {
+                    *usage = Some(u);
+                }
+                let finished = v
+                    .pointer("/choices/0/finish_reason")
+                    .is_some_and(|f| !f.is_null());
+                // Park the finish chunk only while usage is still missing:
+                // translated egresses read usage off that very chunk.
+                if finished && v.get("usage").is_none_or(|u| u.is_null()) && usage.is_none() {
                     *held = Some(v);
+                } else if finished {
+                    if let (Some(o), Some(u)) = (v.as_object_mut(), usage.as_ref()) {
+                        o.insert("usage".into(), u.clone());
+                    }
+                    out.push(v);
                 } else {
                     out.push(v);
                 }
@@ -823,10 +843,20 @@ impl Inbound {
         }
     }
 
-    /// Flush a held finish chunk at end of stream.
+    /// Flush a held finish chunk at end of stream, backfilling any usage
+    /// that arrived separately.
     fn flush(&mut self) -> Vec<Value> {
         match self {
-            Inbound::Chat { held, .. } => held.take().into_iter().collect(),
+            Inbound::Chat { held, usage, .. } => {
+                let mut out = vec![];
+                if let Some(mut h) = held.take() {
+                    if let (Some(o), Some(u)) = (h.as_object_mut(), usage.as_ref()) {
+                        o.insert("usage".into(), u.clone());
+                    }
+                    out.push(h);
+                }
+                out
+            }
             _ => vec![],
         }
     }

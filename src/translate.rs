@@ -111,13 +111,27 @@ pub fn responses_usage(input: i64, output: i64, cached: i64, reasoning: i64) -> 
 }
 
 /// Anthropic Messages `usage` object.
-pub fn anthropic_usage(input: i64, output: i64, cache_read: i64) -> Value {
+///
+/// `cache_creation_input_tokens` must be carried, not zeroed: cache writes
+/// are billed and dropping them understates cost on cache-heavy traffic.
+pub fn anthropic_usage_full(
+    input: i64,
+    output: i64,
+    cache_creation: i64,
+    cache_read: i64,
+) -> Value {
     json!({
         "input_tokens": input,
         "output_tokens": output,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": cache_creation,
         "cache_read_input_tokens": cache_read
     })
+}
+
+/// Anthropic Messages `usage` object, for callers that have no cache-write
+/// count to report.
+pub fn anthropic_usage(input: i64, output: i64, cache_read: i64) -> Value {
+    anthropic_usage_full(input, output, 0, cache_read)
 }
 
 /// Chat `usage` -> (prompt, completion, cached, reasoning).
@@ -474,10 +488,18 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         .pointer("/usage/output_tokens")
         .and_then(|x| x.as_i64())
         .unwrap_or(0);
+    // Anthropic `input_tokens` excludes cache reads/writes, while OpenAI
+    // `prompt_tokens` includes cached tokens. Adding them keeps
+    // `prompt_tokens` comparable and `total_tokens` honest.
     let cached = resp
         .pointer("/usage/cache_read_input_tokens")
         .and_then(|x| x.as_i64())
         .unwrap_or(0);
+    let cache_creation = resp
+        .pointer("/usage/cache_creation_input_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let prompt_total = in_tok + cached + cache_creation;
 
     let mut message = json!({"role": "assistant", "content": text});
     if !reasoning.is_empty() {
@@ -494,7 +516,8 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         "created": now_ts(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-        "usage": chat_usage(in_tok, out_tok, cached, 0)
+        "usage": chat_usage(prompt_total, out_tok, cached, 0),
+        "cache_creation_input_tokens": cache_creation
     })
 }
 
@@ -518,6 +541,7 @@ pub struct AnthropicStream {
     in_tok: i64,
     out_tok: i64,
     cached: i64,
+    cache_creation: i64,
     finish: Option<String>,
 }
 
@@ -532,6 +556,7 @@ impl AnthropicStream {
             in_tok: 0,
             out_tok: 0,
             cached: 0,
+            cache_creation: 0,
             finish: None,
         }
     }
@@ -559,6 +584,10 @@ impl AnthropicStream {
                     .unwrap_or(0);
                 self.cached = ev
                     .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0);
+                self.cache_creation = ev
+                    .pointer("/message/usage/cache_creation_input_tokens")
                     .and_then(|x| x.as_i64())
                     .unwrap_or(0);
                 self.ensure_role(&mut out);
@@ -641,7 +670,15 @@ impl AnthropicStream {
                 self.ensure_role(&mut out);
                 let fr = self.finish.clone().unwrap_or_else(|| "stop".to_string());
                 let mut c = chunk(&self.id, &self.model, json!({}), Some(&fr));
-                c["usage"] = chat_usage(self.in_tok, self.out_tok, self.cached, 0);
+                // Anthropic's `input_tokens` excludes cache reads; OpenAI's
+                // `prompt_tokens` includes them.
+                c["usage"] = chat_usage(
+                    self.in_tok + self.cached + self.cache_creation,
+                    self.out_tok,
+                    self.cached,
+                    0,
+                );
+                c["cache_creation_input_tokens"] = json!(self.cache_creation);
                 out.push(c);
             }
             _ => {}
@@ -2033,7 +2070,14 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
         .pointer("/choices/0/finish_reason")
         .and_then(|x| x.as_str())
         .unwrap_or("stop");
+    // Canonical `prompt_tokens` already includes cached tokens; Anthropic
+    // reports cache reads and writes separately.
     let (p, c, cached, _) = chat_usage_parts(chat.get("usage"));
+    let cache_creation = chat
+        .get("cache_creation_input_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let input = (p - cached - cache_creation).max(0);
 
     json!({
         "id": gen_id("msg_"),
@@ -2043,7 +2087,7 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
         "content": blocks,
         "stop_reason": anthropic_stop(finish),
         "stop_sequence": Value::Null,
-        "usage": anthropic_usage(p, c, cached)
+        "usage": anthropic_usage_full(input, c, cache_creation, cached)
     })
 }
 
@@ -2402,7 +2446,8 @@ mod tests {
                 {"type": "tool_use", "id": "tu1", "name": "f", "input": {"x": 1}}
             ],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 7}
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                "cache_read_input_tokens": 7, "cache_creation_input_tokens": 2}
         });
         let out = anthropic_to_openai(&resp, "m");
         let msg = &out["choices"][0]["message"];
@@ -2410,12 +2455,33 @@ mod tests {
         assert_eq!(msg["reasoning_content"], json!("hmm"));
         assert_eq!(msg["tool_calls"][0]["function"]["name"], json!("f"));
         assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
-        assert_eq!(out["usage"]["prompt_tokens"], json!(10));
+        // prompt_tokens includes cached reads and writes (19 total);
+        // Anthropic's bare input_tokens (10) excludes them.
+        assert_eq!(out["usage"]["prompt_tokens"], json!(19));
         assert_eq!(
             out["usage"]["prompt_tokens_details"]["cached_tokens"],
             json!(7)
         );
-        assert_eq!(out["usage"]["total_tokens"], json!(15));
+        assert_eq!(out["cache_creation_input_tokens"], json!(2));
+        assert_eq!(out["usage"]["total_tokens"], json!(24));
+    }
+
+    #[test]
+    fn anthropic_usage_round_trips_cache_semantics() {
+        // chat -> anthropic must subtract cached tokens from input_tokens
+        // and report the split the upstream expects.
+        let chat = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "x"}}],
+            "usage": {"prompt_tokens": 19, "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 7}},
+            "cache_creation_input_tokens": 2
+        });
+        let out = chat_to_anthropic_response(&chat, "m");
+        assert_eq!(out["usage"]["input_tokens"], json!(10));
+        assert_eq!(out["usage"]["cache_read_input_tokens"], json!(7));
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], json!(2));
+        assert_eq!(out["usage"]["output_tokens"], json!(5));
     }
 
     #[test]
