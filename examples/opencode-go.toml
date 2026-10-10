@@ -1,6 +1,12 @@
 # Example: a coding-model subscription service (OpenCode Go).
 # Provided as a working reference. This project is not affiliated with that
 # service; the header names / model ids below are service-specific examples.
+#
+# Revised for [models_dev] + [discovery]: pure-chat models need no entries
+# at all — they are auto-discovered from upstream /v1/models and enriched
+# (vision/prices/limits) from models.dev. Only models that need a non-chat
+# protocol are pinned below. Explicit entries always win over discovered
+# ones, so keeping extra entries as fallback is harmless.
 
 listen = "0.0.0.0:8787"
 
@@ -20,101 +26,35 @@ default_base_url = "https://opencode.ai/zen/go/v1"
 owned_by = "opencode-go"
 provider = "opencode-go"
 
-# `vision = true` marks models that accept image input; it is advertised to
-# clients via /v1/models as info.meta.capabilities.vision.
+# Vision/modality, prices and limits are inferred from models.dev into
+# /v1/models. Verified against this provider: every inferred `vision`
+# matches the previously hand-maintained flags, so no per-model
+# `vision = ...` lines are needed (an explicit one would still win).
+[models_dev]
+enable = true
+provider = "opencode-go"
+refresh_interval_secs = 86400
+cache_path = "./models.dev.json"
 
-# --- /v1/chat/completions (OpenAI-compatible, pass-through) ---
-[[models]]
-name = "glm-5.3-flash"
-protocol = "chat"
-vision = true
+# Re-reads the file on SIGHUP / mtime change. Broken files are rejected.
+[reload]
+enable = true
+watch_interval_secs = 30
 
-[[models]]
-name = "glm-5.3"
+# New/retired upstream models appear/disappear automatically. Anything
+# discovered defaults to `chat`; models on other protocols must be pinned
+# below or they will be mis-routed (watch the gateway logs for upstream
+# 4xx after a provider-side model launch).
+[discovery]
+enable = true
+interval_secs = 3600
 protocol = "chat"
-
-[[models]]
-name = "glm-5.2"
-protocol = "chat"
-
-[[models]]
-name = "kimi-k3"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "kimi-k2.7-code"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "kimi-k2.6"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "longcat-2.0"
-protocol = "chat"
-
-[[models]]
-name = "longcat-2.5-preview-free"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "deepseek-v4.1-flash"
-protocol = "chat"
-
-[[models]]
-name = "deepseek-v4-pro"
-protocol = "chat"
-
-[[models]]
-name = "deepseek-v4-flash"
-protocol = "chat"
-
-[[models]]
-name = "deepseek-v4-flash-vision-exp"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "mimo-v2.6-flash"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "mimo-v2.6-pro"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "mimo-v2.5"
-protocol = "chat"
-vision = true
-
-[[models]]
-name = "mimo-v2.5-pro"
-protocol = "chat"
-
-[[models]]
-name = "hy4-preview"
-protocol = "chat"
-
-[[models]]
-name = "hy3"
-protocol = "chat"
-
-[[models]]
-name = "space-bunny"
-protocol = "chat"
-vision = true
+prune_missing = true
 
 # --- /v1/messages (Anthropic Messages, translated) ---
 [[models]]
 name = "minimax-m3"
 protocol = "anthropic"
-vision = true
 
 [[models]]
 name = "minimax-m2.7"
@@ -123,38 +63,31 @@ protocol = "anthropic"
 [[models]]
 name = "qwen3.8-max"
 protocol = "anthropic"
-vision = true
 
 [[models]]
 name = "qwen3.8-flash"
 protocol = "anthropic"
-vision = true
 
 [[models]]
 name = "qwen3.7-plus"
 protocol = "anthropic"
-vision = true
 
 # --- /v1/responses (OpenAI Responses, translated) ---
 [[models]]
 name = "grok-4.7"
 protocol = "responses"
-vision = true
 
 [[models]]
 name = "grok-4.6"
 protocol = "responses"
-vision = true
 
 [[models]]
 name = "gpt-6-luna"
 protocol = "responses"
-vision = true
 
 [[models]]
 name = "gpt-5.6-luna"
 protocol = "responses"
-vision = true
 
 [[models]]
 name = "muse-spark-1.3-contributor"
@@ -163,3 +96,10 @@ protocol = "responses"
 [[models]]
 name = "muse-spark-1.2-contributor"
 protocol = "responses"
+
+# --- everything else needs no entry ---
+# glm-5.3-flash, glm-5.3, glm-5.2, kimi-k3, kimi-k2.7-code, kimi-k2.6,
+# longcat-2.0, longcat-2.5-preview-free, deepseek-v4.1-flash, deepseek-v4-pro,
+# deepseek-v4-flash, deepseek-v4-flash-vision-exp, mimo-v2.6-flash,
+# mimo-v2.6-pro, mimo-v2.5, mimo-v2.5-pro, hy4-preview, hy3, space-bunny, …
+# are discovered as chat models and enriched automatically.
