@@ -111,9 +111,23 @@ async fn main() {
     });
 
     if state.cfg.read().unwrap().discovery.enable {
-        match refresh_discovery(&state).await {
-            Ok(d) => eprintln!("[gw] discovery: {d} models"),
-            Err(e) => eprintln!("[gw] discovery failed at startup: {e}"),
+        // Container network/DNS is often not ready in the first seconds
+        // after boot (scratch image, daemon-attached network), so retry a
+        // few times before serving with static models only.
+        for attempt in 1..=4 {
+            match refresh_discovery(&state).await {
+                Ok(d) => {
+                    eprintln!("[gw] discovery: {d} models");
+                    break;
+                }
+                Err(e) if attempt < 4 => {
+                    eprintln!(
+                        "[gw] discovery failed at startup (attempt {attempt}/4): {e}; retrying in 5s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => eprintln!("[gw] discovery failed at startup: {e}"),
+            }
         }
     }
 
@@ -176,7 +190,13 @@ async fn main() {
                     let c = st.cfg.read().unwrap();
                     (c.discovery.enable, c.discovery.interval_secs)
                 };
-                if d_enable && d_interval > 0 && last_discover.elapsed().as_secs() >= d_interval
+                // If startup discovery failed (empty map), retry every minute
+                // instead of waiting out the full interval.
+                let discovered_empty = st.discovered.read().unwrap().is_empty();
+                let elapsed = last_discover.elapsed().as_secs();
+                if d_enable
+                    && d_interval > 0
+                    && (elapsed >= d_interval || (discovered_empty && elapsed >= 60))
                 {
                     last_discover = Instant::now();
                     match refresh_discovery(&st).await {
@@ -373,7 +393,7 @@ async fn load_enrichment(
             Err(e) => eprintln!("[gw] models.dev: read body failed: {e}"),
         },
         Ok(resp) => eprintln!("[gw] models.dev: http {} from {url}", resp.status()),
-        Err(e) => eprintln!("[gw] models.dev: fetch failed ({url}): {e}"),
+        Err(e) => eprintln!("[gw] models.dev: fetch failed ({url}): {e:#}"),
     }
     // Fallback: disk cache.
     if let Some(p) = cache_path {

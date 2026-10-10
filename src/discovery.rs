@@ -77,14 +77,14 @@ pub async fn refresh_discovery(st: &St) -> Result<usize, String> {
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("discovery fetch {url} failed: {e}"))?;
+        .map_err(|e| format!("discovery fetch {url} failed: {e:#}"))?;
     if !resp.status().is_success() {
         return Err(format!("discovery http {} from {url}", resp.status()));
     }
     let text = resp
         .text()
         .await
-        .map_err(|e| format!("discovery read body failed: {e}"))?;
+        .map_err(|e| format!("discovery read body failed: {e:#}"))?;
     let ids = parse_models_list(&text)?;
 
     let mut fresh = HashMap::new();
