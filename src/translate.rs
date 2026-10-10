@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::config::ThinkingMode;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn now_ts() -> i64 {
@@ -52,7 +54,10 @@ pub struct SseEvent {
 impl SseEvent {
     /// `data:`-only event (Chat chunks, Responses events).
     pub fn data(v: Value) -> Self {
-        Self { event: None, data: v }
+        Self {
+            event: None,
+            data: v,
+        }
     }
     /// `event:` + `data:` event (Anthropic).
     pub fn ev(name: &str, v: Value) -> Self {
@@ -119,8 +124,12 @@ pub fn anthropic_usage(input: i64, output: i64, cache_read: i64) -> Value {
 pub fn chat_usage_parts(u: Option<&Value>) -> (i64, i64, i64, i64) {
     let u = u.unwrap_or(&Value::Null);
     (
-        u.pointer("/prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0),
-        u.pointer("/completion_tokens").and_then(|x| x.as_i64()).unwrap_or(0),
+        u.pointer("/prompt_tokens")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
+        u.pointer("/completion_tokens")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
         u.pointer("/prompt_tokens_details/cached_tokens")
             .and_then(|x| x.as_i64())
             .unwrap_or(0),
@@ -148,9 +157,14 @@ fn openai_image_to_anthropic(p: &Value) -> Option<Value> {
 fn anthropic_image_to_openai(b: &Value) -> Option<Value> {
     match b.pointer("/source/type").and_then(|x| x.as_str()) {
         Some("base64") => {
-            let media = b.pointer("/source/media_type").and_then(|x| x.as_str()).unwrap_or("image/png");
+            let media = b
+                .pointer("/source/media_type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("image/png");
             let data = b.pointer("/source/data").and_then(|x| x.as_str())?;
-            Some(json!({"type":"image_url","image_url":{"url": format!("data:{media};base64,{data}")}}))
+            Some(
+                json!({"type":"image_url","image_url":{"url": format!("data:{media};base64,{data}")}}),
+            )
         }
         Some("url") => {
             let url = b.pointer("/source/url").and_then(|x| x.as_str())?;
@@ -228,6 +242,7 @@ fn push_anthropic_blocks(msgs: &mut Vec<Value>, role: &str, blocks: Vec<Value>) 
     msgs.push(json!({"role": role, "content": blocks}));
 }
 
+/// Legacy `thinking.budget_tokens` for `ThinkingMode::Enabled`.
 fn thinking_budget(effort: &str) -> i64 {
     match effort {
         "minimal" => 1024,
@@ -238,7 +253,7 @@ fn thinking_budget(effort: &str) -> i64 {
     }
 }
 
-pub fn openai_to_anthropic(req: &Value) -> Value {
+pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
     let mut out = serde_json::Map::new();
 
     let max_tokens = req
@@ -326,7 +341,8 @@ pub fn openai_to_anthropic(req: &Value) -> Value {
                                 .and_then(|x| x.as_str())
                                 .unwrap_or("{}");
                             let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
-                            blocks.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
+                            blocks
+                                .push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
                         }
                     }
                     push_anthropic_blocks(&mut msgs, "assistant", blocks);
@@ -383,10 +399,24 @@ pub fn openai_to_anthropic(req: &Value) -> Value {
 
     if let Some(e) = req.get("reasoning_effort").and_then(|x| x.as_str()) {
         if e != "none" {
-            out.insert(
-                "thinking".into(),
-                json!({"type":"enabled","budget_tokens": thinking_budget(e)}),
-            );
+            match thinking {
+                // Newer upstream models reject `type: "enabled"` +
+                // budget_tokens and require `type: "adaptive"` with
+                // `output_config.effort`; the adaptive shape is accepted by
+                // every Anthropic-protocol upstream tested so far.
+                ThinkingMode::Adaptive => {
+                    out.insert("thinking".into(), json!({"type":"adaptive"}));
+                    out.insert("output_config".into(), json!({"effort": e}));
+                }
+                // Escape hatch for upstreams that only accept the legacy
+                // `enabled` + budget_tokens shape.
+                ThinkingMode::Enabled => {
+                    out.insert(
+                        "thinking".into(),
+                        json!({"type":"enabled","budget_tokens": thinking_budget(e)}),
+                    );
+                }
+            }
         }
     }
 
@@ -431,10 +461,19 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         }
     }
 
-    let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("end_turn");
+    let stop = resp
+        .get("stop_reason")
+        .and_then(|s| s.as_str())
+        .unwrap_or("end_turn");
     let finish = finish_from_anthropic(stop);
-    let in_tok = resp.pointer("/usage/input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    let out_tok = resp.pointer("/usage/output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    let in_tok = resp
+        .pointer("/usage/input_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let out_tok = resp
+        .pointer("/usage/output_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
     let cached = resp
         .pointer("/usage/cache_read_input_tokens")
         .and_then(|x| x.as_i64())
@@ -500,7 +539,12 @@ impl AnthropicStream {
     fn ensure_role(&mut self, out: &mut Vec<Value>) {
         if !self.role_sent {
             self.role_sent = true;
-            out.push(chunk(&self.id, &self.model, json!({"role":"assistant"}), None));
+            out.push(chunk(
+                &self.id,
+                &self.model,
+                json!({"role":"assistant"}),
+                None,
+            ));
         }
     }
 
@@ -521,11 +565,20 @@ impl AnthropicStream {
             }
             "content_block_start" => {
                 self.ensure_role(&mut out);
-                let bt = ev.pointer("/content_block/type").and_then(|x| x.as_str()).unwrap_or("");
+                let bt = ev
+                    .pointer("/content_block/type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 self.block_ty = bt.to_string();
                 if bt == "tool_use" {
-                    let id = ev.pointer("/content_block/id").and_then(|x| x.as_str()).unwrap_or("");
-                    let name = ev.pointer("/content_block/name").and_then(|x| x.as_str()).unwrap_or("");
+                    let id = ev
+                        .pointer("/content_block/id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let name = ev
+                        .pointer("/content_block/name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
                     out.push(chunk(
                         &self.id,
                         &self.model,
@@ -537,7 +590,10 @@ impl AnthropicStream {
             }
             "content_block_delta" => {
                 self.ensure_role(&mut out);
-                let dt = ev.pointer("/delta/type").and_then(|x| x.as_str()).unwrap_or("");
+                let dt = ev
+                    .pointer("/delta/type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 if dt == "text_delta" {
                     if let Some(t) = ev.pointer("/delta/text").and_then(|x| x.as_str()) {
                         if !t.is_empty() {
@@ -547,7 +603,12 @@ impl AnthropicStream {
                 } else if dt == "thinking_delta" {
                     if let Some(t) = ev.pointer("/delta/thinking").and_then(|x| x.as_str()) {
                         if !t.is_empty() {
-                            out.push(chunk(&self.id, &self.model, json!({"reasoning_content": t}), None));
+                            out.push(chunk(
+                                &self.id,
+                                &self.model,
+                                json!({"reasoning_content": t}),
+                                None,
+                            ));
                         }
                     }
                 } else if dt == "input_json_delta" {
@@ -706,7 +767,10 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
     if !instructions.is_empty() {
         out.insert("instructions".into(), json!(instructions));
     }
-    if let Some(mt) = req.get("max_tokens").or_else(|| req.get("max_completion_tokens")) {
+    if let Some(mt) = req
+        .get("max_tokens")
+        .or_else(|| req.get("max_completion_tokens"))
+    {
         out.insert("max_output_tokens".into(), mt.clone());
     }
     for k in ["temperature", "top_p"] {
@@ -725,12 +789,18 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
                 out.insert("text".into(), json!({"format": {"type": "json_object"}}));
             }
             Some("json_schema") => {
-                let name = rf.pointer("/json_schema/name").and_then(|x| x.as_str()).unwrap_or("response");
+                let name = rf
+                    .pointer("/json_schema/name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("response");
                 let schema = rf
                     .pointer("/json_schema/schema")
                     .cloned()
                     .unwrap_or(json!({"type": "object"}));
-                let strict = rf.pointer("/json_schema/strict").and_then(|x| x.as_bool()).unwrap_or(true);
+                let strict = rf
+                    .pointer("/json_schema/strict")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
                 out.insert(
                     "text".into(),
                     json!({"format": {"type": "json_schema", "name": name, "schema": schema, "strict": strict}}),
@@ -856,7 +926,10 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
         }
     }
 
-    let status = resp.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
+    let status = resp
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("completed");
     let finish = if !tool_calls.is_empty() {
         "tool_calls"
     } else if status == "incomplete" {
@@ -864,8 +937,14 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
     } else {
         "stop"
     };
-    let in_tok = resp.pointer("/usage/input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    let out_tok = resp.pointer("/usage/output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    let in_tok = resp
+        .pointer("/usage/input_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let out_tok = resp
+        .pointer("/usage/output_tokens")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
     let cached = resp
         .pointer("/usage/input_tokens_details/cached_tokens")
         .and_then(|x| x.as_i64())
@@ -927,7 +1006,12 @@ impl ResponsesStream {
     fn ensure_role(&mut self, out: &mut Vec<Value>) {
         if !self.role_sent {
             self.role_sent = true;
-            out.push(chunk(&self.id, &self.model, json!({"role":"assistant"}), None));
+            out.push(chunk(
+                &self.id,
+                &self.model,
+                json!({"role":"assistant"}),
+                None,
+            ));
         }
     }
 
@@ -944,7 +1028,11 @@ impl ResponsesStream {
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     self.cur_call = Some((call_id.clone(), name.clone()));
                     out.push(chunk(
                         &self.id,
@@ -975,7 +1063,12 @@ impl ResponsesStream {
                 self.ensure_role(&mut out);
                 if let Some(t) = ev.get("delta").and_then(|x| x.as_str()) {
                     if !t.is_empty() {
-                        out.push(chunk(&self.id, &self.model, json!({"reasoning_content": t}), None));
+                        out.push(chunk(
+                            &self.id,
+                            &self.model,
+                            json!({"reasoning_content": t}),
+                            None,
+                        ));
                     }
                 }
             }
@@ -1054,7 +1147,11 @@ pub fn responses_stateful_error(req: &Value) -> Option<String> {
                 .to_string(),
         );
     }
-    if req.get("background").and_then(|x| x.as_bool()).unwrap_or(false) {
+    if req
+        .get("background")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+    {
         return Some(
             "background is not supported: this gateway is stateless and has no \
              GET /v1/responses/{id} polling endpoint"
@@ -1139,7 +1236,9 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
 
     let flush_reasoning = |messages: &mut Vec<Value>, pending: &mut String| {
         if !pending.is_empty() {
-            messages.push(json!({"role": "assistant", "content": "", "reasoning_content": pending.clone()}));
+            messages.push(
+                json!({"role": "assistant", "content": "", "reasoning_content": pending.clone()}),
+            );
             pending.clear();
         }
     };
@@ -1239,8 +1338,14 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
         match rf.get("type").and_then(|x| x.as_str()) {
             Some("json_object") => out["response_format"] = json!({"type": "json_object"}),
             Some("json_schema") => {
-                let name = rf.get("name").and_then(|x| x.as_str()).unwrap_or("response");
-                let schema = rf.get("schema").cloned().unwrap_or(json!({"type": "object"}));
+                let name = rf
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("response");
+                let schema = rf
+                    .get("schema")
+                    .cloned()
+                    .unwrap_or(json!({"type": "object"}));
                 let strict = rf.get("strict").and_then(|x| x.as_bool()).unwrap_or(true);
                 out["response_format"] = json!({
                     "type": "json_schema",
@@ -1280,7 +1385,11 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
     if let Some(p) = req.get("parallel_tool_calls") {
         out["parallel_tool_calls"] = p.clone();
     }
-    if let Some(e) = req.get("reasoning").and_then(|x| x.get("effort")).and_then(|x| x.as_str()) {
+    if let Some(e) = req
+        .get("reasoning")
+        .and_then(|x| x.get("effort"))
+        .and_then(|x| x.as_str())
+    {
         out["reasoning_effort"] = json!(e);
     }
     if let Some(u) = req.get("user") {
@@ -1297,7 +1406,10 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
 
 /// Chat completion -> Responses API response object.
 pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
-    let msg = chat.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+    let msg = chat
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or(json!({}));
     let mut output: Vec<Value> = vec![];
 
     let reasoning = msg
@@ -1508,8 +1620,12 @@ impl ChatToResponsesStream {
         let mut out = vec![];
         if !self.started {
             self.started = true;
-            out.push(SseEvent::data(json!({"type": "response.created", "response": self.skeleton("in_progress")})));
-            out.push(SseEvent::data(json!({"type": "response.in_progress", "response": self.skeleton("in_progress")})));
+            out.push(SseEvent::data(
+                json!({"type": "response.created", "response": self.skeleton("in_progress")}),
+            ));
+            out.push(SseEvent::data(
+                json!({"type": "response.in_progress", "response": self.skeleton("in_progress")}),
+            ));
         }
 
         let choice = ch.pointer("/choices/0").cloned().unwrap_or(json!({}));
@@ -1534,7 +1650,12 @@ impl ChatToResponsesStream {
                         text: String::new(),
                     });
                 }
-                if let Some(OpenOut::Reasoning { index, item_id, text }) = &mut self.open {
+                if let Some(OpenOut::Reasoning {
+                    index,
+                    item_id,
+                    text,
+                }) = &mut self.open
+                {
                     text.push_str(t);
                     out.push(SseEvent::data(json!({
                         "type": "response.reasoning_summary_text.delta",
@@ -1571,7 +1692,12 @@ impl ChatToResponsesStream {
                         text: String::new(),
                     });
                 }
-                if let Some(OpenOut::Message { index, item_id, text }) = &mut self.open {
+                if let Some(OpenOut::Message {
+                    index,
+                    item_id,
+                    text,
+                }) = &mut self.open
+                {
                     text.push_str(t);
                     out.push(SseEvent::data(json!({
                         "type": "response.output_text.delta",
@@ -1585,8 +1711,14 @@ impl ChatToResponsesStream {
         // Tool call deltas open function_call output items.
         if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in tcs {
-                let new_call = tc.get("id").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty())
-                    || tc.pointer("/function/name").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty());
+                let new_call = tc
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                    || tc
+                        .pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|s| !s.is_empty());
                 if new_call {
                     self.close_open(&mut out);
                     let index = self.next_index;
@@ -1619,7 +1751,13 @@ impl ChatToResponsesStream {
                 }
                 if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
                     if !args.is_empty() {
-                        if let Some(OpenOut::Tool { index, item_id, args: acc, .. }) = &mut self.open {
+                        if let Some(OpenOut::Tool {
+                            index,
+                            item_id,
+                            args: acc,
+                            ..
+                        }) = &mut self.open
+                        {
                             acc.push_str(args);
                             out.push(SseEvent::data(json!({
                                 "type": "response.function_call_arguments.delta",
@@ -1720,7 +1858,8 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                                 let id = b.get("id").and_then(|x| x.as_str()).unwrap_or("");
                                 let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
                                 let input = b.get("input").cloned().unwrap_or(json!({}));
-                                let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                                let args =
+                                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
                                 tool_calls.push(json!({
                                     "id": id, "type": "function",
                                     "function": {"name": name, "arguments": args}
@@ -1729,7 +1868,8 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                             "tool_result" => {
                                 // tool_result answers an assistant tool_use and
                                 // becomes a Chat `tool` message of its own.
-                                let id = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+                                let id =
+                                    b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
                                 let content = b.get("content").cloned().unwrap_or(json!(""));
                                 messages.push(json!({
                                     "role": "tool", "tool_call_id": id,
@@ -1829,7 +1969,13 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
             out["tool_choice"] = m;
         }
     }
-    if let Some(budget) = req
+    if let Some(e) = req
+        .pointer("/output_config/effort")
+        .and_then(|x| x.as_str())
+    {
+        // Adaptive round-trip: effort rides through `output_config`.
+        out["reasoning_effort"] = json!(e);
+    } else if let Some(budget) = req
         .pointer("/thinking/budget_tokens")
         .and_then(|x| x.as_i64())
     {
@@ -1839,13 +1985,20 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
             _ => "high",
         };
         out["reasoning_effort"] = json!(effort);
+    } else if req.pointer("/thinking/type").and_then(|x| x.as_str()) == Some("adaptive") {
+        // Bare adaptive (no effort, no budget): keep reasoning on for
+        // chat/responses upstreams at the middle level.
+        out["reasoning_effort"] = json!("medium");
     }
     out
 }
 
 /// Chat completion -> Anthropic Messages response object.
 pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
-    let msg = chat.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+    let msg = chat
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or(json!({}));
     let mut blocks: Vec<Value> = vec![];
 
     if let Some(r) = msg.get("reasoning_content").and_then(|x| x.as_str()) {
@@ -1860,8 +2013,14 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
     if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tcs {
             let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
-            let name = tc.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or("");
-            let args = tc.pointer("/function/arguments").and_then(|x| x.as_str()).unwrap_or("{}");
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let args = tc
+                .pointer("/function/arguments")
+                .and_then(|x| x.as_str())
+                .unwrap_or("{}");
             let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
             blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
         }
@@ -2007,14 +2166,23 @@ impl ChatToAnthropicStream {
 
         if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in tcs {
-                let new_call = tc.get("id").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty())
-                    || tc.pointer("/function/name").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty());
+                let new_call = tc
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                    || tc
+                        .pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|s| !s.is_empty());
                 if new_call {
                     self.close_open(&mut out);
                     let index = self.index;
                     self.index += 1;
                     let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                    let name = tc.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or("");
+                    let name = tc
+                        .pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
                     out.push(SseEvent::ev(
                         "content_block_start",
                         json!({
@@ -2117,7 +2285,7 @@ mod tests {
                 {"role": "user", "content": "next"}
             ]
         });
-        let out = openai_to_anthropic(&req);
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
         let msgs = out.get("messages").unwrap().as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "assistant");
@@ -2139,7 +2307,7 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
             "tool_choice": {"type": "function", "function": {"name": "f"}}
         });
-        let out = openai_to_anthropic(&req);
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
         assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "f"}));
         assert!(out.get("tools").is_some());
 
@@ -2149,7 +2317,7 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
             "tool_choice": "none"
         });
-        let out = openai_to_anthropic(&req);
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
         assert!(out.get("tools").is_none());
         assert!(out.get("tool_choice").is_none());
     }
@@ -2161,11 +2329,68 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "high"
         });
-        let out = openai_to_anthropic(&req);
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert_eq!(out["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(out["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn reasoning_effort_enabled_mode_keeps_legacy_shape() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+        let out = openai_to_anthropic(&req, ThinkingMode::Enabled);
         assert_eq!(
             out["thinking"],
             json!({"type": "enabled", "budget_tokens": 16384})
         );
+        assert!(out.get("output_config").is_none());
+
+        // No effort -> no thinking key at all.
+        let req = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = openai_to_anthropic(&req, ThinkingMode::Enabled);
+        assert!(out.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_thinking_shapes_map_to_reasoning_effort() {
+        // Adaptive round-trip: effort passes through output_config.
+        let out = anthropic_to_chat_request(&json!({
+            "model": "m",
+            "max_tokens": 10,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(out["reasoning_effort"], json!("low"));
+
+        // Bare adaptive: keep reasoning on at the middle level.
+        let out = anthropic_to_chat_request(&json!({
+            "model": "m",
+            "max_tokens": 10,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(out["reasoning_effort"], json!("medium"));
+
+        // Legacy enabled + budget maps by thresholds.
+        let out = anthropic_to_chat_request(&json!({
+            "model": "m",
+            "max_tokens": 10,
+            "thinking": {"type": "enabled", "budget_tokens": 20000},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(out["reasoning_effort"], json!("high"));
+
+        // No thinking config -> no reasoning_effort.
+        let out = anthropic_to_chat_request(&json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(out.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -2186,7 +2411,10 @@ mod tests {
         assert_eq!(msg["tool_calls"][0]["function"]["name"], json!("f"));
         assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
         assert_eq!(out["usage"]["prompt_tokens"], json!(10));
-        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], json!(7));
+        assert_eq!(
+            out["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(7)
+        );
         assert_eq!(out["usage"]["total_tokens"], json!(15));
     }
 
@@ -2216,8 +2444,18 @@ mod tests {
             .filter(|c| c.pointer("/choices/0/delta/tool_calls/0/id").is_some())
             .collect();
         assert_eq!(starts.len(), 2);
-        assert_eq!(starts[0].pointer("/choices/0/delta/tool_calls/0/index").unwrap(), 0);
-        assert_eq!(starts[1].pointer("/choices/0/delta/tool_calls/0/index").unwrap(), 1);
+        assert_eq!(
+            starts[0]
+                .pointer("/choices/0/delta/tool_calls/0/index")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            starts[1]
+                .pointer("/choices/0/delta/tool_calls/0/index")
+                .unwrap(),
+            1
+        );
         // thinking deltas surface as reasoning_content
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], json!("tool_calls"));
@@ -2317,15 +2555,24 @@ mod tests {
         assert_eq!(out["output"][0]["arguments"], json!("{\"x\":1}"));
         assert_eq!(out["usage"]["input_tokens"], json!(4));
         assert_eq!(out["usage"]["output_tokens"], json!(6));
-        assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], json!(2));
-        assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], json!(1));
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(2)
+        );
+        assert_eq!(
+            out["usage"]["output_tokens_details"]["reasoning_tokens"],
+            json!(1)
+        );
 
         let chat = json!({
             "choices": [{"index": 0, "finish_reason": "length", "message": {"role": "assistant", "content": "x"}}]
         });
         let out = chat_to_responses_response(&chat, "m");
         assert_eq!(out["status"], json!("incomplete"));
-        assert_eq!(out["incomplete_details"], json!({"reason": "max_output_tokens"}));
+        assert_eq!(
+            out["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
     }
 
     #[test]
@@ -2369,14 +2616,22 @@ mod tests {
         assert_eq!(ts[13], "response.completed");
 
         let last = events.last().unwrap();
-        let output = last.data.pointer("/response/output").unwrap().as_array().unwrap();
+        let output = last
+            .data
+            .pointer("/response/output")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "message");
         assert_eq!(output[0]["content"][0]["text"], "Hello");
         assert_eq!(output[1]["type"], "function_call");
         assert_eq!(output[1]["arguments"], "{}");
         assert_eq!(last.data.pointer("/response/status").unwrap(), "completed");
-        assert_eq!(last.data.pointer("/response/usage/input_tokens").unwrap(), 1);
+        assert_eq!(
+            last.data.pointer("/response/usage/input_tokens").unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2470,7 +2725,10 @@ mod tests {
         assert_eq!(out["max_tokens"], json!(100));
         assert_eq!(out["stop"], json!(["stop!"]));
         assert_eq!(out["reasoning_effort"], json!("high"));
-        assert_eq!(out["tool_choice"], json!({"type": "function", "function": {"name": "f"}}));
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "function": {"name": "f"}})
+        );
         assert_eq!(out["tools"][0]["function"]["name"], json!("f"));
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
@@ -2482,7 +2740,10 @@ mod tests {
         assert_eq!(msgs[2]["reasoning_content"], "hmm");
         assert_eq!(msgs[2]["content"], json!("calling"));
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "f");
-        assert_eq!(msgs[2]["tool_calls"][0]["function"]["arguments"], "{\"x\":1}");
+        assert_eq!(
+            msgs[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"x\":1}"
+        );
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "tu1");
         assert_eq!(msgs[3]["content"], "ok");
@@ -2538,8 +2799,14 @@ mod tests {
         assert_eq!(msg["content"], Value::Null);
         assert_eq!(msg["tool_calls"][0]["id"], json!("c1"));
         assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
-        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], json!(3));
-        assert_eq!(out["usage"]["completion_tokens_details"]["reasoning_tokens"], json!(2));
+        assert_eq!(
+            out["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(3)
+        );
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            json!(2)
+        );
     }
 
     // ---- chat -> responses upstream --------------------------------------

@@ -524,7 +524,7 @@ fn build_body(m: &ModelCfg, req: &Value, stream: bool) -> Value {
             v.as_object_mut().map(|o| o.remove("x_nervogate"));
             v
         }
-        Protocol::Anthropic => openai_to_anthropic(req),
+        Protocol::Anthropic => openai_to_anthropic(req, m.thinking_mode()),
         Protocol::Responses => chat_to_responses_request(req),
     };
     body["model"] = json!(upstream);

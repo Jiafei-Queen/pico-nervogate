@@ -267,9 +267,9 @@ pub fn merge_model(cfg: &ModelCfg, store: &Store) -> Merged {
     };
     // Vision = `image` in effective input modalities. `attachment` alone
     // is not enough (it can mean file attach only).
-    let image_in = eff_input.as_ref().is_some_and(|i| {
-        i.iter().any(|x| x.eq_ignore_ascii_case("image"))
-    });
+    let image_in = eff_input
+        .as_ref()
+        .is_some_and(|i| i.iter().any(|x| x.eq_ignore_ascii_case("image")));
 
     // Vision: explicit config wins; modalities override counts as config;
     // else inferred from models.dev; else default false.
@@ -284,15 +284,13 @@ pub fn merge_model(cfg: &ModelCfg, store: &Store) -> Merged {
         },
     };
 
-    let pick_str = |cfg_v: &Option<String>, dev_v: Option<&String>| {
-        cfg_v.clone().or_else(|| dev_v.cloned())
-    };
+    let pick_str =
+        |cfg_v: &Option<String>, dev_v: Option<&String>| cfg_v.clone().or_else(|| dev_v.cloned());
     let pick_bool = |cfg_v: Option<bool>, dev_v: Option<bool>| cfg_v.or(dev_v);
     let pick_u64 = |cfg_v: Option<u64>, dev_v: Option<u64>| cfg_v.or(dev_v);
     let pick_f64 = |cfg_v: Option<f64>, dev_v: Option<f64>| cfg_v.or(dev_v);
-    let pick_json = |cfg_v: &Option<Value>, dev_v: Option<&Value>| {
-        cfg_v.clone().or_else(|| dev_v.cloned())
-    };
+    let pick_json =
+        |cfg_v: &Option<Value>, dev_v: Option<&Value>| cfg_v.clone().or_else(|| dev_v.cloned());
     let cost = |f: fn(&DevCost) -> Option<f64>| dev.and_then(|d| d.cost.as_ref().and_then(f));
     let cost_json =
         |f: fn(&DevCost) -> Option<&Value>| dev.and_then(|d| d.cost.as_ref().and_then(f));
@@ -306,14 +304,8 @@ pub fn merge_model(cfg: &ModelCfg, store: &Store) -> Merged {
         family: pick_str(&cfg.family, dev.and_then(|d| d.family.as_ref())),
         model_type: pick_str(&cfg.model_type, dev.and_then(|d| d.model_type.as_ref())),
         knowledge: pick_str(&cfg.knowledge, dev.and_then(|d| d.knowledge.as_ref())),
-        release_date: pick_str(
-            &cfg.release_date,
-            dev.and_then(|d| d.release_date.as_ref()),
-        ),
-        last_updated: pick_str(
-            &cfg.last_updated,
-            dev.and_then(|d| d.last_updated.as_ref()),
-        ),
+        release_date: pick_str(&cfg.release_date, dev.and_then(|d| d.release_date.as_ref())),
+        last_updated: pick_str(&cfg.last_updated, dev.and_then(|d| d.last_updated.as_ref())),
         status: pick_str(&cfg.status, dev.and_then(|d| d.status.as_ref())),
         canonical_model_id: pick_str(
             &cfg.canonical_model_id,
@@ -326,10 +318,7 @@ pub fn merge_model(cfg: &ModelCfg, store: &Store) -> Merged {
             dev.and_then(|d| d.reasoning_options.as_ref()),
         ),
         tool_call: pick_bool(cfg.tool_call, dev.and_then(|d| d.tool_call)),
-        structured_output: pick_bool(
-            cfg.structured_output,
-            dev.and_then(|d| d.structured_output),
-        ),
+        structured_output: pick_bool(cfg.structured_output, dev.and_then(|d| d.structured_output)),
         temperature: pick_bool(cfg.temperature, dev.and_then(|d| d.temperature)),
         open_weights: pick_bool(cfg.open_weights, dev.and_then(|d| d.open_weights)),
         modalities,
@@ -358,14 +347,8 @@ pub fn merge_model(cfg: &ModelCfg, store: &Store) -> Merged {
         cost_input_audio: pick_f64(cfg.cost_input_audio, cost(|c| c.input_audio)),
         cost_output_audio: pick_f64(cfg.cost_output_audio, cost(|c| c.output_audio)),
         interleaved: pick_json(&cfg.interleaved, dev.and_then(|d| d.interleaved.as_ref())),
-        model_provider: pick_json(
-            &cfg.model_provider,
-            dev.and_then(|d| d.provider.as_ref()),
-        ),
-        experimental: pick_json(
-            &cfg.experimental,
-            dev.and_then(|d| d.experimental.as_ref()),
-        ),
+        model_provider: pick_json(&cfg.model_provider, dev.and_then(|d| d.provider.as_ref())),
+        experimental: pick_json(&cfg.experimental, dev.and_then(|d| d.experimental.as_ref())),
         matched,
     }
 }
@@ -533,6 +516,7 @@ mod tests {
             protocol: Protocol::Chat,
             base_url: None,
             extra_headers: HashMap::new(),
+            thinking_type: None,
             vision: None,
             models_dev_id: None,
             display_name: None,
@@ -685,11 +669,21 @@ mod tests {
 
         let meta = meta_json(&test_cfg("m"), &m);
         let dev = meta.pointer("/models_dev").unwrap();
-        for k in ["name", "type", "knowledge", "status", "attachment",
-            "reasoning_options", "structured_output", "temperature",
-            "open_weights", "canonical_model_id", "interleaved",
-            "provider", "experimental"]
-        {
+        for k in [
+            "name",
+            "type",
+            "knowledge",
+            "status",
+            "attachment",
+            "reasoning_options",
+            "structured_output",
+            "temperature",
+            "open_weights",
+            "canonical_model_id",
+            "interleaved",
+            "provider",
+            "experimental",
+        ] {
             assert!(dev.get(k).is_some(), "meta missing {k}");
         }
         assert_eq!(
@@ -700,7 +694,10 @@ mod tests {
             dev.pointer("/cost/reasoning").and_then(|v| v.as_f64()),
             Some(0.6)
         );
-        assert!(dev.pointer("/cost/tiers").and_then(|v| v.as_array()).is_some());
+        assert!(dev
+            .pointer("/cost/tiers")
+            .and_then(|v| v.as_array())
+            .is_some());
     }
 
     #[test]

@@ -20,8 +20,8 @@ under 1 MB of resident memory.
   - `POST /v1/chat/completions` — OpenAI Chat Completions (pass-through)
   - `POST /v1/responses` — OpenAI Responses API (translated to/from Chat)
   - `POST /v1/messages` — Anthropic Messages (translated to/from Chat)
-  Each model's `protocol` picks the upstream wire format (`chat` /
-  `anthropic` / `responses`), so any client surface can reach any upstream.
+    Each model's `protocol` picks the upstream wire format (`chat` /
+    `anthropic` / `responses`), so any client surface can reach any upstream.
 - **Full header pass-through** plus global (`[extra_headers]`) and per-model headers.
 - **Streaming**: server-sent events are parsed and re-emitted in the client's
   own framing — Chat (`data:` chunks + `[DONE]`), Responses (`response.*`
@@ -40,13 +40,13 @@ under 1 MB of resident memory.
 
 ## Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/healthz` | liveness check |
-| GET | `/v1/models` | list configured models (OpenAI model list shape) |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions in/out |
-| POST | `/v1/responses` | OpenAI Responses in → Chat up → Responses out |
-| POST | `/v1/messages` | Anthropic Messages in → Chat up → Anthropic out |
+| Method | Path                   | Description                                      |
+| ------ | ---------------------- | ------------------------------------------------ |
+| GET    | `/healthz`             | liveness check                                   |
+| GET    | `/v1/models`           | list configured models (OpenAI model list shape) |
+| POST   | `/v1/chat/completions` | OpenAI Chat Completions in/out                   |
+| POST   | `/v1/responses`        | OpenAI Responses in → Chat up → Responses out    |
+| POST   | `/v1/messages`         | Anthropic Messages in → Chat up → Anthropic out  |
 
 ## Quick start
 
@@ -75,20 +75,20 @@ Then point any OpenAI-compatible client at `http://localhost:8787/v1`.
 
 Top-level keys:
 
-| Key | Default | Description |
-|---|---|---|
-| `listen` | `0.0.0.0:8787` | bind address |
-| `api_key_env` | — | env var holding the upstream Bearer key |
-| `api_key` | — | inline key (prefer the env var) |
-| `session_id` / `session_header` | — | optional stable session header sent upstream |
-| `user_agent` | `pico-nervogate/<version>` | User-Agent sent upstream |
-| `default_base_url` | — | base URL for models without their own |
-| `owned_by` / `provider` | binary name | fields advertised by `/v1/models` |
-| `extra_headers` | — | headers added to every upstream request |
-| `[models_dev]` | disabled | models.dev enrichment for `/v1/models` |
-| `[reload]` | enabled | SIGHUP + mtime config hot-reload |
-| `[discovery]` | disabled | upstream `/models` auto-discovery |
-| `[[models]]` | — | one or more model definitions |
+| Key                             | Default                    | Description                                  |
+| ------------------------------- | -------------------------- | -------------------------------------------- |
+| `listen`                        | `0.0.0.0:8787`             | bind address                                 |
+| `api_key_env`                   | —                          | env var holding the upstream Bearer key      |
+| `api_key`                       | —                          | inline key (prefer the env var)              |
+| `session_id` / `session_header` | —                          | optional stable session header sent upstream |
+| `user_agent`                    | `pico-nervogate/<version>` | User-Agent sent upstream                     |
+| `default_base_url`              | —                          | base URL for models without their own        |
+| `owned_by` / `provider`         | binary name                | fields advertised by `/v1/models`            |
+| `extra_headers`                 | —                          | headers added to every upstream request      |
+| `[models_dev]`                  | disabled                   | models.dev enrichment for `/v1/models`       |
+| `[reload]`                      | enabled                    | SIGHUP + mtime config hot-reload             |
+| `[discovery]`                   | disabled                   | upstream `/models` auto-discovery            |
+| `[[models]]`                    | —                          | one or more model definitions                |
 
 `[models_dev]`: `enable`, `url` (default `https://models.dev/api.json`),
 `provider` (e.g. `opencode-go`; omit to search all), `refresh_interval_secs`
@@ -114,7 +114,12 @@ Explicit `[[models]]` entries always win; discovered models get models.dev
 enrichment automatically when their ids match.
 
 Each `[[models]]`: `name` (public id), `protocol` (`chat` | `anthropic` |
-`responses`), optional `upstream`, `base_url`, `vision`, `extra_headers`.
+`responses`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
+`thinking_type` (`adaptive` | `enabled`, default `adaptive`). `thinking_type`
+controls how `reasoning_effort` renders as `thinking` for `anthropic`
+upstreams: `adaptive` sends `thinking: {"type":"adaptive"}` +
+`output_config: {"effort": ...}` (newer models reject the legacy shape);
+`enabled` sends the legacy `{"type":"enabled","budget_tokens":N}`.
 Optional models.dev overrides (each set value wins over inferred data;
 keys mirror models.dev model entries, minus `id`):
 `models_dev_id`, `display_name`, `description`, `family`, `type`,
@@ -154,8 +159,11 @@ Translation details worth knowing:
 - **Tool calls** round-trip in all directions (`function_calls` ↔ `tool_use` ↔
   `function_call` items), including multi-call turns and tool results.
 - **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
-  Chat shape (with `reasoning_effort` ↔ `thinking.budget_tokens` ↔
-  `reasoning.effort` parameter mapping). Anthropic thinking block *signatures*
+  Chat shape. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
+  `thinking` — for `anthropic` upstreams the per-model `thinking_type` picks
+  the shape: `adaptive` (default) sends `thinking: {"type":"adaptive"}` +
+  `output_config.effort`; `enabled` sends `thinking.budget_tokens`. Anthropic
+  thinking block _signatures_
   are not preserved across protocols (they arrive as `""`), so multi-turn
   thinking replay against a strict Anthropic upstream may be rejected.
 - **Responses statefulness**: the gateway is stateless. `previous_response_id`

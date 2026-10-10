@@ -21,6 +21,22 @@ impl Default for Protocol {
     }
 }
 
+/// How the gateway renders `thinking` for Anthropic upstreams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    /// Legacy `{"type":"enabled","budget_tokens":N}` (effort → budget).
+    Enabled,
+    /// `{"type":"adaptive"}` — upstream decides the budget.
+    Adaptive,
+}
+
+impl Default for ThinkingMode {
+    fn default() -> Self {
+        ThinkingMode::Adaptive
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelCfg {
     /// Public model id exposed to clients.
@@ -35,6 +51,10 @@ pub struct ModelCfg {
     /// Extra headers merged for this model only.
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Anthropic upstream `thinking` shape: `adaptive` (default) or
+    /// `enabled`. Only affects `protocol = "anthropic"` upstreams.
+    #[serde(default)]
+    pub thinking_type: Option<ThinkingMode>,
     /// Whether the model accepts image input (advertised via /v1/models).
     /// `None` (unset) lets models.dev inference fill it in; `Some(_)`
     /// always wins over inferred metadata.
@@ -140,9 +160,16 @@ impl ModelCfg {
         self.vision.unwrap_or(false)
     }
 
+    /// Thinking shape for Anthropic upstreams; unset defaults to `adaptive`.
+    pub fn thinking_mode(&self) -> ThinkingMode {
+        self.thinking_type.unwrap_or_default()
+    }
+
     /// Id used for models.dev matching: explicit override, else upstream.
     pub fn match_id(&self) -> &str {
-        self.models_dev_id.as_deref().unwrap_or_else(|| self.upstream_model())
+        self.models_dev_id
+            .as_deref()
+            .unwrap_or_else(|| self.upstream_model())
     }
 
     /// Constructor for auto-discovered models. Metadata stays unset so
@@ -155,6 +182,7 @@ impl ModelCfg {
             protocol,
             base_url: Some(base_url),
             extra_headers: HashMap::new(),
+            thinking_type: None,
             vision: None,
             models_dev_id: None,
             display_name: None,
@@ -366,8 +394,7 @@ fn default_user_agent() -> String {
 
 impl Config {
     pub fn load(path: &str) -> Result<Config, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|e| format!("read config {path}: {e}"))?;
+        let text = fs::read_to_string(path).map_err(|e| format!("read config {path}: {e}"))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("parse config: {e}"))?;
         if cfg.models.is_empty() {
             return Err("config has no [[models]]".to_string());
@@ -459,12 +486,60 @@ experimental = { modes = {} }
         );
         assert_eq!(m.input_limit, Some(50));
         assert_eq!(m.cost_reasoning, Some(0.6));
-        assert!(m.reasoning_options.as_ref().and_then(|v| v.as_array()).is_some());
+        assert!(m
+            .reasoning_options
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_some());
         assert!(m.cost_tiers.as_ref().and_then(|v| v.as_array()).is_some());
-        assert!(m.cost_context_over_200k.as_ref().and_then(|v| v.as_object()).is_some());
+        assert!(m
+            .cost_context_over_200k
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .is_some());
         assert!(m.interleaved.as_ref().and_then(|v| v.as_object()).is_some());
-        assert!(m.model_provider.as_ref().and_then(|v| v.as_object()).is_some());
-        assert!(m.experimental.as_ref().and_then(|v| v.as_object()).is_some());
+        assert!(m
+            .model_provider
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .is_some());
+        assert!(m
+            .experimental
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .is_some());
+    }
+
+    #[test]
+    fn thinking_type_parses_with_adaptive_default() {
+        // Unset -> Adaptive.
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "anthropic"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.models[0].thinking_mode(), ThinkingMode::Adaptive);
+
+        // Explicit legacy override.
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "anthropic"
+thinking_type = "enabled"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.models[0].thinking_mode(), ThinkingMode::Enabled);
+
+        // Explicit adaptive.
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "anthropic"
+thinking_type = "adaptive"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.models[0].thinking_mode(), ThinkingMode::Adaptive);
     }
 
     #[test]
