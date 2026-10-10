@@ -52,6 +52,12 @@ protocol = "chat"
 prune_missing = true
 
 # --- /v1/messages (Anthropic Messages, translated) ---
+# Claude Haiku: clients spell it with a dot, upstream lists it with dashes.
+[[models]]
+name = "claude-haiku-5.5"
+upstream = "claude-haiku-5-5"
+protocol = "anthropic"
+
 [[models]]
 name = "minimax-m3"
 protocol = "anthropic"

@@ -42,10 +42,37 @@ type St = Arc<Inner>;
 /// Static lookup first, discovered fallback. Explicit `[[models]]`
 /// entries always win over auto-discovered ones.
 fn find_model(st: &St, name: &str) -> Option<ModelCfg> {
-    if let Some(m) = st.models.read().unwrap().get(name) {
+    let statics = st.models.read().unwrap();
+    let discovered = st.discovered.read().unwrap();
+    find_model_in(&statics, &discovered, name)
+}
+
+/// Static lookup first, discovered fallback. Explicit `[[models]]`
+/// entries always win over auto-discovered ones. On an exact miss, one
+/// separator-insensitive retry (`claude-haiku-5.5` matches upstream
+/// `claude-haiku-5-5`) — only when unambiguous, otherwise None.
+fn find_model_in(
+    statics: &HashMap<String, ModelCfg>,
+    discovered: &HashMap<String, ModelCfg>,
+    name: &str,
+) -> Option<ModelCfg> {
+    if let Some(m) = statics.get(name) {
         return Some(m.clone());
     }
-    st.discovered.read().unwrap().get(name).cloned()
+    if let Some(m) = discovered.get(name) {
+        return Some(m.clone());
+    }
+    let want = models_dev::normalize(name);
+    let mut hit: Option<ModelCfg> = None;
+    for m in statics.values().chain(discovered.values()) {
+        if models_dev::normalize(&m.name) == want {
+            if hit.is_some() {
+                return None; // ambiguous: refuse to guess
+            }
+            hit = Some(m.clone());
+        }
+    }
+    hit
 }
 
 #[tokio::main]
@@ -834,4 +861,66 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
         status,
         json!({"error": {"message": msg, "type": "gateway_error"}}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::Protocol;
+
+    fn tables() -> (HashMap<String, ModelCfg>, HashMap<String, ModelCfg>) {
+        let mut statics = HashMap::new();
+        statics.insert(
+            "pinned".to_string(),
+            ModelCfg::discovered(
+                "pinned".to_string(),
+                Protocol::Responses,
+                "https://h/v1".to_string(),
+            ),
+        );
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "claude-haiku-5-5".to_string(),
+            ModelCfg::discovered(
+                "claude-haiku-5-5".to_string(),
+                Protocol::Chat,
+                "https://h/v1".to_string(),
+            ),
+        );
+        (statics, discovered)
+    }
+
+    #[test]
+    fn lookup_prefers_exact_then_static() {
+        let (s, d) = tables();
+        assert_eq!(find_model_in(&s, &d, "pinned").unwrap().name, "pinned");
+        assert_eq!(
+            find_model_in(&s, &d, "claude-haiku-5-5").unwrap().name,
+            "claude-haiku-5-5"
+        );
+        assert!(find_model_in(&s, &d, "nope").is_none());
+    }
+
+    #[test]
+    fn lookup_falls_back_to_normalized_match() {
+        let (s, d) = tables();
+        // Dotted client spelling matches the dashed upstream id.
+        let m = find_model_in(&s, &d, "claude-haiku-5.5").unwrap();
+        assert_eq!(m.name, "claude-haiku-5-5");
+    }
+
+    #[test]
+    fn lookup_refuses_ambiguous_normalized_match() {
+        let (mut s, d) = tables();
+        // Same normalized form as the discovered entry, but explicit.
+        s.insert(
+            "claude.haiku_5-5".to_string(),
+            ModelCfg::discovered(
+                "claude.haiku_5-5".to_string(),
+                Protocol::Chat,
+                "https://h/v1".to_string(),
+            ),
+        );
+        assert!(find_model_in(&s, &d, "claude-haiku-5.5").is_none());
+    }
 }
