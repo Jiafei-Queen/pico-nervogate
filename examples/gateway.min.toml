@@ -11,6 +11,37 @@ default_base_url = "https://api.example.com/v1"
 # owned_by = "my-provider"
 # provider = "my-provider"
 
+# Optional: enrich /v1/models with modalities/prices/limits from models.dev.
+# Local TOML stays the source of truth for routing; models.dev only adds
+# metadata. Any per-model field you set explicitly wins over inferred data.
+# [models_dev]
+# enable = true
+# provider = "opencode-go"   # omit to search all providers
+# url = "https://models.dev/api.json"
+# refresh_interval_secs = 86400  # 0 disables background refresh
+# cache_path = "./models.dev.json"  # disk fallback for offline startup
+
+# Hot-reload: re-reads the config file on SIGHUP and when its mtime
+# changes. Broken files are rejected, old config keeps serving. `listen`
+# changes need a restart (re-bind); everything else, incl. the API key
+# (re-read from env, so rotation works), applies live.
+# [reload]
+# enable = true            # read at startup; when false SIGHUP kills (default)
+# watch_interval_secs = 30 # mtime poll period; 0 = SIGHUP only
+
+# Optional: auto-discover upstream model ids from an OpenAI-compatible
+# {base}/models endpoint and merge them under explicit [[models]] entries.
+# Discovered models default to `protocol` below (pin special ones
+# explicitly); models.dev enrichment applies to them automatically.
+# [discovery]
+# enable = false
+# base_url = "https://api.example.com/v1"  # default: default_base_url
+# path = "/models"
+# interval_secs = 3600  # 0 = fetch once at startup only
+# protocol = "chat"     # chat | anthropic | responses
+# prefix = "gpt-"       # only discover matching ids; omit for all
+# prune_missing = false # true: drop discovered models that vanish upstream
+
 # Optional: send a stable session header upstream.
 # session_header = "x-session-id"
 # session_id = "my-client"
@@ -24,3 +55,22 @@ default_base_url = "https://api.example.com/v1"
 name = "my-model"
 protocol = "chat"
 vision = false
+# Optional per-model overrides (each set value wins over models.dev;
+# keys mirror models.dev model entries, minus `id`):
+# models_dev_id = "upstream-id-on-models-dev"
+# display_name = "..." | description = "..." | family = "..."
+# type = "embedding" | knowledge = "2024-12"
+# release_date = "..." | last_updated = "..." | status = "active"
+# canonical_model_id = "org/model"
+# attachment = true | reasoning = true | tool_call = true
+# structured_output = true | temperature = true | open_weights = true
+# reasoning_options = [{ type = "effort", values = ["none", "high"] }]
+# modalities_input = ["text", "image"] | modalities_output = ["text"]
+# context_limit = 1048576 | input_limit = 192000 | output_limit = 131072
+# cost_input = 0.435 | cost_output = 0.87
+# cost_cache_read = 0.003 | cost_cache_write = 0.0
+# cost_reasoning = 0.6 | cost_input_audio = 1.5 | cost_output_audio = 3.0
+# cost_tiers = [{ input = 5.0, tier = { type = "context", size = 32000 } }]
+# cost_context_over_200k = { input = 4.0, output = 8.0 }
+# interleaved = { field = "reasoning_content" }
+# provider = { npm = "@ai-sdk/openai-compatible" } | experimental = { ... }

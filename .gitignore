@@ -2,3 +2,4 @@
 .env.remote
 .env
 gateway.local.toml
+models.dev.json

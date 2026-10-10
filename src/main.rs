@@ -1,9 +1,12 @@
 mod config;
+mod discovery;
+mod models_dev;
 mod translate;
 
 use std::collections::HashMap;
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -13,22 +16,37 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 use config::{Config, ModelCfg, Protocol};
+use discovery::refresh_discovery;
 use translate::{
     anthropic_to_openai, chat_to_responses_request, openai_to_anthropic, responses_to_chat_request,
     responses_to_openai, AnthropicStream, ResponsesStream,
 };
 
 struct Inner {
-    cfg: Config,
-    api_key: String,
+    cfg: RwLock<Config>,
+    api_key: RwLock<String>,
     client: reqwest::Client,
-    models: HashMap<String, ModelCfg>,
+    /// Explicit models from TOML. Always wins over `discovered`.
+    models: RwLock<HashMap<String, ModelCfg>>,
+    /// Auto-discovered upstream models (see `[discovery]`).
+    discovered: RwLock<HashMap<String, ModelCfg>>,
+    enrichment: Arc<std::sync::RwLock<models_dev::Store>>,
+    config_path: String,
+    config_mtime: RwLock<Option<SystemTime>>,
 }
 
 type St = Arc<Inner>;
+
+/// Static lookup first, discovered fallback. Explicit `[[models]]`
+/// entries always win over auto-discovered ones.
+fn find_model(st: &St, name: &str) -> Option<ModelCfg> {
+    if let Some(m) = st.models.read().unwrap().get(name) {
+        return Some(m.clone());
+    }
+    st.discovered.read().unwrap().get(name).cloned()
+}
 
 #[tokio::main]
 async fn main() {
@@ -57,14 +75,142 @@ async fn main() {
         .build()
         .expect("build http client");
 
+    // models.dev enrichment: fetch once at startup (cache fallback).
+    // Periodic refresh runs in the maintenance loop below. Never fatal:
+    // an empty store means plain (unenriched) behavior.
+    let enrichment = Arc::new(std::sync::RwLock::new(models_dev::Store::empty()));
+    if cfg.models_dev.enable {
+        let loaded = load_enrichment(
+            &client,
+            &cfg.models_dev.url,
+            cfg.models_dev.provider.as_deref(),
+            cfg.models_dev.cache_path.as_deref(),
+        )
+        .await;
+        eprintln!(
+            "[gw] models.dev: {} entries (provider={})",
+            loaded.len(),
+            cfg.models_dev.provider.as_deref().unwrap_or("all")
+        );
+        *enrichment.write().unwrap() = loaded;
+    }
+
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     let listen = cfg.listen.clone();
     let n = models.len();
+    let reload_boot = cfg.reload.enable;
     let state: St = Arc::new(Inner {
-        cfg,
-        api_key,
+        cfg: RwLock::new(cfg),
+        api_key: RwLock::new(api_key),
         client,
-        models,
+        models: RwLock::new(models),
+        discovered: RwLock::new(HashMap::new()),
+        enrichment,
+        config_path: path,
+        config_mtime: RwLock::new(mtime),
     });
+
+    if state.cfg.read().unwrap().discovery.enable {
+        match refresh_discovery(&state).await {
+            Ok(d) => eprintln!("[gw] discovery: {d} models"),
+            Err(e) => eprintln!("[gw] discovery failed at startup: {e}"),
+        }
+    }
+
+    // Maintenance loop: config mtime watch, models.dev refresh, discovery
+    // refresh. Single task, 15s tick; each job re-reads live config and
+    // fires only when its own interval has elapsed.
+    {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            const TICK_SECS: u64 = 15;
+            let mut last_watch = Instant::now();
+            let mut last_enrich = Instant::now();
+            let mut last_discover = Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+
+                let (r_enable, w_interval) = {
+                    let c = st.cfg.read().unwrap();
+                    (c.reload.enable, c.reload.watch_interval_secs)
+                };
+                if r_enable && w_interval > 0 && last_watch.elapsed().as_secs() >= w_interval
+                {
+                    last_watch = Instant::now();
+                    match reload_config(&st, false).await {
+                        Ok(msg) if msg != "unchanged" => eprintln!("[gw] reload: {msg}"),
+                        Err(e) => eprintln!("[gw] reload failed: {e}"),
+                        _ => {}
+                    }
+                }
+
+                let (e_enable, e_interval) = {
+                    let c = st.cfg.read().unwrap();
+                    (c.models_dev.enable, c.models_dev.refresh_interval_secs)
+                };
+                if e_enable && e_interval > 0 && last_enrich.elapsed().as_secs() >= e_interval
+                {
+                    last_enrich = Instant::now();
+                    let (url, provider, cache) = {
+                        let c = st.cfg.read().unwrap();
+                        (
+                            c.models_dev.url.clone(),
+                            c.models_dev.provider.clone(),
+                            c.models_dev.cache_path.clone(),
+                        )
+                    };
+                    let next =
+                        load_enrichment(&st.client, &url, provider.as_deref(), cache.as_deref())
+                            .await;
+                    eprintln!("[gw] models.dev: refreshed ({} entries)", next.len());
+                    // Keep the old store if refresh yields nothing and we
+                    // already have data (avoids flapping on transient errors).
+                    if next.is_empty() && !st.enrichment.read().unwrap().is_empty() {
+                        eprintln!("[gw] models.dev: refresh empty, keeping old data");
+                    } else {
+                        *st.enrichment.write().unwrap() = next;
+                    }
+                }
+
+                let (d_enable, d_interval) = {
+                    let c = st.cfg.read().unwrap();
+                    (c.discovery.enable, c.discovery.interval_secs)
+                };
+                if d_enable && d_interval > 0 && last_discover.elapsed().as_secs() >= d_interval
+                {
+                    last_discover = Instant::now();
+                    match refresh_discovery(&st).await {
+                        Ok(d) => eprintln!("[gw] discovery: refreshed ({d} models)"),
+                        Err(e) => eprintln!("[gw] discovery refresh failed: {e}"),
+                    }
+                }
+            }
+        });
+    }
+
+    // SIGHUP reloads the config file. The master switch is read at startup:
+    // when disabled, no handler is installed and SIGHUP keeps its default
+    // (terminate) behavior.
+    #[cfg(unix)]
+    if reload_boot {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[gw] sighup watch unavailable: {e}");
+                        return;
+                    }
+                };
+            while sig.recv().await.is_some() {
+                match reload_config(&st, true).await {
+                    Ok(msg) => eprintln!("[gw] sighup reload: {msg}"),
+                    Err(e) => eprintln!("[gw] sighup reload failed: {e}"),
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -85,21 +231,167 @@ async fn healthz() -> Response {
 }
 
 async fn list_models(State(st): State<St>) -> Response {
-    let data: Vec<Value> = st
-        .models
+    let store = st.enrichment.read().unwrap();
+    let statics = st.models.read().unwrap();
+    let discovered = st.discovered.read().unwrap();
+    let cfg = st.cfg.read().unwrap();
+    let owned_by = cfg
+        .owned_by
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string());
+    let provider = cfg
+        .provider
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string());
+    let mut data: Vec<Value> = statics
         .values()
+        // Discovered ids shadowed by explicit entries are skipped: the
+        // explicit entry is already listed above.
+        .chain(discovered.values().filter(|m| !statics.contains_key(&m.name)))
         .map(|m| {
+            let merged = models_dev::merge_model(m, &store);
+            let meta = models_dev::meta_json(m, &merged);
             json!({
                 "id": m.name,
                 "object": "model",
                 "created": 0,
-                "owned_by": st.cfg.owned_by.as_deref().unwrap_or(env!("CARGO_PKG_NAME")),
-                "provider": st.cfg.provider.as_deref().unwrap_or(env!("CARGO_PKG_NAME")),
-                "info": {"meta": {"capabilities": {"vision": m.vision}}}
+                "owned_by": owned_by,
+                "provider": provider,
+                "info": {"meta": meta}
             })
         })
         .collect();
+    // Stable ordering for clients/diffs.
+    data.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|x| x.as_str())
+            .cmp(&b.get("id").and_then(|x| x.as_str()))
+    });
     json_response(StatusCode::OK, json!({"object": "list", "data": data}))
+}
+
+/// Reload the config file into live state. Validates before swapping, so a
+/// broken file keeps the old config serving. Returns a short summary.
+async fn reload_config(st: &St, force: bool) -> Result<String, String> {
+    let path = st.config_path.clone();
+    let mtime = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok();
+    if !force {
+        let cur = *st.config_mtime.read().unwrap();
+        if cur.is_some() && mtime == cur {
+            return Ok("unchanged".to_string());
+        }
+    }
+    let cfg = Config::load(&path)?;
+    // Re-resolve the key (env): supports rotation without restart.
+    let api_key = cfg.api_key()?;
+    let old = st.cfg.read().unwrap().clone();
+
+    let mut models = HashMap::new();
+    for m in &cfg.models {
+        models.insert(m.name.clone(), m.clone());
+    }
+    let n = models.len();
+    let d = st.discovered.read().unwrap().len();
+
+    if old.listen != cfg.listen {
+        eprintln!(
+            "[gw] reload: `listen` changed ({} -> {}); rebind requires restart, still on {}",
+            old.listen, cfg.listen, old.listen
+        );
+    }
+    let models_dev_changed = old.models_dev.enable != cfg.models_dev.enable
+        || old.models_dev.url != cfg.models_dev.url
+        || old.models_dev.provider != cfg.models_dev.provider;
+    let discovery_changed = old.discovery.enable != cfg.discovery.enable
+        || old.discovery.base_url != cfg.discovery.base_url
+        || old.discovery.path != cfg.discovery.path
+        || old.discovery.protocol != cfg.discovery.protocol
+        || old.discovery.prefix != cfg.discovery.prefix
+        || old.discovery.prune_missing != cfg.discovery.prune_missing;
+    let discovery_now_off = old.discovery.enable && !cfg.discovery.enable;
+
+    *st.cfg.write().unwrap() = cfg;
+    *st.models.write().unwrap() = models;
+    *st.api_key.write().unwrap() = api_key;
+    *st.config_mtime.write().unwrap() = mtime;
+
+    // React promptly to section changes instead of waiting for the next tick.
+    if models_dev_changed {
+        let (url, provider, cache, enabled) = {
+            let c = st.cfg.read().unwrap();
+            (
+                c.models_dev.url.clone(),
+                c.models_dev.provider.clone(),
+                c.models_dev.cache_path.clone(),
+                c.models_dev.enable,
+            )
+        };
+        if enabled {
+            let next =
+                load_enrichment(&st.client, &url, provider.as_deref(), cache.as_deref()).await;
+            eprintln!("[gw] models.dev: reloaded ({} entries)", next.len());
+            *st.enrichment.write().unwrap() = next;
+        } else {
+            *st.enrichment.write().unwrap() = models_dev::Store::empty();
+        }
+    }
+    if discovery_now_off {
+        st.discovered.write().unwrap().clear();
+    } else if discovery_changed && st.cfg.read().unwrap().discovery.enable {
+        match refresh_discovery(st).await {
+            Ok(count) => eprintln!("[gw] discovery: reloaded ({count} models)"),
+            Err(e) => eprintln!("[gw] discovery reload failed: {e}"),
+        }
+    }
+
+    Ok(format!("{n} static + {d} discovered models"))
+}
+
+/// Fetch api.json, parse for the configured provider, fall back to disk
+/// cache, else return an empty store (gateway keeps serving regardless).
+async fn load_enrichment(
+    client: &reqwest::Client,
+    url: &str,
+    provider: Option<&str>,
+    cache_path: Option<&str>,
+) -> models_dev::Store {
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(text) => match models_dev::parse_api_json(&text, provider) {
+                Ok(store) => {
+                    if let Some(p) = cache_path {
+                        if let Err(e) = std::fs::write(p, &text) {
+                            eprintln!("[gw] models.dev: cache write {p} failed: {e}");
+                        }
+                    }
+                    return store;
+                }
+                Err(e) => eprintln!("[gw] models.dev: parse failed: {e}"),
+            },
+            Err(e) => eprintln!("[gw] models.dev: read body failed: {e}"),
+        },
+        Ok(resp) => eprintln!("[gw] models.dev: http {} from {url}", resp.status()),
+        Err(e) => eprintln!("[gw] models.dev: fetch failed ({url}): {e}"),
+    }
+    // Fallback: disk cache.
+    if let Some(p) = cache_path {
+        match std::fs::read_to_string(p) {
+            Ok(text) => match models_dev::parse_api_json(&text, provider) {
+                Ok(store) => {
+                    eprintln!(
+                        "[gw] models.dev: using disk cache {p} ({} entries)",
+                        store.len()
+                    );
+                    return store;
+                }
+                Err(e) => eprintln!("[gw] models.dev: cache parse failed: {e}"),
+            },
+            Err(e) => eprintln!("[gw] models.dev: no cache at {p}: {e}"),
+        }
+    }
+    models_dev::Store::empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -108,14 +400,16 @@ async fn list_models(State(st): State<St>) -> Response {
 
 fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
     let mut h = HeaderMap::new();
-    let bearer = format!("Bearer {}", st.api_key);
+    let api_key = st.api_key.read().unwrap().clone();
+    let cfg = st.cfg.read().unwrap();
+    let bearer = format!("Bearer {api_key}");
     if let Ok(v) = HeaderValue::from_str(&bearer) {
         h.insert(header::AUTHORIZATION, v);
     }
-    if let Ok(v) = HeaderValue::from_str(&st.cfg.user_agent) {
+    if let Ok(v) = HeaderValue::from_str(&cfg.user_agent) {
         h.insert(header::USER_AGENT, v);
     }
-    if let (Some(session_id), Some(session_header)) = (&st.cfg.session_id, &st.cfg.session_header) {
+    if let (Some(session_id), Some(session_header)) = (&cfg.session_id, &cfg.session_header) {
         if let (Ok(v), Ok(name)) = (
             HeaderValue::from_str(session_id),
             header::HeaderName::from_bytes(session_header.as_bytes()),
@@ -123,7 +417,7 @@ fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
             h.insert(name, v);
         }
     }
-    for (k, v) in st.cfg.extra_headers.iter().chain(m.extra_headers.iter()) {
+    for (k, v) in cfg.extra_headers.iter().chain(m.extra_headers.iter()) {
         if let (Ok(name), Ok(val)) = (
             header::HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
@@ -132,7 +426,7 @@ fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
         }
     }
     if m.protocol == Protocol::Anthropic {
-        if let Ok(v) = HeaderValue::from_str(&st.api_key) {
+        if let Ok(v) = HeaderValue::from_str(&api_key) {
             h.insert(header::HeaderName::from_static("x-api-key"), v);
         }
         h.insert(
@@ -218,6 +512,8 @@ async fn call_upstream(
 ) -> Result<reqwest::Response, UpstreamError> {
     let base = st
         .cfg
+        .read()
+        .unwrap()
         .base_url_for(m)
         .map_err(UpstreamError::Message)?;
     let url = upstream_url(&base, m);
@@ -291,8 +587,8 @@ async fn chat(State(st): State<St>, body: Bytes) -> Response {
         Some(n) => n.to_string(),
         None => return error_json(StatusCode::BAD_REQUEST, "missing field: model"),
     };
-    let m = match st.models.get(&name) {
-        Some(m) => m.clone(),
+    let m = match find_model(&st, &name) {
+        Some(m) => m,
         None => {
             eprintln!("[gw] req unknown-model={name}");
             return error_json(StatusCode::NOT_FOUND, &format!("unknown model: {name}"));
@@ -349,8 +645,8 @@ async fn responses_ingress(State(st): State<St>, body: Bytes) -> Response {
         Some(n) => n.to_string(),
         None => return error_json(StatusCode::BAD_REQUEST, "missing field: model"),
     };
-    let m = match st.models.get(&name) {
-        Some(m) => m.clone(),
+    let m = match find_model(&st, &name) {
+        Some(m) => m,
         None => {
             eprintln!("[gw] req unknown-model={name}");
             return error_json(StatusCode::NOT_FOUND, &format!("unknown model: {name}"));
