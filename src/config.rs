@@ -4,10 +4,11 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// OpenAI-compatible POST {base}/chat/completions (pass-through).
+    #[default]
     Chat,
     /// Anthropic POST {base}/messages (translated).
     Anthropic,
@@ -15,26 +16,25 @@ pub enum Protocol {
     Responses,
 }
 
-impl Default for Protocol {
-    fn default() -> Self {
-        Protocol::Chat
+impl Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Protocol::Chat => "chat",
+            Protocol::Anthropic => "anthropic",
+            Protocol::Responses => "responses",
+        }
     }
 }
 
 /// How the gateway renders `thinking` for Anthropic upstreams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
     /// Legacy `{"type":"enabled","budget_tokens":N}` (effort → budget).
     Enabled,
     /// `{"type":"adaptive"}` — upstream decides the budget.
+    #[default]
     Adaptive,
-}
-
-impl Default for ThinkingMode {
-    fn default() -> Self {
-        ThinkingMode::Adaptive
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

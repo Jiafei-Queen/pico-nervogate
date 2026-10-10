@@ -448,7 +448,7 @@ async fn load_enrichment(
 // Upstream request builders
 // ---------------------------------------------------------------------------
 
-fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
+pub(crate) fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
     let mut h = HeaderMap::new();
     let api_key = st.api_key.read().unwrap().clone();
     let cfg = st.cfg.read().unwrap();
@@ -505,7 +505,7 @@ fn trunc(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
-fn upstream_url(base: &str, m: &ModelCfg) -> String {
+pub(crate) fn upstream_url(base: &str, m: &ModelCfg) -> String {
     let base = base.trim_end_matches('/');
     match m.protocol {
         Protocol::Chat => format!("{base}/chat/completions"),
@@ -982,6 +982,50 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
         status,
         json!({"error": {"message": msg, "type": "gateway_error"}}),
     )
+}
+
+/// Minimal in-process state: no models, no upstream, no network.
+#[cfg(test)]
+pub(crate) fn test_state(cfg: Config) -> St {
+    // The static model table is normally built from `cfg.models` in `main`;
+    // tests reach the state through this constructor, so it has to happen
+    // here too or every model reads as unknown.
+    let models: HashMap<String, ModelCfg> = cfg
+        .models
+        .iter()
+        .map(|m| (m.name.clone(), m.clone()))
+        .collect();
+    Arc::new(Inner {
+        cfg: RwLock::new(cfg),
+        api_key: RwLock::new("test-key".into()),
+        client: reqwest::Client::new(),
+        models: RwLock::new(models),
+        discovered: RwLock::new(HashMap::new()),
+        enrichment: Arc::new(RwLock::new(models_dev::Store::empty())),
+        config_path: String::new(),
+        config_mtime: RwLock::new(None),
+    })
+}
+
+
+#[cfg(test)]
+fn sample_config() -> Config {
+    Config {
+        listen: "127.0.0.1:0".into(),
+        api_key_env: None,
+        api_key: Some("k".into()),
+        session_id: None,
+        session_header: None,
+        user_agent: "test".into(),
+        default_base_url: None,
+        owned_by: None,
+        provider: None,
+        extra_headers: HashMap::new(),
+        models_dev: Default::default(),
+        reload: Default::default(),
+        discovery: Default::default(),
+        models: vec![],
+    }
 }
 
 #[cfg(test)]

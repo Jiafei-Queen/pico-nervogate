@@ -113,6 +113,14 @@ additive only; `true` drops discovered models that vanish upstream).
 Explicit `[[models]]` entries always win; discovered models get models.dev
 enrichment automatically when their ids match.
 
+A `/models` list says nothing about which completion endpoint the upstream
+speaks, so a wrong `protocol` makes every discovered model fail with a 404
+at request time. The gateway probes one discovered model with a `max_tokens:
+1` request per refresh — one request in the common case, since `chat` is
+tried first — and logs the result (`discovery: upstream speaks
+\`anthropic\``). A `404`/`405`means "not this endpoint"; any other status
+means the endpoint is real. Set`protocol` explicitly to skip probing.
+
 Each `[[models]]`: `name` (public id), `protocol` (`chat` | `anthropic` |
 `responses`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
 `thinking_type` (`adaptive` | `enabled`, default `adaptive`). `thinking_type`
