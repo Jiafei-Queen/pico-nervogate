@@ -75,20 +75,23 @@ Then point any OpenAI-compatible client at `http://localhost:8787/v1`.
 
 Top-level keys:
 
-| Key                             | Default                    | Description                                  |
-| ------------------------------- | -------------------------- | -------------------------------------------- |
-| `listen`                        | `0.0.0.0:8787`             | bind address                                 |
-| `api_key_env`                   | —                          | env var holding the upstream Bearer key      |
-| `api_key`                       | —                          | inline key (prefer the env var)              |
-| `session_id` / `session_header` | —                          | optional stable session header sent upstream |
-| `user_agent`                    | `pico-nervogate/<version>` | User-Agent sent upstream                     |
-| `default_base_url`              | —                          | base URL for models without their own        |
-| `owned_by` / `provider`         | binary name                | fields advertised by `/v1/models`            |
-| `extra_headers`                 | —                          | headers added to every upstream request      |
-| `[models_dev]`                  | disabled                   | models.dev enrichment for `/v1/models`       |
-| `[reload]`                      | enabled                    | SIGHUP + mtime config hot-reload             |
-| `[discovery]`                   | disabled                   | upstream `/models` auto-discovery            |
-| `[[models]]`                    | —                          | one or more model definitions                |
+| Key                             | Default                    | Description                                                                                                                    |
+| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `listen`                        | `0.0.0.0:8787`             | bind address                                                                                                                   |
+| `api_key_env`                   | —                          | env var holding the upstream Bearer key                                                                                        |
+| `api_key`                       | —                          | inline key (prefer the env var)                                                                                                |
+| `session_id` / `session_header` | —                          | optional stable session header sent upstream                                                                                   |
+| `user_agent`                    | `pico-nervogate/<version>` | User-Agent sent upstream                                                                                                       |
+| `default_base_url`              | —                          | base URL for models without their own                                                                                          |
+| `owned_by` / `provider`         | binary name                | fields advertised by `/v1/models`                                                                                              |
+| `extra_headers`                 | —                          | headers added to every upstream request                                                                                        |
+| `anthropic_max_tokens`          | `8192`                     | `max_tokens` sent to Anthropic upstreams when the client omitted it (Anthropic requires the field; Chat treats it as optional) |
+| `strict_params`                 | `false`                    | reject requests whose parameters the translation cannot carry, instead of warning on stderr                                    |
+| `max_body_bytes`                | `33554432` (32 MiB)        | largest client request body accepted; `0` disables the limit                                                                   |
+| `[models_dev]`                  | disabled                   | models.dev enrichment for `/v1/models`                                                                                         |
+| `[reload]`                      | enabled                    | SIGHUP + mtime config hot-reload                                                                                               |
+| `[discovery]`                   | disabled                   | upstream `/models` auto-discovery                                                                                              |
+| `[[models]]`                    | —                          | one or more model definitions                                                                                                  |
 
 `[models_dev]`: `enable`, `url` (default `https://models.dev/api.json`),
 `provider` (e.g. `opencode-go`; omit to search all), `refresh_interval_secs`

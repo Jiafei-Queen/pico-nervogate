@@ -27,17 +27,35 @@ pub fn gen_id(prefix: &str) -> String {
 pub fn content_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
         Value::Array(parts) => {
             let mut out = String::new();
             for p in parts {
                 if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
                     out.push_str(t);
+                } else if let Some(r) = p.get("refusal").and_then(|x| x.as_str()) {
+                    out.push_str(r);
                 }
             }
             out
         }
         _ => String::new(),
     }
+}
+
+/// Assistant message text for Chat egresses. Handles string, array, and null
+/// content, falling back to the top-level `refusal` field when content is
+/// empty so refusal-only turns are not silently dropped.
+fn chat_message_text(msg: &Value) -> String {
+    let text = content_text(msg.get("content").unwrap_or(&Value::Null));
+    if !text.is_empty() {
+        return text;
+    }
+    msg.get("refusal")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +207,10 @@ fn anthropic_image_to_openai(b: &Value) -> Option<Value> {
 }
 
 /// OpenAI user content -> Anthropic content blocks.
+///
+/// Block types with no Anthropic equivalent (`input_audio`, `file`,
+/// `document`, ...) are reported instead of silently dropped: the client
+/// believes it sent the payload while the model never saw it.
 fn user_blocks(c: &Value) -> Vec<Value> {
     match c {
         Value::String(s) => {
@@ -208,12 +230,28 @@ fn user_blocks(c: &Value) -> Vec<Value> {
                         .filter(|t| !t.as_str().unwrap_or("").is_empty())
                         .map(|t| json!({"type": "text", "text": t.clone()})),
                     "image_url" => openai_image_to_anthropic(p),
-                    _ => None,
+                    other => {
+                        warn_dropped_block("openai_to_anthropic", other);
+                        None
+                    }
                 }
             })
             .collect(),
         _ => vec![],
     }
+}
+
+/// Log a content block the translation cannot represent. Silently skipping
+/// multimodal payloads is very hard to debug from the client side.
+pub fn warn_dropped_block(dir: &str, block_type: &str) {
+    // Text-ish and empty blocks are expected no-ops, not data loss.
+    if matches!(
+        block_type,
+        "" | "text" | "input_text" | "output_text" | "refusal"
+    ) {
+        return;
+    }
+    eprintln!("[gw] translate {dir}: dropped unsupported content block type `{block_type}`");
 }
 
 fn finish_from_anthropic(stop: &str) -> &'static str {
@@ -231,6 +269,9 @@ fn anthropic_stop(finish: &str) -> &'static str {
     match finish {
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
+        // Closes the round trip with `finish_from_anthropic`, which already
+        // maps `refusal` -> `content_filter`.
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }
@@ -267,14 +308,34 @@ fn thinking_budget(effort: &str) -> i64 {
     }
 }
 
+/// Fallback `max_tokens` for Anthropic upstreams when the client omitted
+/// it. Anthropic *requires* the field, Chat treats it as optional, so the
+/// gateway must supply something; the value is configurable.
+#[cfg(test)]
+pub const ANTHROPIC_DEFAULT_MAX_TOKENS: i64 = 8192;
+
+/// Translation with the built-in default. Production callers go through
+/// `openai_to_anthropic_with_max` so the value comes from config.
+#[cfg(test)]
 pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
+    openai_to_anthropic_with_max(req, thinking, ANTHROPIC_DEFAULT_MAX_TOKENS)
+}
+
+pub fn openai_to_anthropic_with_max(
+    req: &Value,
+    thinking: ThinkingMode,
+    default_max_tokens: i64,
+) -> Value {
     let mut out = serde_json::Map::new();
+    // `output_config` carries both `effort` (thinking) and `format`
+    // (structured outputs); build it once so the two never clobber each other.
+    let mut output_config: serde_json::Map<String, Value> = serde_json::Map::new();
 
     let max_tokens = req
         .get("max_tokens")
         .or_else(|| req.get("max_completion_tokens"))
         .cloned()
-        .unwrap_or(json!(4096));
+        .unwrap_or_else(|| json!(default_max_tokens));
     out.insert("max_tokens".into(), max_tokens);
 
     for k in ["temperature", "top_p"] {
@@ -339,7 +400,10 @@ pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
                             blocks.push(json!({"type":"thinking","thinking":r,"signature":""}));
                         }
                     }
-                    let text = content_text(m.get("content").unwrap_or(&Value::Null));
+                    // Falls back to the top-level `refusal` when `content`
+                    // is empty, so a refusal-only turn is not turned into a
+                    // blank assistant message.
+                    let text = chat_message_text(m);
                     if !text.is_empty() {
                         blocks.push(json!({"type":"text","text":text}));
                     }
@@ -411,6 +475,38 @@ pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
         out.insert("tools".into(), Value::Array(tools));
     }
 
+    // Structured outputs: Chat `response_format` -> Anthropic
+    // `output_config.format`. Dropping this silently returns free-form text
+    // where the caller expects schema-valid JSON.
+    if let Some(rf) = req.get("response_format") {
+        match rf.get("type").and_then(|x| x.as_str()) {
+            Some("json_object") => {
+                // Anthropic's `output_config.format` only accepts
+                // `json_schema`; sending `json_object` gets a 400 back.
+                // The closest faithful translation is an unconstrained
+                // object schema — the caller asked for "valid JSON object",
+                // and that is exactly what an empty object schema means.
+                output_config.insert(
+                    "format".into(),
+                    json!({"type": "json_schema", "schema": {"type": "object"}}),
+                );
+            }
+            Some("json_schema") => {
+                let schema = rf
+                    .pointer("/json_schema/schema")
+                    .cloned()
+                    .unwrap_or(json!({"type": "object"}));
+                output_config.insert(
+                    "format".into(),
+                    json!({"type": "json_schema", "schema": schema}),
+                );
+            }
+            // `text` is Anthropic's native (unconstrained) mode; nothing to do.
+            Some("text") | None => {}
+            _ => {}
+        }
+    }
+
     if let Some(e) = req.get("reasoning_effort").and_then(|x| x.as_str()) {
         if e != "none" {
             match thinking {
@@ -420,7 +516,7 @@ pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
                 // every Anthropic-protocol upstream tested so far.
                 ThinkingMode::Adaptive => {
                     out.insert("thinking".into(), json!({"type":"adaptive"}));
-                    out.insert("output_config".into(), json!({"effort": e}));
+                    output_config.insert("effort".into(), json!(e));
                 }
                 // Escape hatch for upstreams that only accept the legacy
                 // `enabled` + budget_tokens shape.
@@ -433,8 +529,50 @@ pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
             }
         }
     }
+    if !output_config.is_empty() {
+        out.insert("output_config".into(), Value::Object(output_config));
+    }
 
     Value::Object(out)
+}
+
+/// Request parameters a Chat -> Anthropic translation cannot carry over.
+/// Silently dropping them changes model behaviour, so the caller reports
+/// them (stderr always, HTTP 400 when `strict_params` is on).
+pub fn chat_to_anthropic_loss(req: &Value) -> Vec<&'static str> {
+    const LOST: &[&str] = &[
+        "n",
+        "frequency_penalty",
+        "presence_penalty",
+        "logit_bias",
+        "seed",
+        "logprobs",
+        "top_logprobs",
+        "user",
+        // `stream_options` is deliberately absent: dropping it only means
+        // "no OpenAI-style trailing usage chunk", which is the upstream
+        // default anyway and `Inbound::Chat::usage` already covers the
+        // ordering. Warning on it would fire on nearly every SDK request.
+    ];
+    LOST.iter()
+        .copied()
+        .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
+        .collect()
+}
+
+/// `n` changes the *shape* of the reply (one candidate vs many), so a
+/// caller indexing `choices[1]` breaks silently. It gets a hard 400 under
+/// `strict_params`. `parallel_tool_calls` is only warned about: OpenAI SDKs
+/// send it by default, so rejecting it would break otherwise-working setups.
+pub fn chat_to_anthropic_fatal(req: &Value) -> Option<String> {
+    if req.get("n").and_then(|x| x.as_i64()).unwrap_or(1) > 1 {
+        return Some(
+            "`n > 1` is not supported for Anthropic upstreams: the translation \
+             yields a single candidate and `choices[1]` would be undefined"
+                .to_string(),
+        );
+    }
+    None
 }
 
 pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
@@ -715,7 +853,7 @@ fn responses_input_parts(c: &Value) -> Vec<Value> {
                         }
                     }
                     "input_image" => parts.push(p.clone()),
-                    _ => {}
+                    other => warn_dropped_block("chat_to_responses_request", other),
                 }
             }
         }
@@ -891,6 +1029,72 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
         out.insert("include".into(), inc.clone());
     }
     Value::Object(out)
+}
+
+/// Parameters an Anthropic upstream is likely to reject because thinking is
+/// on.
+///
+/// Unlike [`chat_to_anthropic_loss`] these are **not** dropped — they are
+/// forwarded. Removing `temperature: 0` would let the caller believe the
+/// model is deterministic when it is not, which is a silent behaviour
+/// change; making them an error would break the Anthropic-protocol proxies
+/// that do accept them. So the gateway passes them through and says so.
+///
+/// Anthropic's docs state it as "you can't set a custom temperature while
+/// thinking is on, so it uses the default of 1"; upstreams that enforce it
+/// answer 400.
+///
+/// Only values differing from Anthropic's defaults (`temperature` 1,
+/// `top_p` 1) are reported. Forwarding the default is accepted, and warning
+/// on it would fire on essentially every request.
+pub fn chat_to_anthropic_thinking_conflict(req: &Value) -> Vec<&'static str> {
+    let thinking = req
+        .get("reasoning_effort")
+        .and_then(|x| x.as_str())
+        .is_some_and(|e| e != "none");
+    if !thinking {
+        return vec![];
+    }
+    let mut out = vec![];
+    for k in ["temperature", "top_p"] {
+        if req
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .is_some_and(|v| v != 1.0)
+        {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// Request parameters a Chat -> Responses translation cannot carry over.
+pub fn chat_to_responses_loss(req: &Value) -> Vec<&'static str> {
+    const LOST: &[&str] = &[
+        "frequency_penalty",
+        "presence_penalty",
+        "logit_bias",
+        "seed",
+        "n",
+        "stop",
+        "logprobs",
+    ];
+    LOST.iter()
+        .copied()
+        .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
+        .collect()
+}
+
+/// `n > 1` would silently collapse to a single candidate.
+pub fn chat_to_responses_fatal(req: &Value) -> Option<String> {
+    if req.get("n").and_then(|x| x.as_i64()).unwrap_or(1) > 1 {
+        return Some(
+            "`n > 1` is not supported for Responses upstreams: the translation \
+             yields a single candidate and `choices[1]` would be undefined"
+                .to_string(),
+        );
+    }
+    None
 }
 
 pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
@@ -1252,6 +1456,30 @@ pub fn responses_stateful_error(req: &Value) -> Option<String> {
                 .to_string(),
         );
     }
+    // `store: true` promises a retrievable response id, but there is no
+    // GET endpoint behind it. Silently downgrading it to `store: false`
+    // makes the client wait for an id that never resolves.
+    if req.get("store").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return Some(
+            "store: true is not supported: this gateway is stateless and keeps no \
+             response store; send store: false"
+                .to_string(),
+        );
+    }
+    // An `item_reference` points into that same store. Dropping it would
+    // silently remove earlier turns from the conversation.
+    if let Some(Value::Array(items)) = req.get("input") {
+        if items
+            .iter()
+            .any(|it| it.get("type").and_then(|t| t.as_str()) == Some("item_reference"))
+        {
+            return Some(
+                "`item_reference` input items are not supported: they reference a \
+                 server-side store this gateway does not keep; inline the item instead"
+                    .to_string(),
+            );
+        }
+    }
     None
 }
 
@@ -1286,7 +1514,7 @@ fn responses_content_to_chat_parts(c: &Value) -> Vec<Value> {
                         }
                     }
                     "image_url" => parts.push(p.clone()),
-                    _ => {}
+                    other => warn_dropped_block("responses_to_chat_request", other),
                 }
             }
         }
@@ -1519,6 +1747,9 @@ pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
     }
 
     let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    // `refusal` carries the reply when `content` is empty; dropping it
+    // yields an empty message the client cannot explain.
+    let refusal = msg.get("refusal").and_then(|c| c.as_str()).unwrap_or("");
     if !text.is_empty() {
         output.push(json!({
             "type": "message",
@@ -1526,6 +1757,14 @@ pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
             "role": "assistant",
             "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
+        }));
+    } else if !refusal.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": gen_id("msg_"),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "refusal", "refusal": refusal}]
         }));
     }
 
@@ -1548,6 +1787,8 @@ pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
         .unwrap_or("stop");
     let (status, incomplete) = match finish {
         "length" => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
+        // Not always a token limit: see `finish_from_incomplete`.
+        "content_filter" => ("incomplete", Some(json!({"reason": "content_filter"}))),
         _ => ("completed", None),
     };
     let (p, c, cached, reasoning_tok) = chat_usage_parts(chat.get("usage"));
@@ -2053,7 +2294,7 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                                     reasoning.push_str(t);
                                 }
                             }
-                            _ => {}
+                            other => warn_dropped_block("anthropic_to_chat_request", other),
                         }
                     }
                     if !tool_calls.is_empty() {
@@ -2179,8 +2420,13 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
         }
     }
     let text = msg.get("content").and_then(|x| x.as_str()).unwrap_or("");
+    let refusal = msg.get("refusal").and_then(|x| x.as_str()).unwrap_or("");
     if !text.is_empty() {
         blocks.push(json!({"type": "text", "text": text}));
+    } else if !refusal.is_empty() {
+        // Anthropic reports a refusal through `stop_reason: "refusal"` with
+        // the explanation in the text block; keeping the text preserves it.
+        blocks.push(json!({"type": "text", "text": refusal}));
     }
     if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tcs {
@@ -2898,7 +3144,15 @@ mod tests {
     fn stateful_fields_policy() {
         assert!(responses_stateful_error(&json!({"previous_response_id": "resp_1"})).is_some());
         assert!(responses_stateful_error(&json!({"background": true})).is_some());
-        assert!(responses_stateful_error(&json!({"store": true, "include": ["x"]})).is_none());
+        // Stateless: `store: true` promises a retrievable id with no endpoint
+        // behind it, and `item_reference` needs that same store.
+        assert!(responses_stateful_error(&json!({"store": true})).is_some());
+        assert!(responses_stateful_error(&json!({
+            "input": [{"type": "item_reference", "id": "msg_1"}]
+        }))
+        .is_some());
+        assert!(responses_stateful_error(&json!({"include": ["x"]})).is_none());
+        assert!(responses_stateful_error(&json!({"store": false})).is_none());
         assert!(responses_stateful_error(&json!({"input": "hi"})).is_none());
     }
 
@@ -3117,6 +3371,138 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "tu1");
         assert_eq!(msgs[3]["content"], "ok");
+    }
+
+    // ---- S-1: response_format survives the trip to Anthropic -------------
+
+    #[test]
+    fn response_format_maps_to_anthropic_output_config() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "person",
+                "schema": {"type": "object", "properties": {"n": {"type": "string"}}}
+            }}
+        });
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert_eq!(out["output_config"]["format"]["type"], json!("json_schema"));
+        // Anthropic takes the bare JSON Schema, not OpenAI's
+        // `{name, schema}` wrapper.
+        assert_eq!(
+            out["output_config"]["format"]["schema"]["properties"]["n"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
+    fn output_config_holds_both_effort_and_format() {
+        // Both features write `output_config`; neither may clobber the other.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "response_format": {"type": "json_schema", "json_schema": {
+                "schema": {"type": "object"}
+            }}
+        });
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert_eq!(out["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(out["output_config"]["effort"], json!("high"));
+        assert_eq!(out["output_config"]["format"]["type"], json!("json_schema"));
+        assert_eq!(
+            out["output_config"]["format"]["schema"]["type"],
+            json!("object")
+        );
+    }
+
+    #[test]
+    fn json_object_downgrades_to_an_unconstrained_object_schema() {
+        // Anthropic's `output_config.format` only accepts `json_schema`; the
+        // old mapping emitted `{"type":"json_object"}` and got a 400 back.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"}
+        });
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert_eq!(out["output_config"]["format"]["type"], json!("json_schema"));
+        assert_eq!(
+            out["output_config"]["format"]["schema"],
+            json!({"type": "object"})
+        );
+    }
+
+    #[test]
+    fn anthropic_max_tokens_default_is_configurable() {
+        let req = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(
+            openai_to_anthropic(&req, ThinkingMode::Adaptive)["max_tokens"],
+            json!(8192)
+        );
+        assert_eq!(
+            openai_to_anthropic_with_max(&req, ThinkingMode::Adaptive, 32000)["max_tokens"],
+            json!(32000)
+        );
+        // An explicit value always wins over the default.
+        let req = json!({"model": "m", "messages": [], "max_tokens": 50});
+        assert_eq!(
+            openai_to_anthropic_with_max(&req, ThinkingMode::Adaptive, 32000)["max_tokens"],
+            json!(50)
+        );
+    }
+
+    // ---- S-2: dropped parameters are reported ----------------------------
+
+    #[test]
+    fn unsupported_params_are_reported() {
+        let req = json!({
+            "model": "m", "messages": [],
+            "n": 3, "seed": 7, "logit_bias": {"a": 1}, "top_logprobs": 2
+        });
+        let lost = chat_to_anthropic_loss(&req);
+        assert!(lost.contains(&"n"));
+        assert!(lost.contains(&"seed"));
+        assert!(lost.contains(&"logit_bias"));
+        assert!(chat_to_anthropic_fatal(&req).is_some());
+        assert!(chat_to_anthropic_loss(&json!({"model": "m"})).is_empty());
+        assert!(chat_to_anthropic_fatal(&json!({"n": 1})).is_none());
+
+        let lost = chat_to_responses_loss(&req);
+        assert!(lost.contains(&"seed"));
+        assert!(chat_to_responses_fatal(&req).is_some());
+        assert!(chat_to_responses_loss(&json!({"model": "m"})).is_empty());
+    }
+
+    // ---- M-3: refusal survives -------------------------------------------
+
+    #[test]
+    fn refusal_only_turn_is_not_dropped() {
+        let chat = json!({
+            "choices": [{"index": 0, "finish_reason": "content_filter", "message": {
+                "role": "assistant", "content": Value::Null,
+                "refusal": "I cannot help with that"
+            }}]
+        });
+        // -> Anthropic
+        let out = chat_to_anthropic_response(&chat, "m");
+        assert_eq!(out["content"][0]["type"], "text");
+        assert_eq!(out["content"][0]["text"], "I cannot help with that");
+        // -> Responses
+        let out = chat_to_responses_response(&chat, "m");
+        assert_eq!(out["output"][0]["content"][0]["type"], "refusal");
+        assert_eq!(
+            out["output"][0]["content"][0]["refusal"],
+            "I cannot help with that"
+        );
+        // -> Anthropic request (assistant turn)
+        let out = openai_to_anthropic(
+            &json!({"model": "m", "messages": [{
+                "role": "assistant", "content": Value::Null, "refusal": "no"
+            }]}),
+            ThinkingMode::Adaptive,
+        );
+        assert_eq!(out["messages"][0]["content"][0]["text"], "no");
     }
 
     // ---- M-1: interleaved parallel tool calls ---------------------------
@@ -3406,6 +3792,42 @@ mod tests {
     }
 
     #[test]
+    fn content_filter_survives_both_egresses() {
+        // A content-filter stop is not a token limit. Reporting it as
+        // `completed`/`end_turn` dresses a truncated answer up as finished.
+        let chat = json!({
+            "choices": [{"index": 0, "finish_reason": "content_filter",
+                "message": {"role": "assistant", "content": "partial"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        });
+
+        // Non-streaming Responses egress.
+        let out = chat_to_responses_response(&chat, "m");
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "content_filter");
+
+        // Streaming Responses egress.
+        let mut s = ChatToResponsesStream::new("m");
+        let ev = s.handle(&chunk("i", "m", json!({}), Some("content_filter")));
+        let last = ev.last().unwrap();
+        assert_eq!(last.data["type"], "response.incomplete");
+        assert_eq!(
+            last.data["response"]["incomplete_details"]["reason"],
+            "content_filter"
+        );
+
+        // Anthropic egress: closes the round trip with
+        // `finish_from_anthropic`, which already maps `refusal`.
+        let out = chat_to_anthropic_response(&chat, "m");
+        assert_eq!(out["stop_reason"], "refusal");
+        assert_eq!(
+            anthropic_stop("content_filter"),
+            "refusal",
+            "streaming egress must agree with the non-streaming one"
+        );
+    }
+
+    #[test]
     fn tool_calls_without_index_are_not_merged_into_one() {
         // Compatibility upstreams that omit `tool_calls[].index` used to
         // collapse every parallel call onto key 0, concatenating their
@@ -3453,6 +3875,86 @@ mod tests {
         assert_eq!(blocks.len(), 2, "parallel calls must stay separate");
         assert_eq!(blocks[0].data["content_block"]["id"], "c1");
         assert_eq!(blocks[1].data["content_block"]["id"], "c2");
+    }
+
+    #[test]
+    fn stream_options_is_not_reported_as_a_loss() {
+        // Every OpenAI SDK sends `stream_options`; warning on it would fire
+        // on effectively every request and train operators to ignore the log.
+        let req = json!({"model": "m", "messages": [],
+            "stream_options": {"include_usage": true}});
+        assert!(chat_to_anthropic_loss(&req).is_empty());
+        assert!(chat_to_responses_loss(&req).is_empty());
+    }
+
+    // ---- M-6: thinking vs. sampling params -------------------------------
+
+    #[test]
+    fn thinking_with_sampling_params_is_reported_but_still_forwarded() {
+        // The decision (M-6): warn, do not strip. Stripping `temperature: 0`
+        // would make the caller believe the model is deterministic when it
+        // is not — a silent behaviour change, worse than the 400 it prevents.
+        let req = json!({
+            "model": "m", "messages": [],
+            "reasoning_effort": "high",
+            "temperature": 0, "top_p": 0.9
+        });
+        let conflicting = chat_to_anthropic_thinking_conflict(&req);
+        assert_eq!(conflicting, vec!["temperature", "top_p"]);
+
+        // Forwarded unchanged: the warning is not a euphemism for a strip.
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert_eq!(out["temperature"], 0);
+        assert_eq!(out["top_p"], 0.9);
+        assert_eq!(out["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn sampling_params_without_thinking_are_not_reported() {
+        // The common case: no thinking, no warning. A log line that fires on
+        // every request is a log line operators learn to skip.
+        let req = json!({"model": "m", "messages": [], "temperature": 0, "top_p": 0.9});
+        assert!(chat_to_anthropic_thinking_conflict(&req).is_empty());
+    }
+
+    #[test]
+    fn thinking_at_the_default_sampling_value_is_not_reported() {
+        // `temperature: 1` / `top_p: 1` are Anthropic's defaults and are
+        // accepted with thinking. Warning there would be pure noise — and
+        // some SDKs send them unconditionally.
+        let req = json!({
+            "model": "m", "messages": [],
+            "reasoning_effort": "high", "temperature": 1, "top_p": 1.0
+        });
+        assert!(chat_to_anthropic_thinking_conflict(&req).is_empty());
+    }
+
+    #[test]
+    fn thinking_effort_none_is_not_thinking() {
+        // `"none"` is the explicit off switch: it must not enable thinking,
+        // and so must not arm the warning either.
+        let req = json!({
+            "model": "m", "messages": [],
+            "reasoning_effort": "none", "temperature": 0
+        });
+        assert!(chat_to_anthropic_thinking_conflict(&req).is_empty());
+        // And it really is off: no `thinking` goes upstream.
+        let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+        assert!(out.get("thinking").is_none());
+        assert!(out.get("output_config").is_none());
+    }
+
+    #[test]
+    fn thinking_conflict_is_not_reported_as_a_dropped_param() {
+        // The two mechanisms must stay distinct: `loss` means "silently
+        // removed", this one means "forwarded but may be rejected". Merging
+        // them would make the log say temperature was dropped when it wasn't.
+        let req = json!({
+            "model": "m", "messages": [],
+            "reasoning_effort": "high", "temperature": 0
+        });
+        assert!(!chat_to_anthropic_loss(&req).contains(&"temperature"));
+        assert!(chat_to_anthropic_thinking_conflict(&req).contains(&"temperature"));
     }
 
     #[test]

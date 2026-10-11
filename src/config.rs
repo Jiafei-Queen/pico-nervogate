@@ -373,6 +373,15 @@ pub struct Config {
     /// Extra headers applied to every upstream request.
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// `max_tokens` the gateway sends to Anthropic upstreams when the client
+    /// omitted it (Anthropic requires the field; Chat treats it as optional).
+    /// A hardcoded default silently truncates long answers, so it is tunable.
+    #[serde(default = "default_anthropic_max_tokens")]
+    pub anthropic_max_tokens: i64,
+    /// Reject requests carrying parameters the translation would silently
+    /// drop (see PROTOCOL-AUDIT S-2). Off by default: warnings only.
+    #[serde(default)]
+    pub strict_params: bool,
     /// Largest client request body accepted, in bytes. Axum's built-in limit
     /// is 2 MiB, which rejects real workloads (base64 images, long agent
     /// histories) with a plain-text 413 that no SDK can parse. The gateway
@@ -397,6 +406,9 @@ fn default_listen() -> String {
 }
 fn default_user_agent() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+fn default_anthropic_max_tokens() -> i64 {
+    8192
 }
 fn default_max_body_bytes() -> usize {
     // 32 MiB. Large enough for a few hundred turns of conversation or a

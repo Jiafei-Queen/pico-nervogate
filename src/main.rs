@@ -20,10 +20,12 @@ use serde_json::{json, Value};
 use config::{Config, ModelCfg, Protocol};
 use discovery::refresh_discovery;
 use translate::{
-    anthropic_to_chat_request, anthropic_to_openai, chat_failure, chat_to_anthropic_response,
-    chat_to_responses_request, chat_to_responses_response, frame_data, frame_event,
-    openai_to_anthropic, responses_stateful_error, responses_to_chat_request, responses_to_openai,
-    AnthropicStream, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, SseEvent,
+    anthropic_to_chat_request, anthropic_to_openai, chat_failure, chat_to_anthropic_fatal,
+    chat_to_anthropic_loss, chat_to_anthropic_response, chat_to_anthropic_thinking_conflict,
+    chat_to_responses_fatal, chat_to_responses_loss, chat_to_responses_request,
+    chat_to_responses_response, frame_data, frame_event, openai_to_anthropic_with_max,
+    responses_stateful_error, responses_to_chat_request, responses_to_openai, AnthropicStream,
+    ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, SseEvent,
 };
 
 struct Inner {
@@ -557,7 +559,13 @@ pub(crate) fn upstream_url(base: &str, m: &ModelCfg) -> String {
 /// and `stream`). Routing an Anthropic request through the canonical chat
 /// shape and back would silently drop block-level `cache_control` (killing
 /// prompt caching), thinking signatures and `tool_result.is_error`.
-fn build_body(m: &ModelCfg, req: &Value, stream: bool, native: Option<&Value>) -> Value {
+fn build_body(
+    m: &ModelCfg,
+    req: &Value,
+    stream: bool,
+    native: Option<&Value>,
+    anthropic_max_tokens: i64,
+) -> Value {
     let upstream = m.upstream_model();
     let mut body = match native {
         Some(v) => {
@@ -573,7 +581,9 @@ fn build_body(m: &ModelCfg, req: &Value, stream: bool, native: Option<&Value>) -
                 v.as_object_mut().map(|o| o.remove("x_nervogate"));
                 v
             }
-            Protocol::Anthropic => openai_to_anthropic(req, m.thinking_mode()),
+            Protocol::Anthropic => {
+                openai_to_anthropic_with_max(req, m.thinking_mode(), anthropic_max_tokens)
+            }
             Protocol::Responses => chat_to_responses_request(req),
         },
     };
@@ -732,7 +742,13 @@ async fn call_upstream(
         .base_url_for(m)
         .map_err(UpstreamError::Message)?;
     let url = upstream_url(&base, m);
-    let body = build_body(m, req, stream, native);
+    let body = build_body(
+        m,
+        req,
+        stream,
+        native,
+        st.cfg.read().unwrap().anthropic_max_tokens,
+    );
     let t0 = now_ms();
     let stream_tag = if stream { "stream" } else { "nonstream" };
     let resp = match st
@@ -935,6 +951,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
 
     // Same protocol on both ends: forward the client's own body untouched.
     let native = ingress.protocol() == m.protocol;
+    let strict = st.cfg.read().unwrap().strict_params;
 
     // Normalize the ingress request to the canonical chat shape. Skipped
     // on the native path, which keeps the original body intact.
@@ -947,6 +964,49 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             Ingress::Anthropic => anthropic_to_chat_request(&req),
         }
     };
+
+    if !native {
+        let (lost, fatal) = match m.protocol {
+            Protocol::Anthropic => (
+                chat_to_anthropic_loss(&chat_req),
+                chat_to_anthropic_fatal(&chat_req),
+            ),
+            Protocol::Responses => (
+                chat_to_responses_loss(&chat_req),
+                chat_to_responses_fatal(&chat_req),
+            ),
+            Protocol::Chat => (vec![], None),
+        };
+        if let Some(msg) = fatal {
+            if strict {
+                return ingress_error(ingress, StatusCode::BAD_REQUEST, &msg);
+            }
+            eprintln!("[gw] req model={name}: {msg} (dropping; strict_params off)");
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "[gw] req model={name} protocol={}: dropped unsupported params: {}",
+                m.protocol.as_str(),
+                lost.join(", ")
+            );
+        }
+        // Forwarded, not dropped — so this warns but never rejects, even
+        // under `strict_params`. Anthropic-protocol upstreams differ on
+        // whether they enforce this, and a 400 here would break the ones
+        // that don't.
+        if m.protocol == Protocol::Anthropic {
+            let conflicting = chat_to_anthropic_thinking_conflict(&chat_req);
+            if !conflicting.is_empty() {
+                eprintln!(
+                    "[gw] req model={name} protocol=anthropic: thinking is on and \
+                     {} was also set; Anthropic may reject it (thinking fixes \
+                     sampling at the default of 1). Forwarding as-is — drop it \
+                     from the client request to avoid a 400.",
+                    conflicting.join(", ")
+                );
+            }
+        }
+    }
 
     let resp = match call_upstream(
         &st,
@@ -1659,6 +1719,8 @@ fn sample_config() -> Config {
         owned_by: None,
         provider: None,
         extra_headers: HashMap::new(),
+        anthropic_max_tokens: 8192,
+        strict_params: false,
         max_body_bytes: 32 * 1024 * 1024,
         models_dev: Default::default(),
         reload: Default::default(),
@@ -1960,7 +2022,7 @@ mod tests {
         // native path forwards the client's body verbatim.
         let m = ModelCfg::discovered("m".to_string(), Protocol::Anthropic, "https://h/v1".into());
         let req = json!({"model": "m", "x_nervogate": {"top_k": 5}});
-        let body = build_body(&m, &req, false, Some(&req));
+        let body = build_body(&m, &req, false, Some(&req), 4096);
         assert!(
             body.get("x_nervogate").is_none(),
             "reserved key leaked upstream: {body}"
