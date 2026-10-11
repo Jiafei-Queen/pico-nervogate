@@ -23,7 +23,7 @@ use translate::{
     anthropic_to_chat_request, anthropic_to_openai, chat_to_anthropic_response,
     chat_to_responses_request, chat_to_responses_response, frame_data, frame_event,
     openai_to_anthropic, responses_stateful_error, responses_to_chat_request, responses_to_openai,
-    AnthropicStream, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream,
+    AnthropicStream, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, SseEvent,
 };
 
 struct Inner {
@@ -515,24 +515,40 @@ pub(crate) fn upstream_url(base: &str, m: &ModelCfg) -> String {
 }
 
 /// Resolve model + build the upstream body for the given protocol.
-fn build_body(m: &ModelCfg, req: &Value, stream: bool) -> Value {
+///
+/// When the client's protocol already matches the upstream's, `native` is
+/// the client's own body and it is forwarded untouched (bar the model id
+/// and `stream`). Routing an Anthropic request through the canonical chat
+/// shape and back would silently drop block-level `cache_control` (killing
+/// prompt caching), thinking signatures and `tool_result.is_error`.
+fn build_body(m: &ModelCfg, req: &Value, stream: bool, native: Option<&Value>) -> Value {
     let upstream = m.upstream_model();
-    let mut body = match m.protocol {
-        Protocol::Chat => {
-            let mut v = req.clone();
-            // The reserved passthrough key never goes on the wire.
+    let mut body = match native {
+        Some(v) => {
+            let mut v = v.clone();
+            // The reserved passthrough key never goes on the wire, on any path.
             v.as_object_mut().map(|o| o.remove("x_nervogate"));
             v
         }
-        Protocol::Anthropic => openai_to_anthropic(req, m.thinking_mode()),
-        Protocol::Responses => chat_to_responses_request(req),
+        None => match m.protocol {
+            Protocol::Chat => {
+                let mut v = req.clone();
+                // The reserved passthrough key never goes on the wire.
+                v.as_object_mut().map(|o| o.remove("x_nervogate"));
+                v
+            }
+            Protocol::Anthropic => openai_to_anthropic(req, m.thinking_mode()),
+            Protocol::Responses => chat_to_responses_request(req),
+        },
     };
-    body["model"] = json!(upstream);
-    if stream {
-        body["stream"] = json!(true);
-    } else {
-        // avoid asking upstream for a stream we will not consume
-        body.as_object_mut().map(|o| o.remove("stream"));
+    if let Some(o) = body.as_object_mut() {
+        o.insert("model".into(), json!(upstream));
+        if stream {
+            o.insert("stream".into(), json!(true));
+        } else {
+            // avoid asking upstream for a stream we will not consume
+            o.remove("stream");
+        }
     }
     body
 }
@@ -590,6 +606,7 @@ async fn call_upstream(
     m: &ModelCfg,
     req: &Value,
     stream: bool,
+    native: Option<&Value>,
 ) -> Result<reqwest::Response, UpstreamError> {
     let base = st
         .cfg
@@ -598,7 +615,7 @@ async fn call_upstream(
         .base_url_for(m)
         .map_err(UpstreamError::Message)?;
     let url = upstream_url(&base, m);
-    let body = build_body(m, req, stream);
+    let body = build_body(m, req, stream, native);
     let t0 = now_ms();
     let stream_tag = if stream { "stream" } else { "nonstream" };
     let resp = match st
@@ -666,6 +683,16 @@ enum Ingress {
     Anthropic,
 }
 
+impl Ingress {
+    fn protocol(&self) -> Protocol {
+        match self {
+            Ingress::Chat => Protocol::Chat,
+            Ingress::Responses => Protocol::Responses,
+            Ingress::Anthropic => Protocol::Anthropic,
+        }
+    }
+}
+
 async fn chat(State(st): State<St>, body: Bytes) -> Response {
     handle_ingress(st, body, Ingress::Chat).await
 }
@@ -718,14 +745,30 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
     }
     let stream = req.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    // Normalize the ingress request to the canonical chat shape.
-    let chat_req = match ingress {
-        Ingress::Chat => req,
-        Ingress::Responses => responses_to_chat_request(&req),
-        Ingress::Anthropic => anthropic_to_chat_request(&req),
+    // Same protocol on both ends: forward the client's own body untouched.
+    let native = ingress.protocol() == m.protocol;
+
+    // Normalize the ingress request to the canonical chat shape. Skipped
+    // on the native path, which keeps the original body intact.
+    let chat_req = if native {
+        Value::Null
+    } else {
+        match ingress {
+            Ingress::Chat => req.clone(),
+            Ingress::Responses => responses_to_chat_request(&req),
+            Ingress::Anthropic => anthropic_to_chat_request(&req),
+        }
     };
 
-    let resp = match call_upstream(&st, &m, &chat_req, stream).await {
+    let resp = match call_upstream(
+        &st,
+        &m,
+        &chat_req,
+        stream,
+        if native { Some(&req) } else { None },
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return upstream_error_response(ingress, e),
     };
@@ -745,7 +788,12 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
             Ingress::Responses => Egress::Responses(ChatToResponsesStream::new(&name)),
             Ingress::Anthropic => Egress::Anthropic(ChatToAnthropicStream::new(&name)),
         };
-        sse_response(sse_body(resp, inbound, egress))
+        sse_response(sse_body(
+            resp,
+            inbound,
+            egress,
+            native.then(|| name.clone()),
+        ))
     } else {
         let text = match resp.text().await {
             Ok(t) => t,
@@ -761,6 +809,15 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
             Ok(v) => v,
             Err(_) => return raw_json_response(StatusCode::OK, text),
         };
+        if native {
+            // Same protocol both ends: only the public model id needs
+            // rewriting, everything else is the client's own response.
+            let mut v = up;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("model".into(), json!(name.clone()));
+            }
+            return json_response(StatusCode::OK, v);
+        }
         let chat = match m.protocol {
             Protocol::Chat => {
                 let mut v = up;
@@ -878,97 +935,426 @@ impl Egress {
         }
     }
 
-    /// Trailer: Chat streams end with the `[DONE]` sentinel; the other two
-    /// end with their terminal event (already emitted).
-    fn finish(&mut self) -> Vec<String> {
+    /// Trailer for a stream that ended cleanly. Chat closes with the
+    /// `[DONE]` sentinel; the other two emit their terminal event if the
+    /// upstream never sent a finish chunk (otherwise the client waits
+    /// forever on a closed connection).
+    ///
+    /// `passthrough` marks the same-protocol path, where the gateway never
+    /// ran a single chunk through this state machine and the upstream has
+    /// already emitted its own terminal event. Synthesizing one here would
+    /// append a second `message_start` / `response.created` to a stream that
+    /// is already correctly framed.
+    fn finish(&mut self, passthrough: bool) -> Vec<String> {
+        if passthrough {
+            return match self {
+                // The upstream's own `[DONE]` is swallowed by the parser and
+                // has to be re-emitted; the other protocols terminate
+                // themselves upstream.
+                Egress::Chat => vec!["data: [DONE]\n\n".to_string()],
+                _ => vec![],
+            };
+        }
         match self {
             Egress::Chat => vec!["data: [DONE]\n\n".to_string()],
-            _ => vec![],
+            Egress::Responses(s) => match s.finish() {
+                Some(events) => events.iter().map(|e| e.frame()).collect(),
+                None => vec![],
+            },
+            Egress::Anthropic(s) => match s.finish() {
+                Some(events) => events.iter().map(|e| e.frame()).collect(),
+                None => vec![],
+            },
         }
     }
 
-    /// Mid-stream upstream error, in the client protocol's framing.
-    fn fail(&mut self, msg: &str) -> Vec<String> {
+    /// Mid-stream upstream failure, in the client protocol's framing. This
+    /// is a terminal signal: Chat clients otherwise read a truncated answer
+    /// terminated by `[DONE]` as a successful one.
+    ///
+    /// On the passthrough path there is no gateway-side block bookkeeping to
+    /// close, so only the error frame itself is emitted.
+    fn fail(&mut self, msg: &str, passthrough: bool) -> Vec<String> {
         match self {
-            Egress::Chat => vec![],
-            Egress::Responses(_) => vec![frame_data(&json!({"type": "error", "message": msg}))],
-            Egress::Anthropic(_) => vec![frame_event(
-                "error",
-                &json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
-            )],
+            Egress::Chat => vec![
+                frame_data(&json!({
+                    "error": {"message": msg, "type": "gateway_error"}
+                })),
+                "data: [DONE]\n\n".to_string(),
+            ],
+            Egress::Responses(s) => {
+                let mut out: Vec<SseEvent> = if passthrough { vec![] } else { s.abort() };
+                out.push(SseEvent::data(json!({"type": "error", "message": msg})));
+                out.iter().map(|e| e.frame()).collect()
+            }
+            Egress::Anthropic(s) => {
+                let mut out: Vec<SseEvent> = if passthrough { vec![] } else { s.abort() };
+                out.push(SseEvent::ev(
+                    "error",
+                    json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
+                ));
+                out.iter().map(|e| e.frame()).collect()
+            }
         }
     }
 }
 
-fn sse_body(resp: reqwest::Response, mut inbound: Inbound, mut egress: Egress) -> Body {
+/// What one upstream SSE block means, once parsed and classified.
+///
+/// Lives outside the stream body so the main loop and the end-of-stream
+/// flush share one implementation: the two paths used to duplicate the
+/// error checks, and a fix applied to only one of them is a bug.
+enum Block {
+    /// Nothing to forward (blank, `[DONE]`, unparseable).
+    Skip,
+    /// The upstream signalled a failure; the stream ends here.
+    Error(String),
+    /// Native path: forward verbatim, keeping the upstream's `event:` name.
+    Passthrough(Option<String>, Value),
+    /// Translated path: client-facing SSE lines rendered by the egress.
+    Chunks(Vec<String>),
+}
+
+fn classify_block(
+    block: &[u8],
+    model_rewrite: &Option<String>,
+    inbound: &mut Inbound,
+    egress: &mut Egress,
+) -> Block {
+    let f = sse_fields(block);
+    if f.data.is_empty() || f.data == "[DONE]" {
+        return Block::Skip;
+    }
+    let ev: Value = match serde_json::from_str(&f.data) {
+        Ok(v) => v,
+        Err(_) => return Block::Skip,
+    };
+    if is_stream_error(&ev) {
+        eprintln!("[gw] upstream stream error: {}", trunc(&f.data, 500));
+        return Block::Error(stream_error_msg(&ev, &f.data));
+    }
+    if let Some(m) = model_rewrite {
+        // Native path: hand the client's own event straight back, event
+        // name included — Anthropic clients dispatch on it and ignore an
+        // event that arrives without one.
+        let mut ev = ev;
+        if let Some(o) = ev.as_object_mut() {
+            o.insert("model".into(), json!(m));
+        }
+        return Block::Passthrough(f.name, ev);
+    }
+    let mut out = vec![];
+    for c in inbound.handle(&ev) {
+        // A canonical chunk flagged as failed (Responses `response.failed`)
+        // must not be framed as a normal finish; it terminates the stream
+        // with an error.
+        if c.pointer("/choices/0/finish_reason")
+            .and_then(|f| f.as_str())
+            == Some("error")
+        {
+            eprintln!("[gw] upstream response failed");
+            return Block::Error("upstream response failed".to_string());
+        }
+        out.extend(egress.handle(&c));
+    }
+    Block::Chunks(out)
+}
+
+/// Render one classified block as client-facing SSE lines. A passthrough
+/// block that triggers an error is reported so the caller can end the stream.
+fn render_block(block: Block) -> (Vec<String>, Option<String>) {
+    match block {
+        Block::Skip => (vec![], None),
+        Block::Error(msg) => (vec![], Some(msg)),
+        Block::Passthrough(name, ev) => (
+            vec![match &name {
+                Some(n) => frame_event(n, &ev),
+                None => frame_data(&ev),
+            }],
+            None,
+        ),
+        Block::Chunks(lines) => (lines, None),
+    }
+}
+
+/// `model_rewrite` is set on the native (same-protocol) path: events are
+/// forwarded verbatim except for the public model id.
+fn sse_body(
+    resp: reqwest::Response,
+    mut inbound: Inbound,
+    mut egress: Egress,
+    model_rewrite: Option<String>,
+) -> Body {
+    let passthrough = model_rewrite.is_some();
     Body::from_stream(async_stream::stream! {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut parser = SseParser::new();
         let mut bs = resp.bytes_stream();
-        let mut failed = false;
-        while let Some(chunk) = bs.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(_) => break,
-            };
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = find_subslice(&buf, b"\n\n") {
-                let block: Vec<u8> = buf.drain(..pos).collect();
-                buf.drain(..2.min(buf.len()));
-                let text = String::from_utf8_lossy(&block);
-                let mut data = String::new();
-                for line in text.lines() {
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        if !data.is_empty() {
-                            data.push('\n');
-                        }
-                        data.push_str(rest.trim_start());
-                    }
-                }
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let ev: Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                // An upstream error event ends the stream early.
-                if ev.get("type").and_then(|t| t.as_str()) == Some("error")
-                    || ev.get("error").is_some()
-                {
-                    let msg = trunc(&data, 500);
-                    eprintln!("[gw] upstream stream error: {msg}");
-                    for line in egress.fail(msg) {
-                        yield Ok::<Bytes, io::Error>(Bytes::from(line));
-                    }
-                    failed = true;
+        let mut upstream_err: Option<String> = None;
+
+        loop {
+            let chunk = match bs.next().await {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    // A transport failure is not a clean EOF: the answer is
+                    // truncated and the client must not read it as success.
+                    upstream_err = Some(format!("upstream stream error: {e}"));
                     break;
                 }
-                for c in inbound.handle(&ev) {
-                    for line in egress.handle(&c) {
-                        yield Ok::<Bytes, io::Error>(Bytes::from(line));
-                    }
+                None => break,
+            };
+            parser.push(&chunk);
+
+            while let Some(range) = parser.next_block() {
+                let (lines, err) = render_block(classify_block(
+                    parser.block(range), &model_rewrite, &mut inbound, &mut egress,
+                ));
+                for line in lines {
+                    yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                }
+                if let Some(msg) = err {
+                    // An upstream error event ends the stream early.
+                    upstream_err = Some(msg);
+                    break;
                 }
             }
-            if failed {
+            if upstream_err.is_some() {
                 break;
             }
         }
-        for c in inbound.flush() {
-            for line in egress.handle(&c) {
-                yield Ok::<Bytes, io::Error>(Bytes::from(line));
+
+        // Whatever is left in the buffer when the upstream closed without a
+        // trailing blank line is still a real event; dropping it loses the
+        // final chunk (often the one carrying finish_reason / usage).
+        if upstream_err.is_none() {
+            if let Some(range) = parser.finish() {
+                let (lines, err) = render_block(classify_block(
+                    parser.block(range), &model_rewrite, &mut inbound, &mut egress,
+                ));
+                for line in lines {
+                    yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                }
+                upstream_err = err;
             }
         }
-        for line in egress.finish() {
+
+        if !passthrough {
+            for c in inbound.flush() {
+                for line in egress.handle(&c) {
+                    yield Ok::<Bytes, io::Error>(Bytes::from(line));
+                }
+            }
+        }
+
+        let trailer = match upstream_err {
+            Some(msg) => egress.fail(&msg, passthrough),
+            None => egress.finish(passthrough),
+        };
+        for line in trailer {
             yield Ok::<Bytes, io::Error>(Bytes::from(line));
         }
     })
 }
 
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
+// ---------------------------------------------------------------------------
+// SSE event parsing
+// ---------------------------------------------------------------------------
+
+/// Incremental SSE block splitter.
+///
+/// Splits on a *blank line* per the SSE spec rather than on a literal
+/// `\n\n`, so `\r\n\r\n` (nginx / CDN / Windows upstreams), `\r\r` and
+/// mixed terminators all dispatch events. Scanning resumes where the
+/// previous call stopped, keeping total work linear in stream size.
+struct SseParser {
+    buf: Vec<u8>,
+    /// Bytes of `buf` already dispatched as events.
+    pos: usize,
+    /// Start of the line currently being scanned. Bytes before it belong to
+    /// complete lines, so they are never rescanned.
+    line_start: usize,
+}
+
+impl SseParser {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            pos: 0,
+            line_start: 0,
+        }
     }
-    hay.windows(needle.len()).position(|w| w == needle)
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Reclaim dispatched bytes. `drain` from the front is O(remaining), so
+    /// doing it every event would be quadratic on a busy stream.
+    fn compact(&mut self) {
+        if self.pos >= 64 * 1024 {
+            self.buf.drain(..self.pos);
+            // `line_start` is always >= `pos`, but `saturating_sub` keeps a
+            // future refactor from turning a bookkeeping slip into a panic —
+            // and `panic = "abort"` would take the whole gateway with it.
+            self.line_start = self.line_start.saturating_sub(self.pos);
+            self.pos = 0;
+        }
+    }
+
+    /// Next complete event block, as a range into `buf` (valid until the
+    /// next call). The block holds the event's lines but not the blank line
+    /// that terminated it.
+    fn next_block(&mut self) -> Option<(usize, usize)> {
+        self.compact();
+        let mut i = self.line_start;
+        loop {
+            if i >= self.buf.len() {
+                // No terminator yet: the tail is an incomplete line.
+                self.line_start = i;
+                return None;
+            }
+            let term = match self.buf[i] {
+                b'\n' => 1,
+                b'\r' => {
+                    if i + 1 >= self.buf.len() {
+                        // A lone trailing CR may still turn out to be the
+                        // first half of a CRLF split across chunks.
+                        self.line_start = i;
+                        return None;
+                    }
+                    if self.buf[i + 1] == b'\n' {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let at = i;
+            let blank = at == self.line_start;
+            let start = self.pos;
+            i += term;
+            self.line_start = i;
+            if blank {
+                self.pos = i;
+                return Some((start, at));
+            }
+        }
+    }
+
+    /// Trailing bytes left when the upstream closed without a final blank
+    /// line. The last event must not be dropped: it is frequently the only
+    /// chunk carrying `finish_reason` / usage.
+    fn finish(&mut self) -> Option<(usize, usize)> {
+        self.compact();
+        let start = self.pos;
+        let mut end = self.buf.len();
+        // Drop a dangling line terminator, it carries no data.
+        while end > start && matches!(self.buf[end - 1], b'\n' | b'\r') {
+            end -= 1;
+        }
+        self.pos = self.buf.len();
+        // Keep the two cursors consistent: `next_block()` resumes from
+        // `line_start`, and `compact()` derives it from `pos`.
+        self.line_start = self.pos;
+        (end > start).then_some((start, end))
+    }
+
+    fn block(&self, range: (usize, usize)) -> &[u8] {
+        &self.buf[range.0..range.1]
+    }
+}
+
+/// Split an SSE block into lines, accepting LF, CRLF and bare CR.
+fn sse_lines(block: &[u8]) -> Vec<&[u8]> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < block.len() {
+        let start = i;
+        while i < block.len() && block[i] != b'\n' && block[i] != b'\r' {
+            i += 1;
+        }
+        out.push(&block[start..i]);
+        i = match block.get(i) {
+            Some(b'\r') if block.get(i + 1) == Some(&b'\n') => i + 2,
+            Some(_) => i + 1,
+            None => block.len(),
+        };
+    }
+    out
+}
+
+/// The two SSE fields the gateway cares about from one block.
+///
+/// `name` is the `event:` value. Anthropic clients dispatch on it and ignore
+/// the event entirely when it is absent, so it has to survive passthrough —
+/// dropping it silently turns a healthy stream into zero events.
+struct SseFields {
+    name: Option<String>,
+    data: String,
+}
+
+/// Parse one SSE block. Multiple `data:` lines join with `\n` and exactly one
+/// leading space is stripped (the spec's rule) — trimming all leading
+/// whitespace would corrupt indented JSON payloads.
+fn sse_fields(block: &[u8]) -> SseFields {
+    let mut name = None;
+    let mut data = String::new();
+    for line in sse_lines(block) {
+        // `:`-prefixed lines are comments (keep-alive padding, pings).
+        if line.first() == Some(&b':') {
+            continue;
+        }
+        let colon = match line.iter().position(|&c| c == b':') {
+            Some(p) => p,
+            // A bare field name with no colon carries an empty value, which
+            // is a no-op for `data`; nothing to append.
+            None => continue,
+        };
+        let mut val = &line[colon + 1..];
+        if val.first() == Some(&b' ') {
+            val = &val[1..];
+        }
+        match &line[..colon] {
+            b"event" => name = Some(String::from_utf8_lossy(val).into_owned()),
+            b"data" => {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(&String::from_utf8_lossy(val));
+            }
+            _ => {}
+        }
+    }
+    SseFields { name, data }
+}
+
+/// Upstream event signalling a failure. `"error": null` (sent by some
+/// OpenAI-compatible servers on healthy chunks) is *not* an error — that is
+/// exactly what S-5 is about, and the `Value::Null` arm catches it. Any other
+/// non-null error counts, including an empty `{}`: missing a real failure is
+/// worse than aborting a stream that only looked healthy.
+fn is_stream_error(ev: &Value) -> bool {
+    if ev.get("type").and_then(|t| t.as_str()) == Some("error") {
+        return true;
+    }
+    match ev.get("error") {
+        Some(Value::Object(_)) => true,
+        Some(Value::String(s)) => !s.is_empty(),
+        _ => false,
+    }
+}
+
+/// Best-effort human-readable message out of an upstream error event.
+fn stream_error_msg(ev: &Value, raw: &str) -> String {
+    ev.pointer("/error/message")
+        .or_else(|| ev.pointer("/response/error/message"))
+        .or_else(|| ev.get("message"))
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| trunc(raw, 500).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1422,6 @@ pub(crate) fn test_state(cfg: Config) -> St {
         config_mtime: RwLock::new(None),
     })
 }
-
 
 #[cfg(test)]
 fn sample_config() -> Config {
@@ -1118,4 +1503,243 @@ mod tests {
         );
         assert!(find_model_in(&s, &d, "claude-haiku-5.5").is_none());
     }
+
+    // ---- SSE parsing ------------------------------------------------------
+
+    /// Feed raw bytes through the parser and collect every dispatched block.
+    fn parse_all(chunks: &[&[u8]]) -> Vec<String> {
+        let mut p = SseParser::new();
+        let mut out = vec![];
+        for c in chunks {
+            p.push(c);
+            while let Some(r) = p.next_block() {
+                let d = sse_fields(p.block(r)).data;
+                if !d.is_empty() {
+                    out.push(d);
+                }
+            }
+        }
+        if let Some(r) = p.finish() {
+            let d = sse_fields(p.block(r)).data;
+            if !d.is_empty() {
+                out.push(d);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sse_splits_on_lf_crlf_and_cr_blank_lines() {
+        for (label, sep) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+            let raw = format!("data: one{sep}{sep}data: two{sep}{sep}");
+            let got = parse_all(&[raw.as_bytes()]);
+            assert_eq!(got, vec!["one", "two"], "separator {label}");
+        }
+    }
+
+    #[test]
+    fn sse_handles_mixed_terminators_and_split_chunks() {
+        // CRLF/LF mixed, and an event split mid-payload across chunks.
+        let got = parse_all(&[b"data: a\r\n\r\ndata: b\n\nda", b"ta: c\r\r"]);
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn sse_does_not_split_a_crlf_across_chunks() {
+        // The trailing CR of chunk 1 must not be read as a lone terminator,
+        // which would split `data: x` into an early dispatch.
+        let mut p = SseParser::new();
+        p.push(b"data: x\r");
+        assert!(p.next_block().is_none());
+        p.push(b"\n\r\n");
+        let (s, e) = p.next_block().expect("event after CRLF completes");
+        assert_eq!(sse_fields(p.block((s, e))).data, "x");
+    }
+
+    #[test]
+    fn sse_strips_only_one_leading_space_and_skips_comments() {
+        let got = parse_all(&[b": keep-alive\ndata:  {\"a\":1}\n\n"]);
+        assert_eq!(got, vec![" {\"a\":1}"]);
+    }
+
+    #[test]
+    fn sse_multi_line_data_joins_with_newline() {
+        let got = parse_all(&[b"data: {\"a\":\ndata: 1}\n\n"]);
+        assert_eq!(got, vec!["{\"a\":\n1}"]);
+    }
+
+    #[test]
+    fn sse_flushes_trailing_event_without_blank_line() {
+        // B-3: upstream closed without a trailing blank line. The last event
+        // (here the finish chunk) must still be delivered.
+        let mut p = SseParser::new();
+        p.push(b"data: {\"choices\":[]}\n\ndata: {\"finish\":1}");
+        assert!(p.next_block().is_some());
+        assert!(p.next_block().is_none());
+        let r = p.finish().expect("trailing event");
+        assert_eq!(sse_fields(p.block(r)).data, "{\"finish\":1}");
+        // Draining must not repeat the same event.
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn sse_reclaims_consumed_prefix_across_many_events() {
+        // L-7: repeatedly dispatching events must not grow the buffer
+        // without bound, and scanning must not rescan consumed bytes.
+        let mut p = SseParser::new();
+        let mut events = 0;
+        for i in 0..2000 {
+            p.push(format!("data: {{\"i\":{i},\"pad\":\"{}\"}}\n\n", "x".repeat(200)).as_bytes());
+            while let Some(r) = p.next_block() {
+                assert!(!sse_fields(p.block(r)).data.is_empty());
+                events += 1;
+            }
+            // Compaction keeps the live window bounded regardless of how
+            // many events have already gone out.
+            assert!(
+                p.buf.len() < 64 * 1024,
+                "buffer grew to {} after {} events",
+                p.buf.len(),
+                events
+            );
+        }
+        assert_eq!(events, 2000);
+    }
+
+    #[test]
+    fn null_error_field_is_not_a_stream_error() {
+        // S-5: some OpenAI-compatible servers send `"error": null` on
+        // healthy chunks. Treating that as a failure kills a good stream.
+        assert!(!is_stream_error(
+            &json!({"choices": [{"delta": {}}], "error": null})
+        ));
+        assert!(is_stream_error(&json!({"error": {"message": "boom"}})));
+        assert!(is_stream_error(
+            &json!({"type": "error", "message": "boom"})
+        ));
+        assert!(!is_stream_error(
+            &json!({"type": "response.output_text.delta"})
+        ));
+        // An empty object carries the same intent as `null` only when the
+        // upstream meant it as a placeholder; as a standalone failure it is
+        // the shape some gateways emit, and missing it is the worse error.
+        assert!(is_stream_error(
+            &json!({"choices": [{"delta": {}}], "error": {}})
+        ));
+        assert!(!is_stream_error(&json!({"error": ""})));
+    }
+
+    #[test]
+    fn stream_error_msg_prefers_nested_message() {
+        assert_eq!(
+            stream_error_msg(&json!({"error": {"message": "rate limited"}}), "{}"),
+            "rate limited"
+        );
+        assert_eq!(
+            stream_error_msg(&json!({"response": {"error": {"message": "nope"}}}), "{}"),
+            "nope"
+        );
+        assert_eq!(stream_error_msg(&json!({"message": "flat"}), "{}"), "flat");
+        // Falls back to the raw payload when there is no message field.
+        assert_eq!(stream_error_msg(&json!({"code": "x"}), "raw"), "raw");
+    }
+
+    // ---- S-3: same-protocol passthrough -----------------------------------
+
+    #[test]
+    fn sse_keeps_the_event_name_anthropic_clients_dispatch_on() {
+        // The official Anthropic SDK branches on `sse.event` and silently
+        // drops an event that has none, so the name must survive parsing.
+        let f = sse_fields(b"event: message_delta\ndata: {\"t\":1}");
+        assert_eq!(f.name.as_deref(), Some("message_delta"));
+        assert_eq!(f.data, "{\"t\":1}");
+
+        // Field order is irrelevant to the spec.
+        let f = sse_fields(b"data: {\"t\":1}\nevent: message_stop");
+        assert_eq!(f.name.as_deref(), Some("message_stop"));
+        assert_eq!(f.data, "{\"t\":1}");
+
+        // Chat framing carries no name.
+        assert_eq!(sse_fields(b"data: [DONE]").name, None);
+        // Comments and unknown fields must not be mistaken for the name.
+        assert_eq!(sse_fields(b": ping\nid: 7\ndata: x").name, None);
+        assert_eq!(sse_fields(b": ping\nid: 7\ndata: x").data, "x");
+    }
+
+    #[test]
+    fn passthrough_keeps_the_upstream_event_name() {
+        let mut inbound = Inbound::Responses(ResponsesStream::new("m"));
+        let mut egress = Egress::Responses(ChatToResponsesStream::new("m"));
+        let name = Some("m".to_string());
+        let block = b"event: response.output_text.delta\ndata: {\"type\":\"x\"}";
+        let (lines, err) = render_block(classify_block(block, &name, &mut inbound, &mut egress));
+        assert!(err.is_none());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("event: response.output_text.delta\ndata: "),
+            "event name was dropped: {}",
+            lines[0]
+        );
+        // ...and the public model id is still rewritten on the way out.
+        assert!(lines[0].contains("\"model\":\"m\""));
+    }
+
+    #[test]
+    fn passthrough_does_not_synthesize_a_second_terminal_event() {
+        // The gateway never ran a chunk through these state machines on the
+        // native path, so `terminated` is still false. Calling `finish()`
+        // unconditionally appended a duplicate `message_start` /
+        // `response.created` to an already-complete stream.
+        let mut anthropic = Egress::Anthropic(ChatToAnthropicStream::new("m"));
+        assert!(
+            anthropic.finish(true).is_empty(),
+            "anthropic passthrough must defer to the upstream's own terminal event"
+        );
+        let fail = anthropic.fail("boom", true);
+        assert_eq!(fail.len(), 1, "only the error frame, no block bookkeeping");
+        assert!(fail[0].starts_with("event: error\n"));
+
+        let mut responses = Egress::Responses(ChatToResponsesStream::new("m"));
+        assert!(responses.finish(true).is_empty());
+        let fail = responses.fail("boom", true);
+        assert_eq!(fail.len(), 1);
+        assert!(fail[0].contains("\"type\":\"error\""));
+
+        // Chat still needs its `[DONE]`: the upstream's own sentinel is
+        // swallowed by the parser and must be re-emitted.
+        let mut chat = Egress::Chat;
+        assert_eq!(chat.finish(true), vec!["data: [DONE]\n\n".to_string()]);
+        assert_eq!(chat.fail("boom", true).len(), 2);
+
+        // The translated path is unchanged and still synthesizes.
+        let mut responses = Egress::Responses(ChatToResponsesStream::new("m"));
+        assert!(!responses.finish(false).is_empty());
+    }
+
+    #[test]
+    fn x_nervogate_is_stripped_on_every_path() {
+        // README promises the reserved key never reaches the wire, and the
+        // native path forwards the client's body verbatim.
+        let m = ModelCfg::discovered("m".to_string(), Protocol::Anthropic, "https://h/v1".into());
+        let req = json!({"model": "m", "x_nervogate": {"top_k": 5}});
+        let body = build_body(&m, &req, false, Some(&req));
+        assert!(
+            body.get("x_nervogate").is_none(),
+            "reserved key leaked upstream: {body}"
+        );
+    }
+
+    #[test]
+    fn sse_parser_tolerates_use_after_finish() {
+        // `finish()` resets the cursors; a later `next_block()` used to
+        // underflow `line_start - pos`, which under `panic = "abort"` would
+        // take the whole gateway down.
+        let mut p = SseParser::new();
+        p.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}");
+        while p.next_block().is_some() {}
+        assert!(p.finish().is_some());
+        assert!(p.next_block().is_none());
+        assert!(p.finish().is_none());
+    }
+
 }

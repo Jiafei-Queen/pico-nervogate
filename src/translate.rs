@@ -1541,8 +1541,12 @@ pub struct ChatToResponsesStream {
     model: String,
     created: i64,
     started: bool,
+    terminated: bool,
     next_index: usize,
     open: Option<OpenOut>,
+    /// Tool calls buffered until the stream ends, keyed by upstream
+    /// `tool_calls[].index` so parallel calls never mix arguments.
+    tools: Vec<(ToolKey, PendingTool)>,
     items: Vec<Value>,
 }
 
@@ -1553,8 +1557,10 @@ impl ChatToResponsesStream {
             model: model.to_string(),
             created: now_ts(),
             started: false,
+            terminated: false,
             next_index: 0,
             open: None,
+            tools: vec![],
             items: vec![],
         }
     }
@@ -1571,6 +1577,75 @@ impl ChatToResponsesStream {
             "error": Value::Null,
             "incomplete_details": Value::Null
         })
+    }
+
+    fn start(&mut self, out: &mut Vec<SseEvent>) {
+        if !self.started {
+            self.started = true;
+            out.push(SseEvent::data(
+                json!({"type": "response.created", "response": self.skeleton("in_progress")}),
+            ));
+            out.push(SseEvent::data(
+                json!({"type": "response.in_progress", "response": self.skeleton("in_progress")}),
+            ));
+        }
+    }
+
+    fn terminal(&mut self, ty: &str, status: &str, incomplete: Value, out: &mut Vec<SseEvent>) {
+        self.flush_tools(out);
+        self.close_open(out);
+        self.terminated = true;
+        let response = json!({
+            "id": self.resp_id,
+            "object": "response",
+            "created_at": self.created,
+            "model": self.model,
+            "status": status,
+            "incomplete_details": incomplete,
+            "output": self.items,
+            "usage": responses_usage(0, 0, 0, 0),
+            "error": Value::Null
+        });
+        out.push(SseEvent::data(json!({"type": ty, "response": response})));
+    }
+
+    /// Emit buffered tool calls as complete, contiguous `function_call`
+    /// output items (added -> arguments -> done per `output_index`).
+    fn flush_tools(&mut self, out: &mut Vec<SseEvent>) {
+        for (_, t) in std::mem::take(&mut self.tools) {
+            self.close_open(out);
+            let index = self.next_index;
+            self.next_index += 1;
+            let item_id = gen_id("fc_");
+            let call_id = if t.id.is_empty() {
+                gen_id("call_")
+            } else {
+                t.id.clone()
+            };
+            let args = if t.args.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                t.args.clone()
+            };
+            out.push(SseEvent::data(json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": {
+                    "id": item_id, "type": "function_call", "status": "in_progress",
+                    "call_id": call_id, "name": t.name, "arguments": ""
+                }
+            })));
+            out.push(SseEvent::data(json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id, "output_index": index, "delta": args
+            })));
+            self.open = Some(OpenOut::Tool {
+                index,
+                item_id,
+                call_id,
+                name: t.name,
+                args,
+            });
+        }
     }
 
     fn close_open(&mut self, out: &mut Vec<SseEvent>) {
@@ -1655,15 +1730,7 @@ impl ChatToResponsesStream {
     /// Handle one canonical OpenAI chat chunk. Returns Responses SSE events.
     pub fn handle(&mut self, ch: &Value) -> Vec<SseEvent> {
         let mut out = vec![];
-        if !self.started {
-            self.started = true;
-            out.push(SseEvent::data(
-                json!({"type": "response.created", "response": self.skeleton("in_progress")}),
-            ));
-            out.push(SseEvent::data(
-                json!({"type": "response.in_progress", "response": self.skeleton("in_progress")}),
-            ));
-        }
+        self.start(&mut out);
 
         let choice = ch.pointer("/choices/0").cloned().unwrap_or(json!({}));
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
@@ -1745,93 +1812,104 @@ impl ChatToResponsesStream {
             }
         }
 
-        // Tool call deltas open function_call output items.
+        // Like the Anthropic egress, tool calls are buffered per upstream
+        // `tool_calls[].index` and emitted as complete, contiguous output
+        // items: Responses also requires added -> delta* -> done per
+        // `output_index`, which interleaved parallel calls would violate.
         if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in tcs {
-                let new_call = tc
+                let pos = match tool_slot(tc, &self.tools) {
+                    Some(key) => match self.tools.iter().position(|(k, _)| *k == key) {
+                        Some(p) => p,
+                        None => {
+                            self.tools.push((key, PendingTool::default()));
+                            self.tools.len() - 1
+                        }
+                    },
+                    None => continue,
+                };
+                let entry = &mut self.tools[pos].1;
+                if let Some(id) = tc
                     .get("id")
                     .and_then(|x| x.as_str())
-                    .is_some_and(|s| !s.is_empty())
-                    || tc
-                        .pointer("/function/name")
-                        .and_then(|x| x.as_str())
-                        .is_some_and(|s| !s.is_empty());
-                if new_call {
-                    self.close_open(&mut out);
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    let item_id = gen_id("fc_");
-                    let call_id = tc
-                        .get("id")
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| gen_id("call_"));
-                    let name = tc
-                        .pointer("/function/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    out.push(SseEvent::data(json!({
-                        "type": "response.output_item.added", "output_index": index,
-                        "item": {
-                            "id": item_id, "type": "function_call", "status": "in_progress",
-                            "call_id": call_id, "name": name, "arguments": ""
-                        }
-                    })));
-                    self.open = Some(OpenOut::Tool {
-                        index,
-                        item_id,
-                        call_id,
-                        name,
-                        args: String::new(),
-                    });
+                    .filter(|s| !s.is_empty())
+                {
+                    entry.id = id.to_string();
                 }
-                if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
-                    if !args.is_empty() {
-                        if let Some(OpenOut::Tool {
-                            index,
-                            item_id,
-                            args: acc,
-                            ..
-                        }) = &mut self.open
-                        {
-                            acc.push_str(args);
-                            out.push(SseEvent::data(json!({
-                                "type": "response.function_call_arguments.delta",
-                                "item_id": item_id, "output_index": index, "delta": args
-                            })));
-                        }
-                    }
+                if let Some(n) = tc
+                    .pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    entry.name = n.to_string();
+                }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    entry.args.push_str(a);
                 }
             }
         }
 
         // Terminal chunk carries finish_reason (and usage).
         if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {
-            self.close_open(&mut out);
-            let (p, c, cached, reasoning_tok) = chat_usage_parts(ch.get("usage"));
-            let (status, incomplete) = match fr {
-                "length" => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
-                _ => ("completed", None),
+            self.flush_tools(&mut out);
+            let (ty, status, incomplete) = match fr {
+                "length" => (
+                    "response.incomplete",
+                    "incomplete",
+                    json!({"reason": "max_output_tokens"}),
+                ),
+                // An `incomplete` Responses response can be a content-filter
+                // stop, not a token limit. Reporting it as `completed` would
+                // dress a truncated answer up as a finished one.
+                "content_filter" => (
+                    "response.incomplete",
+                    "incomplete",
+                    json!({"reason": "content_filter"}),
+                ),
+                _ => ("response.completed", "completed", Value::Null),
             };
+            self.close_open(&mut out);
+            self.terminated = true;
+            let (p, c, cached, reasoning_tok) = chat_usage_parts(ch.get("usage"));
             let response = json!({
                 "id": self.resp_id,
                 "object": "response",
                 "created_at": self.created,
                 "model": self.model,
                 "status": status,
-                "incomplete_details": incomplete.unwrap_or(Value::Null),
+                "incomplete_details": incomplete,
                 "output": self.items,
                 "usage": responses_usage(p, c, cached, reasoning_tok),
                 "error": Value::Null
             });
-            let ty = if status == "incomplete" {
-                "response.incomplete"
-            } else {
-                "response.completed"
-            };
             out.push(SseEvent::data(json!({"type": ty, "response": response})));
         }
+        out
+    }
+
+    /// Terminal event for an upstream that closed without a finish chunk.
+    /// Without it the client waits forever on a connection that is already
+    /// gone. `None` when a finish chunk already produced the terminal event.
+    pub fn finish(&mut self) -> Option<Vec<SseEvent>> {
+        if self.terminated {
+            return None;
+        }
+        let mut out = vec![];
+        self.start(&mut out);
+        self.terminal("response.completed", "completed", Value::Null, &mut out);
+        Some(out)
+    }
+
+    /// Close any open output item before an error event, so clients see a
+    /// well-formed stream instead of an abandoned open block.
+    pub fn abort(&mut self) -> Vec<SseEvent> {
+        if self.terminated {
+            return vec![];
+        }
+        let mut out = vec![];
+        self.start(&mut out);
+        self.flush_tools(&mut out);
+        self.close_open(&mut out);
         out
     }
 }
@@ -2095,10 +2173,52 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
 // Chat chunks -> Anthropic Messages SSE stream (egress)
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq)]
 enum AnthBlock {
     Text,
     Thinking,
-    Tool,
+}
+
+/// One in-flight Chat tool call, keyed by upstream `tool_calls[].index`.
+#[derive(Default)]
+struct PendingTool {
+    id: String,
+    name: String,
+    args: String,
+}
+
+/// Slot identity for a streamed Chat tool call.
+///
+/// `Index` is the upstream's own `tool_calls[].index` and is authoritative
+/// when present. Compatibility upstreams that omit `index` would otherwise
+/// collapse every parallel call onto key 0 and concatenate their arguments
+/// into one unparseable blob, so those fall back to `Synthetic`, one slot per
+/// distinct `id`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolKey {
+    Index(i64),
+    Synthetic(usize),
+}
+
+/// Slot a tool-call delta belongs to.
+///
+/// - upstream sent `index` -> that slot, no ambiguity;
+/// - no `index`, non-empty `id` we have not seen -> a brand new slot, so two
+///   parallel calls stay separate;
+/// - otherwise it is a continuation fragment -> the most recently opened
+///   slot.
+fn tool_slot(tc: &Value, tools: &[(ToolKey, PendingTool)]) -> Option<ToolKey> {
+    if let Some(i) = tc.get("index").and_then(|x| x.as_i64()) {
+        return Some(ToolKey::Index(i));
+    }
+    let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
+    if !id.is_empty() {
+        if tools.iter().any(|(_, t)| t.id == id) {
+            return None; // known id: keep filling its existing slot
+        }
+        return Some(ToolKey::Synthetic(tools.len()));
+    }
+    tools.last().map(|(k, _)| *k)
 }
 
 /// Stateful translator for OpenAI chat chunks into Anthropic Messages SSE
@@ -2108,8 +2228,14 @@ pub struct ChatToAnthropicStream {
     msg_id: String,
     model: String,
     started: bool,
+    terminated: bool,
     index: usize,
-    open: Option<AnthBlock>,
+    /// The currently open block, tagged with the content index it was
+    /// emitted at. `index - 1` is wrong once blocks interleave.
+    open: Option<(AnthBlock, usize)>,
+    /// Tool calls seen so far, in first-seen order so parallel calls keep
+    /// their relative ordering in the Anthropic message.
+    tools: Vec<(ToolKey, PendingTool)>,
 }
 
 impl ChatToAnthropicStream {
@@ -2118,23 +2244,55 @@ impl ChatToAnthropicStream {
             msg_id: gen_id("msg_"),
             model: model.to_string(),
             started: false,
+            terminated: false,
             index: 0,
             open: None,
+            tools: vec![],
         }
     }
 
-    fn close_open(&mut self, out: &mut Vec<SseEvent>) {
-        if self.open.take().is_some() {
+    /// Emit every buffered tool call as a complete, contiguous Anthropic
+    /// content block. Each call becomes exactly one `tool_use` block
+    /// carrying its full argument JSON, which is what strict clients
+    /// require (they reject interleaved and split blocks).
+    ///
+    /// Returns true when at least one block was emitted, so the caller can
+    /// skip the "message needs a content block" fallback.
+    fn flush_tools(&mut self, out: &mut Vec<SseEvent>) -> bool {
+        let tools = std::mem::take(&mut self.tools);
+        let emitted = !tools.is_empty();
+        for (_, t) in tools {
+            self.close_open(out);
+            let ci = self.index;
+            self.index += 1;
+            let args = if t.args.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                t.args.clone()
+            };
+            out.push(SseEvent::ev(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start", "index": ci,
+                    "content_block": {"type": "tool_use", "id": t.id, "name": t.name, "input": {}}
+                }),
+            ));
+            out.push(SseEvent::ev(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": ci,
+                    "delta": {"type": "input_json_delta", "partial_json": args}
+                }),
+            ));
             out.push(SseEvent::ev(
                 "content_block_stop",
-                json!({"type": "content_block_stop", "index": self.index - 1}),
+                json!({"type": "content_block_stop", "index": ci}),
             ));
         }
+        emitted
     }
 
-    /// Handle one canonical OpenAI chat chunk. Returns Anthropic SSE events.
-    pub fn handle(&mut self, ch: &Value) -> Vec<SseEvent> {
-        let mut out = vec![];
+    fn start(&mut self, out: &mut Vec<SseEvent>) {
         if !self.started {
             self.started = true;
             out.push(SseEvent::ev(
@@ -2154,29 +2312,87 @@ impl ChatToAnthropicStream {
                 }),
             ));
         }
+    }
+
+    /// Open a text block if no block is currently open.
+    fn ensure_block(&mut self, out: &mut Vec<SseEvent>) {
+        if self.open.is_none() {
+            let index = self.index;
+            self.index += 1;
+            out.push(SseEvent::ev(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+            self.open = Some((AnthBlock::Text, index));
+        }
+    }
+
+    fn close_open(&mut self, out: &mut Vec<SseEvent>) {
+        if let Some((_, index)) = self.open.take() {
+            out.push(SseEvent::ev(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+    }
+
+    fn terminal(&mut self, stop_reason: &str, out: &mut Vec<SseEvent>) {
+        // Tool blocks already satisfy Anthropic's "at least one content
+        // block" rule, so only add an empty text block when there are none.
+        let had_tools = self.flush_tools(out);
+        if !had_tools {
+            self.ensure_block(out);
+        }
+        self.close_open(out);
+        self.terminated = true;
+        out.push(SseEvent::ev(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": anthropic_usage(0, 0, 0)
+            }),
+        ));
+        out.push(SseEvent::ev(
+            "message_stop",
+            json!({"type": "message_stop"}),
+        ));
+    }
+
+    /// Handle one canonical OpenAI chat chunk. Returns Anthropic SSE events.
+    pub fn handle(&mut self, ch: &Value) -> Vec<SseEvent> {
+        let mut out = vec![];
+        self.start(&mut out);
 
         let choice = ch.pointer("/choices/0").cloned().unwrap_or(json!({}));
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
         if let Some(t) = delta.get("reasoning_content").and_then(|x| x.as_str()) {
             if !t.is_empty() {
-                if !matches!(self.open, Some(AnthBlock::Thinking)) {
-                    self.close_open(&mut out);
-                    let index = self.index;
-                    self.index += 1;
-                    out.push(SseEvent::ev(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start", "index": index,
-                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                        }),
-                    ));
-                    self.open = Some(AnthBlock::Thinking);
-                }
+                let ci = match &self.open {
+                    Some((AnthBlock::Thinking, ci)) => *ci,
+                    _ => {
+                        self.close_open(&mut out);
+                        let ci = self.index;
+                        self.index += 1;
+                        out.push(SseEvent::ev(
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start", "index": ci,
+                                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                            }),
+                        ));
+                        self.open = Some((AnthBlock::Thinking, ci));
+                        ci
+                    }
+                };
                 out.push(SseEvent::ev(
                     "content_block_delta",
                     json!({
-                        "type": "content_block_delta", "index": self.index - 1,
+                        "type": "content_block_delta", "index": ci,
                         "delta": {"type": "thinking_delta", "thinking": t}
                     }),
                 ));
@@ -2185,93 +2401,95 @@ impl ChatToAnthropicStream {
 
         if let Some(t) = delta.get("content").and_then(|x| x.as_str()) {
             if !t.is_empty() {
-                if !matches!(self.open, Some(AnthBlock::Text)) {
-                    self.close_open(&mut out);
-                    let index = self.index;
-                    self.index += 1;
-                    out.push(SseEvent::ev(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start", "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    ));
-                    self.open = Some(AnthBlock::Text);
-                }
+                let ci = match &self.open {
+                    Some((AnthBlock::Text, ci)) => *ci,
+                    _ => {
+                        self.close_open(&mut out);
+                        let ci = self.index;
+                        self.index += 1;
+                        out.push(SseEvent::ev(
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start", "index": ci,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        ));
+                        self.open = Some((AnthBlock::Text, ci));
+                        ci
+                    }
+                };
                 out.push(SseEvent::ev(
                     "content_block_delta",
                     json!({
-                        "type": "content_block_delta", "index": self.index - 1,
+                        "type": "content_block_delta", "index": ci,
                         "delta": {"type": "text_delta", "text": t}
                     }),
                 ));
             }
         }
 
+        // Anthropic's SSE requires each content block to be started, fully
+        // deltad and stopped before the next one opens, but Chat streams may
+        // interleave arguments across parallel tool calls. Tool blocks are
+        // therefore accumulated per upstream `tool_calls[].index` and
+        // emitted contiguously at the end of the stream; text and thinking
+        // still stream through live.
         if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in tcs {
-                let new_call = tc
+                let pos = match tool_slot(tc, &self.tools) {
+                    Some(key) => match self.tools.iter().position(|(k, _)| *k == key) {
+                        Some(p) => p,
+                        None => {
+                            self.tools.push((key, PendingTool::default()));
+                            self.tools.len() - 1
+                        }
+                    },
+                    None => continue,
+                };
+                let entry = &mut self.tools[pos].1;
+                // A later chunk may carry the field the first one omitted
+                // (upstreams split `id` and `name` across chunks).
+                if let Some(id) = tc
                     .get("id")
                     .and_then(|x| x.as_str())
-                    .is_some_and(|s| !s.is_empty())
-                    || tc
-                        .pointer("/function/name")
-                        .and_then(|x| x.as_str())
-                        .is_some_and(|s| !s.is_empty());
-                if new_call {
-                    self.close_open(&mut out);
-                    let index = self.index;
-                    self.index += 1;
-                    let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                    let name = tc
-                        .pointer("/function/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("");
-                    out.push(SseEvent::ev(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start", "index": index,
-                            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-                        }),
-                    ));
-                    self.open = Some(AnthBlock::Tool);
+                    .filter(|s| !s.is_empty())
+                {
+                    entry.id = id.to_string();
                 }
-                if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
-                    if !args.is_empty() && matches!(self.open, Some(AnthBlock::Tool)) {
-                        out.push(SseEvent::ev(
-                            "content_block_delta",
-                            json!({
-                                "type": "content_block_delta", "index": self.index - 1,
-                                "delta": {"type": "input_json_delta", "partial_json": args}
-                            }),
-                        ));
-                    }
+                if let Some(n) = tc
+                    .pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    entry.name = n.to_string();
+                }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    entry.args.push_str(a);
                 }
             }
         }
 
         if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {
-            if self.open.is_none() {
-                // Anthropic messages must have at least one content block.
-                let index = self.index;
-                self.index += 1;
-                out.push(SseEvent::ev(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start", "index": index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                ));
-                self.open = Some(AnthBlock::Text);
+            let had_tools = self.flush_tools(&mut out);
+            if !had_tools {
+                self.ensure_block(&mut out);
             }
             self.close_open(&mut out);
             let (p, c, cached, _) = chat_usage_parts(ch.get("usage"));
+            let cache_creation = ch
+                .get("cache_creation_input_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            // Canonical `prompt_tokens` includes cached tokens; Anthropic
+            // reports cache reads and writes separately.
+            let input = (p - cached - cache_creation).max(0);
+            self.terminated = true;
             out.push(SseEvent::ev(
                 "message_delta",
                 json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": anthropic_stop(fr), "stop_sequence": Value::Null},
-                    "usage": anthropic_usage(p, c, cached)
+                    "usage": anthropic_usage_full(input, c, cache_creation, cached)
                 }),
             ));
             out.push(SseEvent::ev(
@@ -2281,13 +2499,39 @@ impl ChatToAnthropicStream {
         }
         out
     }
+
+    /// Terminal events for an upstream that closed without a finish chunk.
+    /// Without them the client hangs on a connection that already closed.
+    /// `None` when a finish chunk already emitted `message_stop`.
+    pub fn finish(&mut self) -> Option<Vec<SseEvent>> {
+        if self.terminated {
+            return None;
+        }
+        let mut out = vec![];
+        self.start(&mut out);
+        self.terminal("end_turn", &mut out);
+        Some(out)
+    }
+
+    /// Close the open content block before an error event so the client sees
+    /// a well-formed stream instead of an abandoned block index.
+    pub fn abort(&mut self) -> Vec<SseEvent> {
+        if self.terminated {
+            return vec![];
+        }
+        let mut out = vec![];
+        self.start(&mut out);
+        self.flush_tools(&mut out);
+        self.close_open(&mut out);
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn types<'a>(events: &'a [SseEvent]) -> Vec<String> {
+    fn types(events: &[SseEvent]) -> Vec<String> {
         events
             .iter()
             .map(|e| {
@@ -2756,7 +3000,10 @@ mod tests {
         assert_eq!(delta["delta"]["partial_json"], "{\"a\":1}");
         let msg_delta = &events[10].data;
         assert_eq!(msg_delta["delta"]["stop_reason"], "tool_use");
-        assert_eq!(msg_delta["usage"]["input_tokens"], 3);
+        // prompt_tokens 3 includes 1 cached read, so Anthropic's
+        // input_tokens is 2 and the read is reported separately.
+        assert_eq!(msg_delta["usage"]["input_tokens"], 2);
+        assert_eq!(msg_delta["usage"]["cache_read_input_tokens"], 1);
         assert_eq!(msg_delta["usage"]["output_tokens"], 4);
     }
 
@@ -2813,6 +3060,295 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "tu1");
         assert_eq!(msgs[3]["content"], "ok");
+    }
+
+    // ---- M-1: interleaved parallel tool calls ---------------------------
+
+    /// Feed canonical chat chunks through an Anthropic egress.
+    fn anth_stream(chunks: &[Value]) -> Vec<SseEvent> {
+        let mut s = ChatToAnthropicStream::new("m");
+        let mut events = vec![];
+        for c in chunks {
+            events.extend(s.handle(c));
+        }
+        events
+    }
+
+    /// Build one Chat `tool_calls[]` delta.
+    fn tc(index: i64, id: Option<&str>, name: Option<&str>, args: &str) -> Value {
+        let mut t = tc_no_index(id, name, args);
+        t.as_object_mut()
+            .unwrap()
+            .insert("index".into(), json!(index));
+        t
+    }
+
+    /// Same, from an upstream that does not send `tool_calls[].index`.
+    fn tc_no_index(id: Option<&str>, name: Option<&str>, args: &str) -> Value {
+        let mut f = serde_json::Map::new();
+        if let Some(n) = name {
+            f.insert("name".into(), json!(n));
+        }
+        f.insert("arguments".into(), json!(args));
+        let mut t = serde_json::Map::new();
+        t.insert("type".into(), json!("function"));
+        if let Some(i) = id {
+            t.insert("id".into(), json!(i));
+        }
+        t.insert("function".into(), Value::Object(f));
+        Value::Object(t)
+    }
+
+    #[test]
+    fn interleaved_tool_calls_become_separate_contiguous_blocks() {
+        // Anthropic requires start -> deltas -> stop per block index, so the
+        // egress buffers each parallel call and emits whole blocks.
+        let events = anth_stream(&[
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(0, Some("c1"), Some("a"), "")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(1, Some("c2"), Some("b"), "")]}),
+                None,
+            ),
+            // Interleaved argument fragments: 0, 1, 0, 1
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(0, None, None, "{\"x\":")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(1, None, None, "{\"y\":")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(0, None, None, "1}")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(1, None, None, "2}")]}),
+                None,
+            ),
+            chunk("i", "m", json!({}), Some("tool_calls")),
+        ]);
+
+        let names: Vec<&str> = events.iter().map(|e| e.event.as_deref().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        // Each call is one complete block, in first-seen order.
+        let blocks: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.data["type"] == "content_block_start")
+            .collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].data["content_block"]["name"], "a");
+        assert_eq!(blocks[0].data["content_block"]["id"], "c1");
+        assert_eq!(blocks[1].data["content_block"]["name"], "b");
+        assert_eq!(blocks[1].data["content_block"]["id"], "c2");
+        // Fragments were reassembled in the right order, not interleaved.
+        let deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.data["type"] == "content_block_delta")
+            .collect();
+        assert_eq!(deltas[0].data["delta"]["partial_json"], "{\"x\":1}");
+        assert_eq!(deltas[1].data["delta"]["partial_json"], "{\"y\":2}");
+        assert_eq!(deltas[0].data["index"], 0);
+        assert_eq!(deltas[1].data["index"], 1);
+    }
+
+    #[test]
+    fn split_id_and_name_chunks_stay_one_call() {
+        // Upstreams may send `id` in one chunk and `name` in the next; both
+        // must land on the same tool call, not two.
+        let events = anth_stream(&[
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(0, Some("c1"), None, "")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc(0, None, Some("f"), "{\"a\":1}")]}),
+                None,
+            ),
+            chunk("i", "m", json!({}), Some("tool_calls")),
+        ]);
+        let blocks: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.data["type"] == "content_block_start")
+            .collect();
+        assert_eq!(blocks.len(), 1, "name-only continuation reuses the call");
+        assert_eq!(blocks[0].data["content_block"]["name"], "f");
+        assert_eq!(blocks[0].data["content_block"]["id"], "c1");
+    }
+
+    #[test]
+    fn responses_egress_also_keeps_parallel_calls_separate() {
+        let mut s = ChatToResponsesStream::new("m");
+        let mut events = vec![];
+        events.extend(s.handle(&chunk(
+            "i",
+            "m",
+            json!({"tool_calls": [
+            tc(0, Some("c1"), Some("a"), "")]}),
+            None,
+        )));
+        events.extend(s.handle(&chunk(
+            "i",
+            "m",
+            json!({"tool_calls": [
+            tc(1, Some("c2"), Some("b"), "")]}),
+            None,
+        )));
+        events.extend(s.handle(&chunk(
+            "i",
+            "m",
+            json!({"tool_calls": [
+            tc(1, None, None, "{\"y\":2}")]}),
+            None,
+        )));
+        events.extend(s.handle(&chunk(
+            "i",
+            "m",
+            json!({"tool_calls": [
+            tc(0, None, None, "{\"x\":1}")]}),
+            None,
+        )));
+        events.extend(s.handle(&chunk("i", "m", json!({}), Some("tool_calls"))));
+
+        let added: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.data["type"] == "response.output_item.added")
+            .collect();
+        assert_eq!(added.len(), 2);
+        let args: Vec<String> = events
+            .iter()
+            .filter(|e| e.data["type"] == "response.function_call_arguments.delta")
+            .map(|e| e.data["delta"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(args, vec!["{\"x\":1}", "{\"y\":2}"]);
+        let last = events.last().unwrap();
+        let output = last
+            .data
+            .pointer("/response/output")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["name"], "a");
+        assert_eq!(output[0]["arguments"], "{\"x\":1}");
+        assert_eq!(output[1]["name"], "b");
+        assert_eq!(output[1]["arguments"], "{\"y\":2}");
+    }
+
+    // ---- B-4: terminal events on a truncated stream ---------------------
+
+    #[test]
+    fn truncated_stream_still_emits_terminal_events() {
+        // Upstream closed with no finish chunk: the client must still get a
+        // well-formed terminal event instead of hanging.
+        let mut s = ChatToAnthropicStream::new("m");
+        s.handle(&chunk("i", "m", json!({"content": "hi"}), None));
+        let events = s.finish().expect("terminal events");
+        let names: Vec<&str> = events.iter().map(|e| e.event.as_deref().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
+        // Idempotent: a finish chunk already terminated the stream.
+        assert!(s.finish().is_none());
+
+        let mut s = ChatToResponsesStream::new("m");
+        s.handle(&chunk("i", "m", json!({"content": "hi"}), None));
+        let events = s.finish().expect("terminal event");
+        assert_eq!(events.last().unwrap().data["type"], "response.completed");
+        assert!(s.finish().is_none());
+    }
+
+    #[test]
+    fn abort_closes_open_block_before_an_error_event() {
+        let mut s = ChatToAnthropicStream::new("m");
+        s.handle(&chunk("i", "m", json!({"content": "hi"}), None));
+        let out = s.abort();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data["type"], "content_block_stop");
+        assert!(s.abort().is_empty(), "abort is idempotent");
+    }
+
+    #[test]
+    fn tool_calls_without_index_are_not_merged_into_one() {
+        // Compatibility upstreams that omit `tool_calls[].index` used to
+        // collapse every parallel call onto key 0, concatenating their
+        // arguments into a single unparseable blob.
+        let events = anth_stream(&[
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc_no_index(Some("c1"), Some("a"), "")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc_no_index(Some("c2"), Some("b"), "")]}),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc_no_index(None, None, "{\"y\":")] }),
+                None,
+            ),
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc_no_index(None, None, "2}")] }),
+                None,
+            ),
+            // Continuation fragment with no id and no index: attaches to the
+            // most recently opened slot, not to a merged blob.
+            chunk(
+                "i",
+                "m",
+                json!({"tool_calls": [tc_no_index(None, None, "")]}),
+                None,
+            ),
+            chunk("i", "m", json!({}), Some("tool_calls")),
+        ]);
+
+        let blocks: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.data["type"] == "content_block_start")
+            .collect();
+        assert_eq!(blocks.len(), 2, "parallel calls must stay separate");
+        assert_eq!(blocks[0].data["content_block"]["id"], "c1");
+        assert_eq!(blocks[1].data["content_block"]["id"], "c2");
     }
 
     #[test]
