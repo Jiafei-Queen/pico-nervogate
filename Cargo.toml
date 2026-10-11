@@ -17,6 +17,10 @@ toml = "0.8"
 bytes = "1"
 async-stream = "0.3"
 
+[dev-dependencies]
+# `oneshot` drives the router in-process, so error-shape tests need no socket.
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

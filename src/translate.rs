@@ -967,10 +967,16 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
         .get("status")
         .and_then(|s| s.as_str())
         .unwrap_or("completed");
+    // `failed` is an upstream fault, not a finish reason: mapping it onto
+    // `stop` hands the client HTTP 200 with an empty "answer". Callers see
+    // `status == "failed"` and turn it into a 502 / error event.
     let finish = if !tool_calls.is_empty() {
         "tool_calls"
     } else if status == "incomplete" {
-        "length"
+        incomplete_reason(resp)
+            .as_deref()
+            .map(finish_from_incomplete)
+            .unwrap_or("length")
     } else {
         "stop"
     };
@@ -1006,8 +1012,51 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
         "created": now_ts(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-        "usage": chat_usage(in_tok, out_tok, cached, reasoning_tok)
+        "usage": chat_usage(in_tok, out_tok, cached, reasoning_tok),
+        // Internal hand-off read by `chat_failure`; `handle_ingress` strips it
+        // before the object reaches a client.
+        "upstream_error": responses_failure(resp)
     })
+}
+
+/// `incomplete_details.reason` — not always a token limit, it can be
+/// `content_filter` or `max_output_tokens`.
+fn incomplete_reason(resp: &Value) -> Option<String> {
+    resp.pointer("/incomplete_details/reason")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+}
+
+/// Chat `finish_reason` for a Responses `incomplete_details.reason`.
+fn finish_from_incomplete(reason: &str) -> &'static str {
+    match reason {
+        "max_output_tokens" | "max_tokens" => "length",
+        "content_filter" => "content_filter",
+        _ => "length",
+    }
+}
+
+/// Human-readable error text for a `failed` Responses response.
+pub fn responses_failure(resp: &Value) -> Option<String> {
+    if resp.get("status").and_then(|s| s.as_str()) != Some("failed") {
+        return None;
+    }
+    Some(
+        resp.pointer("/error/message")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .or_else(|| resp.get("error").and_then(|x| x.as_str()).map(String::from))
+            .unwrap_or_else(|| "upstream response failed".to_string()),
+    )
+}
+
+/// `chat_to_responses_response` / `responses_to_openai` counterpart: turn a
+/// canonical chat completion whose upstream reported `failed` back into a
+/// Responses-shaped error object.
+pub fn chat_failure(chat: &Value) -> Option<String> {
+    chat.get("upstream_error")
+        .and_then(|x| x.as_str())
+        .map(String::from)
 }
 
 /// Stateful translator for a Responses API SSE stream into OpenAI chunks.
@@ -1144,9 +1193,17 @@ impl ResponsesStream {
                     .pointer("/response/usage/output_tokens_details/reasoning_tokens")
                     .and_then(|x| x.as_i64())
                     .unwrap_or(0);
-                let fr = match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                    "response.incomplete" => "length",
-                    "response.failed" => "stop",
+                let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                // `failed` is an upstream fault. Emitting `stop` here would
+                // hand the client a normal-looking, truncated answer.
+                let fr = match ty {
+                    "response.incomplete" => {
+                        incomplete_reason(ev.pointer("/response").unwrap_or(ev))
+                            .as_deref()
+                            .map(finish_from_incomplete)
+                            .unwrap_or("length")
+                    }
+                    "response.failed" => "error",
                     _ => {
                         if self.tool_index > 0 {
                             "tool_calls"
@@ -3299,6 +3356,53 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data["type"], "content_block_stop");
         assert!(s.abort().is_empty(), "abort is idempotent");
+    }
+
+    // ---- S-4: `failed` is an error, not a finish reason -----------------
+
+    #[test]
+    fn responses_failed_surfaces_as_an_error() {
+        let resp = json!({
+            "status": "failed",
+            "error": {"message": "upstream exploded"},
+            "output": []
+        });
+        assert_eq!(
+            responses_failure(&resp),
+            Some("upstream exploded".to_string())
+        );
+        assert!(chat_failure(&responses_to_openai(&resp, "m")).is_some());
+        // A healthy response carries no failure.
+        assert!(responses_failure(&json!({"status": "completed"})).is_none());
+    }
+
+    #[test]
+    fn incomplete_reason_drives_finish_reason() {
+        let resp = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": []
+        });
+        let out = responses_to_openai(&resp, "m");
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+        let resp = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": []
+        });
+        let out = responses_to_openai(&resp, "m");
+        assert_eq!(out["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn responses_stream_maps_failed_to_error_finish() {
+        let mut s = ResponsesStream::new("m");
+        s.handle(&json!({"type": "response.output_text.delta", "delta": "x"}));
+        let out = s.handle(&json!({
+            "type": "response.failed",
+            "response": {"error": {"message": "boom"}}
+        }));
+        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "error");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use config::{Config, ModelCfg, Protocol};
 use discovery::refresh_discovery;
 use translate::{
-    anthropic_to_chat_request, anthropic_to_openai, chat_to_anthropic_response,
+    anthropic_to_chat_request, anthropic_to_openai, chat_failure, chat_to_anthropic_response,
     chat_to_responses_request, chat_to_responses_response, frame_data, frame_event,
     openai_to_anthropic, responses_stateful_error, responses_to_chat_request, responses_to_openai,
     AnthropicStream, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, SseEvent,
@@ -505,6 +505,18 @@ fn trunc(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
+/// JSON type name, for error messages about a malformed upstream body.
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 pub(crate) fn upstream_url(base: &str, m: &ModelCfg) -> String {
     let base = base.trim_end_matches('/');
     match m.protocol {
@@ -571,33 +583,114 @@ fn ingress_error(ingress: Ingress, status: StatusCode, msg: &str) -> Response {
 
 /// Upstream failure in the ingress protocol's error shape (the raw upstream
 /// body would not make sense to a client speaking a different protocol).
+///
+/// Only the *envelope* is rewritten; the upstream's own `error` object is
+/// carried through, so `param`, `code`, `inner_error` and friends survive.
+/// The upstream status code is preserved too — a 429 stays a 429, which is
+/// what every SDK's retry logic keys on.
 fn upstream_error_response(ingress: Ingress, e: UpstreamError) -> Response {
     match e {
         UpstreamError::Message(msg) => ingress_error(ingress, StatusCode::BAD_GATEWAY, &msg),
-        UpstreamError::Status(code, body) => {
-            if ingress != Ingress::Anthropic {
-                let mut resp = Response::new(Body::from(body));
-                *resp.status_mut() = code;
-                resp.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                return resp;
-            }
-            let msg = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .or_else(|| v.get("message"))
-                        .and_then(|x| x.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or(body);
-            json_response(
-                code,
-                json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
-            )
+        UpstreamError::Status(status, body) => {
+            json_response(status, upstream_error_body(ingress, &body))
         }
+    }
+}
+
+/// Error classes Anthropic clients recognize in `error.type`. Anything else
+/// becomes `api_error`: an unknown class makes SDK retry logic fall through
+/// to its generic branch, which is the safe default for a gateway fault.
+const ANTHROPIC_ERROR_CLASSES: &[&str] = &[
+    "api_error",
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "request_too_large",
+    "rate_limit_error",
+    "api_timeout_error",
+    "overloaded_error",
+];
+
+/// Rewrite an upstream error body into `ingress`'s error envelope.
+///
+/// An upstream can speak any of the three protocols, so forwarding its body
+/// verbatim hands e.g. an OpenAI-shaped error to an Anthropic client whose
+/// SDK then fails to parse it and surfaces `undefined` instead of the
+/// message. Three envelopes are produced:
+///
+/// - OpenAI (Chat and Responses share it): `{"error": {...}}`
+/// - Anthropic: `{"type": "error", "error": {...}}`
+fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
+    let inner = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| match v.get("error") {
+            Some(Value::Object(o)) => Some(Value::Object(o.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "message": upstream_error_message(body),
+                "type": "upstream_error",
+            })
+        });
+
+    match ingress {
+        Ingress::Anthropic => {
+            let mut o = inner.as_object().cloned().unwrap_or_default();
+            o.entry("message")
+                .or_insert_with(|| json!(upstream_error_message(body)));
+            // Anthropic puts the error *class* inside `error`, and its
+            // clients branch on it. Only real Anthropic classes may pass
+            // through: the literal "error" is the SSE framing marker, and an
+            // OpenAI class such as "rate_limit_exceeded" is meaningless here.
+            // The upstream's own value is not lost — it stays in `error.code`.
+            let class = o
+                .get("type")
+                .and_then(|x| x.as_str())
+                .filter(|s| ANTHROPIC_ERROR_CLASSES.contains(s))
+                .unwrap_or("api_error")
+                .to_string();
+            o.insert("type".into(), json!(class));
+            json!({"type": "error", "error": Value::Object(o)})
+        }
+        _ => {
+            let mut o = inner.as_object().cloned().unwrap_or_default();
+            o.entry("message")
+                .or_insert_with(|| json!(upstream_error_message(body)));
+            json!({"error": Value::Object(o)})
+        }
+    }
+}
+
+/// Best-effort `message` out of an upstream error body of any protocol.
+fn upstream_error_message(body: &str) -> String {
+    let text = body.trim();
+    let v: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        // Not JSON at all: an HTML error page or a proxy banner. The raw
+        // text is still the most useful thing we have, bounded so a stray
+        // megabyte of markup cannot end up in a log line or a response.
+        Err(_) => return fallback_error_message(text),
+    };
+    // `{"error": "rate limited"}` — some gateways send a bare string.
+    if let Some(s) = v.get("error").and_then(|x| x.as_str()) {
+        return s.to_string();
+    }
+    v.pointer("/error/message")
+        .or_else(|| v.get("message"))
+        .or_else(|| v.pointer("/error/detail"))
+        .or_else(|| v.get("detail"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(|| fallback_error_message(text), |s| s.to_string())
+}
+
+fn fallback_error_message(text: &str) -> String {
+    if text.is_empty() {
+        "upstream returned an empty error body".to_string()
+    } else {
+        format!("upstream error: {}", trunc(text, 500))
     }
 }
 
@@ -635,7 +728,9 @@ async fn call_upstream(
                 now_ms() - t0,
                 e
             );
-            return Err(UpstreamError::Message(format!("upstream request failed: {e}")));
+            return Err(UpstreamError::Message(format!(
+                "upstream request failed: {e}"
+            )));
         }
     };
 
@@ -676,7 +771,7 @@ async fn call_upstream(
 // Ingress handlers: POST /v1/chat/completions, /v1/responses, /v1/messages
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Ingress {
     Chat,
     Responses,
@@ -807,8 +902,42 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
         };
         let up: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(_) => return raw_json_response(StatusCode::OK, text),
+            // A 200 with a non-JSON body is an upstream fault (HTML error
+            // page, proxy banner, ...). The raw bytes are useless to a client
+            // speaking any of the three protocols, so return a protocol-shaped
+            // 502 and keep the excerpt in the log.
+            Err(_) => {
+                eprintln!(
+                    "[gw] non-JSON upstream body model={} len={} body={}",
+                    m.name,
+                    text.len(),
+                    trunc(&text, 200)
+                );
+                return ingress_error(
+                    ingress,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream returned a non-JSON body ({} bytes)", text.len()),
+                );
+            }
         };
+        // Every translator below indexes into the body as an object; a
+        // non-object (`[]`, `"OK"`, `null`) would panic on `Value` IndexMut
+        // and, with panic=abort, kill the whole gateway.
+        if !up.is_object() {
+            eprintln!(
+                "[gw] non-object upstream JSON model={} protocol={}",
+                m.name,
+                m.protocol.as_str()
+            );
+            return ingress_error(
+                ingress,
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "upstream returned a non-object JSON body ({})",
+                    kind_of(&up)
+                ),
+            );
+        }
         if native {
             // Same protocol both ends: only the public model id needs
             // rewriting, everything else is the client's own response.
@@ -818,15 +947,26 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
             }
             return json_response(StatusCode::OK, v);
         }
-        let chat = match m.protocol {
+        let mut chat = match m.protocol {
             Protocol::Chat => {
                 let mut v = up;
-                v["model"] = json!(name.clone());
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("model".into(), json!(name.clone()));
+                }
                 v
             }
             Protocol::Anthropic => anthropic_to_openai(&up, &name),
             Protocol::Responses => responses_to_openai(&up, &name),
         };
+        // A `failed` Responses upstream must not reach the client as a
+        // 200 with an empty answer: surface it as a gateway error.
+        if let Some(msg) = chat_failure(&chat) {
+            eprintln!("[gw] upstream response failed model={}: {msg}", m.name);
+            return ingress_error(ingress, StatusCode::BAD_GATEWAY, &msg);
+        }
+        // `upstream_error` is an internal hand-off from `responses_to_openai`
+        // to `chat_failure`; it is not part of any wire protocol.
+        chat.as_object_mut().map(|o| o.remove("upstream_error"));
         let out = match ingress {
             Ingress::Chat => chat,
             Ingress::Responses => chat_to_responses_response(&chat, &name),
@@ -1383,16 +1523,6 @@ fn json_response(status: StatusCode, v: Value) -> Response {
     resp
 }
 
-fn raw_json_response(status: StatusCode, body: String) -> Response {
-    let mut resp = Response::new(Body::from(body));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    resp
-}
-
 fn error_json(status: StatusCode, msg: &str) -> Response {
     json_response(
         status,
@@ -1630,6 +1760,20 @@ mod tests {
     }
 
     #[test]
+    fn non_object_upstream_body_is_a_502_not_a_panic() {
+        // B-1: `Value` IndexMut panics on arrays/strings/numbers and the
+        // release profile is panic = "abort", so this killed the gateway.
+        for bad in [json!([]), json!("OK"), json!(null), json!(7)] {
+            assert!(!bad.is_object(), "{:?} must not pass the object guard", bad);
+            assert_ne!(kind_of(&bad), "object");
+        }
+        assert_eq!(kind_of(&json!([])), "array");
+        assert_eq!(kind_of(&json!("OK")), "string");
+        assert_eq!(kind_of(&Value::Null), "null");
+        assert_eq!(kind_of(&json!({})), "object");
+    }
+
+    #[test]
     fn stream_error_msg_prefers_nested_message() {
         assert_eq!(
             stream_error_msg(&json!({"error": {"message": "rate limited"}}), "{}"),
@@ -1730,6 +1874,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_block_treats_a_failed_chunk_as_a_stream_error() {
+        // The main loop and the end-of-stream flush used to carry separate
+        // copies of this check; both paths must agree.
+        let mut inbound = Inbound::Responses(ResponsesStream::new("m"));
+        let mut egress = Egress::Chat;
+        let block =
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}";
+        let (_, err) = render_block(classify_block(block, &None, &mut inbound, &mut egress));
+        assert_eq!(err.as_deref(), Some("upstream response failed"));
+
+        // A healthy event is not an error.
+        let block = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}";
+        let (lines, err) = render_block(classify_block(block, &None, &mut inbound, &mut egress));
+        assert!(err.is_none());
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
     fn sse_parser_tolerates_use_after_finish() {
         // `finish()` resets the cursors; a later `next_block()` used to
         // underflow `line_start - pos`, which under `panic = "abort"` would
@@ -1740,6 +1902,136 @@ mod tests {
         assert!(p.finish().is_some());
         assert!(p.next_block().is_none());
         assert!(p.finish().is_none());
+    }
+
+    // ---- error shape (L-2) ------------------------------------------------
+
+    /// Assert `body` is a well-formed error for `ingress`, and return the
+    /// message. A body missing that field is exactly the bug: the SDK
+    /// surfaces `undefined` and the user sees nothing useful.
+    fn assert_error_shape(ingress: Ingress, body: &Value) -> String {
+        match ingress {
+            Ingress::Anthropic => assert_eq!(
+                body["type"], "error",
+                "Anthropic clients dispatch on the top-level `type`: {body}"
+            ),
+            _ => assert!(
+                body.get("error").is_some(),
+                "missing `error` object: {body}"
+            ),
+        }
+        assert!(
+            body.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .is_some(),
+            "no readable message for {ingress:?}: {body}"
+        );
+        body.pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn upstream_errors_are_reshaped_for_every_ingress() {
+        // A client must never receive an error in a protocol it does not
+        // speak: an OpenAI-shaped 429 handed to an Anthropic SDK fails to
+        // parse and the user sees `undefined` instead of the rate limit.
+        let upstreams = [
+            // OpenAI / Responses
+            r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
+            // Anthropic
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            // bare string
+            r#"{"error":"nope"}"#,
+            // bare message
+            r#"{"message":"bad request"}"#,
+            // not JSON at all
+            "<html>502 Bad Gateway</html>",
+            // empty
+            "",
+        ];
+        for up in upstreams {
+            for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+                let body = upstream_error_body(ingress, up);
+                let msg = assert_error_shape(ingress, &body);
+                assert!(!msg.is_empty(), "empty message from {up:?} -> {ingress:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_error_keeps_the_status_code_and_extra_fields() {
+        // SDK retry logic keys on the status, and operators debug with the
+        // upstream's own `code` / `param` fields; neither may be flattened.
+        let up = r#"{"error":{"message":"bad","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#;
+        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+            let resp = upstream_error_response(
+                ingress,
+                UpstreamError::Status(StatusCode::TOO_MANY_REQUESTS, up.to_string()),
+            );
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        let chat = upstream_error_body(Ingress::Chat, up);
+        assert_eq!(chat["error"]["code"], "model_not_found");
+        assert_eq!(chat["error"]["param"], "model");
+        let anth = upstream_error_body(Ingress::Anthropic, up);
+        assert_eq!(anth["error"]["code"], "model_not_found");
+    }
+
+    #[test]
+    fn anthropic_error_class_is_always_a_class_the_sdk_knows() {
+        // The literal "error" is Anthropic's SSE framing marker, not an
+        // error class. An OpenAI class is meaningless to an Anthropic SDK and
+        // makes its retry logic fall through to the generic branch.
+        for (upstream, want) in [
+            (r#"{"type":"error","message":"boom"}"#, "api_error"),
+            (
+                r#"{"error":{"message":"m","type":"rate_limit_exceeded"}}"#,
+                "api_error",
+            ),
+            (r#"{"error":{"message":"m","type":""}}"#, "api_error"),
+            (r#"{"message":"m"}"#, "api_error"),
+            // Real Anthropic classes survive untouched.
+            (
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#,
+                "overloaded_error",
+            ),
+            (
+                r#"{"error":{"message":"m","type":"invalid_request_error"}}"#,
+                "invalid_request_error",
+            ),
+        ] {
+            let out = upstream_error_body(Ingress::Anthropic, upstream);
+            assert_eq!(out["type"], "error", "envelope: {out}");
+            assert_eq!(out["error"]["type"], want, "class from {upstream}");
+        }
+
+        // The upstream's own value is not discarded, only relabelled.
+        let out = upstream_error_body(
+            Ingress::Anthropic,
+            r#"{"error":{"message":"m","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}"#,
+        );
+        assert_eq!(out["error"]["code"], "rate_limit_exceeded");
+    }
+
+    #[test]
+    fn non_json_upstream_error_stays_bounded() {
+        // A proxy's HTML error page must not become a megabyte-long message
+        // in both the log and the response body.
+        let html = format!("<html>{}</html>", "x".repeat(5000));
+        let out = upstream_error_body(Ingress::Chat, &html);
+        let msg = &out["error"]["message"];
+        assert!(msg.as_str().unwrap().starts_with("upstream error: <html>"));
+        assert!(
+            msg.as_str().unwrap().len() < 600,
+            "unbounded: {}",
+            msg.as_str().unwrap().len()
+        );
+
+        // An empty body still produces something a client can read.
+        let out = upstream_error_body(Ingress::Chat, "");
+        assert!(!out["error"]["message"].as_str().unwrap().is_empty());
     }
 
 }
