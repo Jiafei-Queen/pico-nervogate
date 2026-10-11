@@ -15,6 +15,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -271,6 +272,13 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {listen}: {e}"));
     println!("pico-nervogate listening on {listen} ({n} models)");
+    // Without TCP_NODELAY, Nagle holds multi-segment SSE responses until the
+    // peer's delayed ACK lands, adding ~40ms per streamed response.
+    let listener = listener.tap_io(|stream| {
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("[gw] set_nodelay failed: {e}");
+        }
+    });
     axum::serve(listener, app).await.unwrap();
 }
 
