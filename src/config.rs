@@ -373,6 +373,13 @@ pub struct Config {
     /// Extra headers applied to every upstream request.
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Largest client request body accepted, in bytes. Axum's built-in limit
+    /// is 2 MiB, which rejects real workloads (base64 images, long agent
+    /// histories) with a plain-text 413 that no SDK can parse. The gateway
+    /// applies this limit itself so the rejection can carry the ingress
+    /// protocol's error shape. 0 disables the limit.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     /// models.dev enrichment (modalities, price, limits) for /v1/models.
     #[serde(default)]
     pub models_dev: ModelsDevCfg,
@@ -390,6 +397,12 @@ fn default_listen() -> String {
 }
 fn default_user_agent() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+fn default_max_body_bytes() -> usize {
+    // 32 MiB. Large enough for a few hundred turns of conversation or a
+    // handful of base64 images, small enough that a runaway client cannot
+    // exhaust memory before the read completes.
+    32 * 1024 * 1024
 }
 
 impl Config {

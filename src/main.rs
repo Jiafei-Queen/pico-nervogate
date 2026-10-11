@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -261,19 +261,28 @@ async fn main() {
         });
     }
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/responses", post(responses_ingress))
-        .route("/v1/messages", post(messages_ingress))
-        .with_state(state);
+    let app = app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| panic!("bind {listen}: {e}"));
     println!("pico-nervogate listening on {listen} ({n} models)");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Route table, kept out of `main` so tests can drive it without a socket.
+fn app(state: St) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/responses", post(responses_ingress))
+        .route("/v1/messages", post(messages_ingress))
+        // The gateway applies `max_body_bytes` itself so an oversized request
+        // can be rejected in the ingress protocol's error shape. Axum's own
+        // 2 MiB `Bytes` extractor limit would fire first, as plain text.
+        .layer(DefaultBodyLimit::disable())
+        .with_state(state)
 }
 
 async fn healthz() -> Response {
@@ -815,16 +824,16 @@ impl Ingress {
     }
 }
 
-async fn chat(State(st): State<St>, body: Bytes) -> Response {
-    handle_ingress(st, body, Ingress::Chat).await
+async fn chat(State(st): State<St>, req: Request) -> Response {
+    handle_ingress(st, req, Ingress::Chat).await
 }
 
-async fn responses_ingress(State(st): State<St>, body: Bytes) -> Response {
-    handle_ingress(st, body, Ingress::Responses).await
+async fn responses_ingress(State(st): State<St>, req: Request) -> Response {
+    handle_ingress(st, req, Ingress::Responses).await
 }
 
-async fn messages_ingress(State(st): State<St>, body: Bytes) -> Response {
-    let mut resp = handle_ingress(st, body, Ingress::Anthropic).await;
+async fn messages_ingress(State(st): State<St>, req: Request) -> Response {
+    let mut resp = handle_ingress(st, req, Ingress::Anthropic).await;
     resp.headers_mut().insert(
         header::HeaderName::from_static("anthropic-version"),
         HeaderValue::from_static("2023-06-01"),
@@ -832,9 +841,54 @@ async fn messages_ingress(State(st): State<St>, body: Bytes) -> Response {
     resp
 }
 
+/// Byte ceiling for a client body. 0 means unlimited, which `to_bytes` would
+/// otherwise read as "reject everything".
+fn body_limit(cfg: &Config) -> usize {
+    if cfg.max_body_bytes == 0 {
+        usize::MAX
+    } else {
+        cfg.max_body_bytes
+    }
+}
+
+fn declared_len(req: &Request) -> Option<u64> {
+    req.headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Protocol-shaped 413.
+///
+/// The `Bytes` extractor would reject an oversized body on its own, but with
+/// a plain-text body no SDK can parse, so the gateway reads the body itself
+/// and reports the failure in the ingress protocol's envelope.
+fn body_too_large(ingress: Ingress, limit: usize) -> Response {
+    ingress_error(
+        ingress,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &format!("request body exceeds the {limit} byte limit"),
+    )
+}
+
 /// One pipeline for all three ingress surfaces: normalize to the canonical
 /// chat request, call upstream, translate back into the ingress protocol.
-async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
+async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
+    let limit = body_limit(&st.cfg.read().unwrap());
+    // A declared Content-Length over the limit is refused before anything is
+    // buffered. Chunked bodies declare none and are caught by the counting
+    // read below instead.
+    if let Some(len) = declared_len(&req) {
+        if len > limit as u64 {
+            return body_too_large(ingress, limit);
+        }
+    }
+    let body = match axum::body::to_bytes(req.into_body(), limit).await {
+        Ok(b) => b,
+        // Under a limit the only failure `to_bytes` raises is exceeding it;
+        // a truncated upload is indistinguishable and equally unusable.
+        Err(_) => return body_too_large(ingress, limit),
+    };
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -865,7 +919,19 @@ async fn handle_ingress(st: St, body: Bytes, ingress: Ingress) -> Response {
             return ingress_error(ingress, StatusCode::BAD_REQUEST, &msg);
         }
     }
-    let stream = req.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
+    let stream = match req.get("stream") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            // `"stream": "true"` would otherwise be read as `false` and the
+            // client gets a JSON body where it expected SSE.
+            return ingress_error(
+                ingress,
+                StatusCode::BAD_REQUEST,
+                &format!("`stream` must be a boolean, got {}", kind_of(other)),
+            );
+        }
+    };
 
     // Same protocol on both ends: forward the client's own body untouched.
     let native = ingress.protocol() == m.protocol;
@@ -1593,6 +1659,7 @@ fn sample_config() -> Config {
         owned_by: None,
         provider: None,
         extra_headers: HashMap::new(),
+        max_body_bytes: 32 * 1024 * 1024,
         models_dev: Default::default(),
         reload: Default::default(),
         discovery: Default::default(),
@@ -2083,4 +2150,119 @@ mod tests {
         assert_eq!(body_summary(&json!([1, 2])), "array");
     }
 
+    // ---- body limit (L-9) -------------------------------------------------
+
+    #[test]
+    fn zero_body_limit_means_unlimited() {
+        // `to_bytes(body, 0)` rejects everything; 0 is the config's way of
+        // saying "no limit" and must not reach it as an actual zero.
+        assert_eq!(
+            body_limit(&Config {
+                max_body_bytes: 0,
+                ..sample_config()
+            }),
+            usize::MAX
+        );
+        assert_eq!(
+            body_limit(&Config {
+                max_body_bytes: 4096,
+                ..sample_config()
+            }),
+            4096
+        );
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_in_the_ingress_protocol_shape() {
+        // Axum's own limit produced a plain-text 413 that no SDK can parse;
+        // the client could not tell a size rejection from a proxy error.
+        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+            let resp = body_too_large(ingress, 1024);
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body: Value = read_body(resp);
+            assert!(assert_error_shape(ingress, &body).contains("1024"));
+        }
+    }
+
+    /// Drive the real router with an oversized body and read the response
+    /// back, so the test covers the limit and the rejection together rather
+    /// than only the helper that formats it.
+    #[tokio::test]
+    async fn router_rejects_an_oversized_body_in_protocol_shape() {
+        use tower::ServiceExt;
+
+        let limit = 1024usize;
+        let mut cfg = sample_config();
+        cfg.max_body_bytes = limit;
+        let state = test_state(cfg);
+        let router = app(state);
+
+        // Comfortably past the limit, with the secret in it: the response
+        // must describe the failure without echoing the payload back.
+        let secret = "sk-live-DO-NOT-ECHO";
+        let big = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{secret}{}"}}]}}"#,
+            "x".repeat(limit * 2)
+        );
+
+        for (path, ingress) in [
+            ("/v1/chat/completions", Ingress::Chat),
+            ("/v1/responses", Ingress::Responses),
+            ("/v1/messages", Ingress::Anthropic),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("content-length", big.len())
+                .body(Body::from(big.clone()))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.expect("router responded");
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path} must be rejected before the model lookup"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("{path} body was not JSON ({e}): {bytes:?}"));
+            let msg = assert_error_shape(ingress, &body);
+            assert!(!msg.contains(secret), "payload echoed back: {body}");
+            assert!(msg.contains("1024"), "limit not reported: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_under_the_limit_is_parsed_not_rejected() {
+        // The limit must not reject legitimate requests: an unknown model is
+        // a 404, which proves the body was read and dispatched normally.
+        use tower::ServiceExt;
+
+        let mut cfg = sample_config();
+        cfg.max_body_bytes = 64 * 1024;
+        let router = app(test_state(cfg));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"nope","messages":[]}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Drain a `Response` body into JSON.
+    fn read_body(resp: Response) -> Value {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("read body");
+                serde_json::from_slice(&bytes).expect("body is JSON")
+            })
+    }
 }
