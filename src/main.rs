@@ -505,6 +505,21 @@ fn trunc(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
+/// Top-level field names of an outbound request, sorted.
+///
+/// Enough to answer "did the translation produce the shape the upstream
+/// expects?" without writing the prompt itself to the log.
+fn body_summary(body: &Value) -> String {
+    match body.as_object() {
+        Some(o) => {
+            let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join(",")
+        }
+        None => kind_of(body).to_string(),
+    }
+}
+
 /// JSON type name, for error messages about a malformed upstream body.
 fn kind_of(v: &Value) -> &'static str {
     match v {
@@ -755,11 +770,23 @@ async fn call_upstream(
             url,
             trunc(&text, 2000)
         );
+        // The outgoing body holds the user's prompt verbatim plus whatever
+        // they inlined (keys in headers aside, tool arguments and file
+        // contents routinely carry secrets too). Logging it writes all of
+        // that to stderr, which in practice is a container log shipped
+        // somewhere durable. Shape only, unless explicitly opted in.
         eprintln!(
-            "[gw] outgoing model={} body={}",
+            "[gw] outgoing model={} keys={}",
             m.name,
-            trunc(&serde_json::to_string(&body).unwrap_or_default(), 2000)
+            body_summary(&body)
         );
+        if std::env::var("GATEWAY_DEBUG_BODY").is_ok_and(|v| v == "1" || v == "true") {
+            eprintln!(
+                "[gw] outgoing body model={} body={}",
+                m.name,
+                trunc(&serde_json::to_string(&body).unwrap_or_default(), 2000)
+            );
+        }
         Err(UpstreamError::Status(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             text,
@@ -2032,6 +2059,28 @@ mod tests {
         // An empty body still produces something a client can read.
         let out = upstream_error_body(Ingress::Chat, "");
         assert!(!out["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    // ---- log hygiene (L-8) ------------------------------------------------
+
+    #[test]
+    fn body_summary_reports_keys_never_values() {
+        // The outbound body is the user's prompt. Whatever we log about it
+        // must not contain any of the content.
+        let secret = "sk-live-DO-NOT-LOG-THIS";
+        let body = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": secret}],
+            "temperature": 0.5,
+        });
+        let summary = body_summary(&body);
+        assert_eq!(summary, "messages,model,temperature");
+        assert!(!summary.contains(secret));
+        assert!(!summary.contains("gpt-4"));
+
+        // A non-object body degrades to its type rather than its content.
+        assert_eq!(body_summary(&json!("hi")), "string");
+        assert_eq!(body_summary(&json!([1, 2])), "array");
     }
 
 }
