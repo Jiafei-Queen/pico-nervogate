@@ -1,5 +1,7 @@
 mod config;
 mod discovery;
+#[cfg(test)]
+mod e2e;
 mod models_dev;
 mod translate;
 
@@ -1683,6 +1685,48 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
     )
 }
 
+/// Baseline `Config` for tests, overridable field by field.
+/// One chat-completion chunk, as a mock upstream would emit it.
+#[cfg(test)]
+pub(crate) fn chat_chunk(delta: Value, finish: Option<&str>) -> Value {
+    let mut choice = json!({"index": 0, "delta": delta, "finish_reason": Value::Null});
+    if let Some(f) = finish {
+        choice["finish_reason"] = json!(f);
+    }
+    json!({"id": "c", "object": "chat.completion.chunk",
+           "created": 1, "model": "mock", "choices": [choice]})
+}
+
+/// Mock non-streaming chat completion carrying `text`.
+#[cfg(test)]
+pub(crate) fn chat_completion(text: &str) -> Value {
+    json!({"id": "c", "object": "chat.completion", "created": 1, "model": "mock",
+           "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": text}}],
+           "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+}
+
+/// Split an SSE body into `(event_name, data)` pairs, in wire order.
+#[cfg(test)]
+pub(crate) fn parse_sse(body: &str) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    for block in body.split("\n\n") {
+        let mut name = None;
+        let mut data = Vec::new();
+        for line in block.split('\n') {
+            if let Some(v) = line.strip_prefix("event:") {
+                name = Some(v.strip_prefix(' ').unwrap_or(v).to_string());
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data.push(v.strip_prefix(' ').unwrap_or(v));
+            }
+        }
+        if !data.is_empty() {
+            out.push((name, data.join("\n")));
+        }
+    }
+    out
+}
+
 /// Minimal in-process state: no models, no upstream, no network.
 #[cfg(test)]
 pub(crate) fn test_state(cfg: Config) -> St {
@@ -1704,6 +1748,17 @@ pub(crate) fn test_state(cfg: Config) -> St {
         config_path: String::new(),
         config_mtime: RwLock::new(None),
     })
+}
+
+/// A `Config` pointing every model at `base_url`.
+#[cfg(test)]
+pub(crate) fn config_for(base_url: &str, models: Vec<ModelCfg>) -> Config {
+    Config {
+        api_key: Some("test-key".into()),
+        default_base_url: Some(base_url.to_string()),
+        models,
+        ..sample_config()
+    }
 }
 
 #[cfg(test)]

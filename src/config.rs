@@ -328,6 +328,26 @@ pub struct DiscoveryCfg {
     pub prune_missing: bool,
 }
 
+/// A minimal `[[models]]` entry for tests. Parsed from TOML rather than
+/// built field by field, so adding a config field does not break every
+/// test that only cares about `name`/`protocol`/`base_url`.
+#[cfg(test)]
+pub(crate) fn test_model(name: &str, protocol: Protocol, base_url: &str) -> ModelCfg {
+    // `Config::load` insists on at least one model and carries every other
+    // section's defaults; only the models table is needed here.
+    #[derive(Deserialize)]
+    struct ModelsOnly {
+        #[serde(default)]
+        models: Vec<ModelCfg>,
+    }
+    let toml = format!(
+        "[[models]]\nname = {name:?}\nprotocol = {:?}\nbase_url = {base_url:?}\n",
+        protocol.as_str()
+    );
+    let parsed: ModelsOnly = toml::from_str(&toml).expect("parse test model");
+    parsed.models.into_iter().next().expect("one model")
+}
+
 impl Default for DiscoveryCfg {
     fn default() -> Self {
         Self {

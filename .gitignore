@@ -2,4 +2,6 @@
 .env.remote
 .env
 gateway.local.toml
+gateway.local.toml.bak
 models.dev.json
+.*.swp
