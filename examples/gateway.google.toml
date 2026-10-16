@@ -1,0 +1,36 @@
+# Google Gemini via pico-nervogate. Covers AI Studio and Vertex AI.
+
+listen = "0.0.0.0:8787"
+
+# Upstream key: AI Studio API key or Vertex access token / API key.
+api_key_env = "GEMINI_API_KEY"
+
+# Optional: values advertised by GET /v1/models.
+# owned_by = "google"
+# provider = "google"
+
+# AI Studio model. Key auth (`x-goog-api-key`) is automatic here because the
+# base URL is not an AI Platform host. Streaming switches the endpoint to
+# `:streamGenerateContent?alt=sse`; no `stream` body flag is sent.
+[[models]]
+name = "gemini-2.5-flash"
+protocol = "google"
+upstream = "gemini-2.5-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+vision = true
+# google_auth = "api_key"  # default under auto for this base URL
+
+# Vertex AI model. Bearer auth is automatic when the base URL points at
+# AI Platform; `google_auth = "bearer"` pins it explicitly. The project,
+# location and publisher path are part of `base_url`.
+# [[models]]
+# name = "vertex-flash"
+# protocol = "google"
+# upstream = "gemini-2.5-flash"
+# base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models"
+# google_auth = "bearer"
+
+# Gemini clients speak the native path (model in the URL, verb picks
+# streaming), while OpenAI/Anthropic clients use the usual surfaces:
+#   curl $GATEWAY/v1beta/models/gemini-2.5-flash:generateContent -d '{...}'
+#   curl $GATEWAY/v1beta/models/gemini-2.5-flash:streamGenerateContent -d '{...}'

@@ -2,6 +2,7 @@ mod config;
 mod discovery;
 #[cfg(test)]
 mod e2e;
+mod google;
 mod models_dev;
 mod translate;
 
@@ -20,8 +21,12 @@ use axum::Router;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use config::{Config, ModelCfg, Protocol};
+use config::{Config, GoogleAuth, ModelCfg, Protocol};
 use discovery::refresh_discovery;
+use google::{
+    chat_to_google_request, chat_to_google_response, google_to_chat, google_to_chat_request,
+    parse_google_action, ChatToGoogleStream, GoogleStream,
+};
 use translate::{
     anthropic_to_chat_request, anthropic_to_openai, apply_reasoning_output_to_message,
     chat_failure, chat_to_anthropic_fatal, chat_to_anthropic_loss, chat_to_anthropic_response,
@@ -291,6 +296,7 @@ fn app(state: St) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses_ingress))
         .route("/v1/messages", post(messages_ingress))
+        .route("/v1beta/models/{action}", post(google_ingress))
         // The gateway applies `max_body_bytes` itself so an oversized request
         // can be rejected in the ingress protocol's error shape. Axum's own
         // 2 MiB `Bytes` extractor limit would fire first, as plain text.
@@ -506,7 +512,31 @@ pub(crate) fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
             HeaderValue::from_static("2023-06-01"),
         );
     }
+    if m.protocol == Protocol::Google && !google_uses_bearer(m, &cfg) {
+        // AI Studio key auth: the Bearer token above does not apply.
+        h.remove(header::AUTHORIZATION);
+        if let Ok(v) = HeaderValue::from_str(&api_key) {
+            h.insert(
+                header::HeaderName::from_static("x-goog-api-key"),
+                v,
+            );
+        }
+    }
     h
+}
+
+/// Does this Google model authenticate with a Bearer token (Vertex)?
+/// `google_auth = "bearer"` forces it, `"api_key"` forces key auth,
+/// `"auto"` (default) sniffs the base URL for AI Platform.
+fn google_uses_bearer(m: &ModelCfg, cfg: &Config) -> bool {
+    match m.google_auth {
+        GoogleAuth::Bearer => true,
+        GoogleAuth::ApiKey => false,
+        GoogleAuth::Auto => cfg
+            .base_url_for(m)
+            .map(|b| b.contains("aiplatform.googleapis.com"))
+            .unwrap_or(false),
+    }
 }
 
 fn now_ms() -> u128 {
@@ -554,12 +584,20 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
-pub(crate) fn upstream_url(base: &str, m: &ModelCfg) -> String {
+pub(crate) fn upstream_url(base: &str, m: &ModelCfg, stream: bool) -> String {
     let base = base.trim_end_matches('/');
     match m.protocol {
         Protocol::Chat => format!("{base}/chat/completions"),
         Protocol::Anthropic => format!("{base}/messages"),
         Protocol::Responses => format!("{base}/responses"),
+        Protocol::Google => {
+            let model = m.upstream_model();
+            if stream {
+                format!("{base}/models/{model}:streamGenerateContent?alt=sse")
+            } else {
+                format!("{base}/models/{model}:generateContent")
+            }
+        }
     }
 }
 
@@ -596,12 +634,19 @@ fn build_body(
                 openai_to_anthropic_with_max(req, m.thinking_mode(), anthropic_max_tokens)
             }
             Protocol::Responses => chat_to_responses_request(req),
+            Protocol::Google => chat_to_google_request(req),
         },
     };
     if let Some(o) = body.as_object_mut() {
-        o.insert("model".into(), json!(upstream));
+        // Google carries the model in the URL path, not the body.
+        if m.protocol != Protocol::Google {
+            o.insert("model".into(), json!(upstream));
+        }
         if stream {
-            o.insert("stream".into(), json!(true));
+            // Google switches endpoint instead of reading a `stream` flag.
+            if m.protocol != Protocol::Google {
+                o.insert("stream".into(), json!(true));
+            }
         } else {
             // avoid asking upstream for a stream we will not consume
             o.remove("stream");
@@ -659,12 +704,12 @@ const ANTHROPIC_ERROR_CLASSES: &[&str] = &[
 
 /// Rewrite an upstream error body into `ingress`'s error envelope.
 ///
-/// An upstream can speak any of the three protocols, so forwarding its body
+/// An upstream can speak any of the four protocols, so forwarding its body
 /// verbatim hands e.g. an OpenAI-shaped error to an Anthropic client whose
 /// SDK then fails to parse it and surfaces `undefined` instead of the
 /// message. Three envelopes are produced:
 ///
-/// - OpenAI (Chat and Responses share it): `{"error": {...}}`
+/// - OpenAI (Chat, Responses and Google share it): `{"error": {...}}`
 /// - Anthropic: `{"type": "error", "error": {...}}`
 fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
     let inner = serde_json::from_str::<Value>(body)
@@ -752,7 +797,7 @@ async fn call_upstream(
         .unwrap()
         .base_url_for(m)
         .map_err(UpstreamError::Message)?;
-    let url = upstream_url(&base, m);
+    let url = upstream_url(&base, m, stream);
     let body = build_body(
         m,
         req,
@@ -831,7 +876,8 @@ async fn call_upstream(
 }
 
 // ---------------------------------------------------------------------------
-// Ingress handlers: POST /v1/chat/completions, /v1/responses, /v1/messages
+// Ingress handlers: POST /v1/chat/completions, /v1/responses, /v1/messages,
+// /v1beta/models/{action}
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -839,6 +885,7 @@ enum Ingress {
     Chat,
     Responses,
     Anthropic,
+    Google,
 }
 
 impl Ingress {
@@ -847,6 +894,7 @@ impl Ingress {
             Ingress::Chat => Protocol::Chat,
             Ingress::Responses => Protocol::Responses,
             Ingress::Anthropic => Protocol::Anthropic,
+            Ingress::Google => Protocol::Google,
         }
     }
 }
@@ -866,6 +914,64 @@ async fn messages_ingress(State(st): State<St>, req: Request) -> Response {
         HeaderValue::from_static("2023-06-01"),
     );
     resp
+}
+
+/// Gemini ingress: `POST /v1beta/models/{model}:generateContent` and
+/// `{model}:streamGenerateContent`. The model id lives in the path, not the
+/// body, and the verb selects streaming.
+async fn google_ingress(
+    State(st): State<St>,
+    axum::extract::Path(action): axum::extract::Path<String>,
+    req: Request,
+) -> Response {
+    let (name, stream) = match parse_google_action(&action) {
+        Some(v) => v,
+        None => {
+            return ingress_error(
+                Ingress::Google,
+                StatusCode::NOT_FOUND,
+                &format!("unknown Google action: {action}"),
+            )
+        }
+    };
+    let limit = body_limit(&st.cfg.read().unwrap());
+    if let Some(len) = declared_len(&req) {
+        if len > limit as u64 {
+            return body_too_large(Ingress::Google, limit);
+        }
+    }
+    let body = match axum::body::to_bytes(req.into_body(), limit).await {
+        Ok(b) => b,
+        Err(_) => return body_too_large(Ingress::Google, limit),
+    };
+    let req_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ingress_error(
+                Ingress::Google,
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+            )
+        }
+    };
+    let m = match find_model(&st, &name) {
+        Some(m) => m,
+        None => {
+            eprintln!("[gw] req unknown-model={name}");
+            return ingress_error(
+                Ingress::Google,
+                StatusCode::NOT_FOUND,
+                &format!("unknown model: {name}"),
+            );
+        }
+    };
+    let native = m.protocol == Protocol::Google;
+    let chat_req = if native {
+        Value::Null
+    } else {
+        google_to_chat_request(&req_json, &name)
+    };
+    serve_normalized(st, Ingress::Google, name, m, req_json, chat_req, stream, native).await
 }
 
 /// Byte ceiling for a client body. 0 means unlimited, which `to_bytes` would
@@ -898,7 +1004,7 @@ fn body_too_large(ingress: Ingress, limit: usize) -> Response {
     )
 }
 
-/// One pipeline for all three ingress surfaces: normalize to the canonical
+/// One pipeline for all ingress surfaces: normalize to the canonical
 /// chat request, call upstream, translate back into the ingress protocol.
 async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
     let limit = body_limit(&st.cfg.read().unwrap());
@@ -962,7 +1068,6 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
 
     // Same protocol on both ends: forward the client's own body untouched.
     let native = ingress.protocol() == m.protocol;
-    let strict = st.cfg.read().unwrap().strict_params;
 
     // Normalize the ingress request to the canonical chat shape. Skipped
     // on the native path, which keeps the original body intact.
@@ -973,8 +1078,27 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             Ingress::Chat => req.clone(),
             Ingress::Responses => responses_to_chat_request(&req),
             Ingress::Anthropic => anthropic_to_chat_request(&req),
+            Ingress::Google => google_to_chat_request(&req, &name),
         }
     };
+
+    serve_normalized(st, ingress, name, m, req, chat_req, stream, native).await
+}
+
+/// Shared pipeline tail: param audit, upstream call, translate back into the
+/// ingress protocol. `req` is the client's original body, `chat_req` its
+/// canonical chat form (Null on the native path), `native` forwards `req`.
+async fn serve_normalized(
+    st: St,
+    ingress: Ingress,
+    name: String,
+    m: ModelCfg,
+    req: Value,
+    chat_req: Value,
+    stream: bool,
+    native: bool,
+) -> Response {
+    let strict = st.cfg.read().unwrap().strict_params;
 
     if !native {
         let (lost, fatal) = match m.protocol {
@@ -985,6 +1109,10 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             Protocol::Responses => (
                 chat_to_responses_loss(&chat_req),
                 chat_to_responses_fatal(&chat_req),
+            ),
+            Protocol::Google => (
+                google::chat_to_google_loss(&chat_req),
+                google::chat_to_google_fatal(&chat_req),
             ),
             Protocol::Chat => (vec![], None),
         };
@@ -1041,6 +1169,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             },
             Protocol::Anthropic => Inbound::Anthropic(AnthropicStream::new(&name)),
             Protocol::Responses => Inbound::Responses(ResponsesStream::new(&name)),
+            Protocol::Google => Inbound::Google(GoogleStream::new(&name)),
         };
         let egress = match ingress {
             Ingress::Chat => {
@@ -1048,6 +1177,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             }
             Ingress::Responses => Egress::Responses(ChatToResponsesStream::new(&name)),
             Ingress::Anthropic => Egress::Anthropic(ChatToAnthropicStream::new(&name)),
+            Ingress::Google => Egress::Google(ChatToGoogleStream::new(&name)),
         };
         sse_response(sse_body(
             resp,
@@ -1070,7 +1200,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             Ok(v) => v,
             // A 200 with a non-JSON body is an upstream fault (HTML error
             // page, proxy banner, ...). The raw bytes are useless to a client
-            // speaking any of the three protocols, so return a protocol-shaped
+            // speaking any of the four protocols, so return a protocol-shaped
             // 502 and keep the excerpt in the log.
             Err(_) => {
                 eprintln!(
@@ -1107,9 +1237,14 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
         if native {
             // Same protocol both ends: only the public model id needs
             // rewriting, everything else is the client's own response.
+            // Google carries it in `modelVersion`, not `model`.
             let mut v = up;
             if let Some(o) = v.as_object_mut() {
-                o.insert("model".into(), json!(name.clone()));
+                if m.protocol == Protocol::Google {
+                    o.insert("modelVersion".into(), json!(name.clone()));
+                } else {
+                    o.insert("model".into(), json!(name.clone()));
+                }
             }
             return json_response(StatusCode::OK, v);
         }
@@ -1123,6 +1258,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             }
             Protocol::Anthropic => anthropic_to_openai(&up, &name),
             Protocol::Responses => responses_to_openai(&up, &name),
+            Protocol::Google => google_to_chat(&up, &name),
         };
         // A `failed` Responses upstream must not reach the client as a
         // 200 with an empty answer: surface it as a gateway error.
@@ -1143,6 +1279,7 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             }
             Ingress::Responses => chat_to_responses_response(&chat, &name),
             Ingress::Anthropic => chat_to_anthropic_response(&chat, &name),
+            Ingress::Google => chat_to_google_response(&chat, &name),
         };
         json_response(StatusCode::OK, out)
     }
@@ -1165,6 +1302,7 @@ enum Inbound {
     },
     Anthropic(AnthropicStream),
     Responses(ResponsesStream),
+    Google(GoogleStream),
 }
 
 impl Inbound {
@@ -1209,6 +1347,7 @@ impl Inbound {
             }
             Inbound::Anthropic(s) => s.handle(ev),
             Inbound::Responses(s) => s.handle(ev),
+            Inbound::Google(s) => s.handle(ev),
         }
     }
 
@@ -1236,6 +1375,7 @@ enum Egress {
     Chat(ChatReasoningEgress),
     Responses(ChatToResponsesStream),
     Anthropic(ChatToAnthropicStream),
+    Google(ChatToGoogleStream),
 }
 
 impl Egress {
@@ -1248,6 +1388,7 @@ impl Egress {
             }
             Egress::Responses(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
             Egress::Anthropic(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
+            Egress::Google(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
         }
     }
 
@@ -1281,6 +1422,10 @@ impl Egress {
                 Some(events) => events.iter().map(|e| e.frame()).collect(),
                 None => vec![],
             },
+            Egress::Google(s) => match s.finish() {
+                Some(events) => events.iter().map(|e| e.frame()).collect(),
+                None => vec![],
+            },
         }
     }
 
@@ -1308,6 +1453,13 @@ impl Egress {
                 out.push(SseEvent::ev(
                     "error",
                     json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
+                ));
+                out.iter().map(|e| e.frame()).collect()
+            }
+            Egress::Google(s) => {
+                let mut out: Vec<SseEvent> = if passthrough { vec![] } else { s.abort() };
+                out.push(SseEvent::data(
+                    json!({"error": {"message": msg, "type": "gateway_error"}}),
                 ));
                 out.iter().map(|e| e.frame()).collect()
             }
@@ -1356,6 +1508,10 @@ fn classify_block(
         let mut ev = ev;
         if let Some(o) = ev.as_object_mut() {
             o.insert("model".into(), json!(m));
+            // Google carries the public id in `modelVersion`, not `model`.
+            if o.contains_key("candidates") || o.contains_key("modelVersion") {
+                o.insert("modelVersion".into(), json!(m));
+            }
         }
         return Block::Passthrough(f.name, ev);
     }
@@ -2189,7 +2345,7 @@ mod tests {
             "",
         ];
         for up in upstreams {
-            for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+            for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic, Ingress::Google] {
                 let body = upstream_error_body(ingress, up);
                 let msg = assert_error_shape(ingress, &body);
                 assert!(!msg.is_empty(), "empty message from {up:?} -> {ingress:?}");
@@ -2202,7 +2358,7 @@ mod tests {
         // SDK retry logic keys on the status, and operators debug with the
         // upstream's own `code` / `param` fields; neither may be flattened.
         let up = r#"{"error":{"message":"bad","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#;
-        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic, Ingress::Google] {
             let resp = upstream_error_response(
                 ingress,
                 UpstreamError::Status(StatusCode::TOO_MANY_REQUESTS, up.to_string()),
@@ -2319,7 +2475,7 @@ mod tests {
     fn oversized_body_is_rejected_in_the_ingress_protocol_shape() {
         // Axum's own limit produced a plain-text 413 that no SDK can parse;
         // the client could not tell a size rejection from a proxy error.
-        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic] {
+        for ingress in [Ingress::Chat, Ingress::Responses, Ingress::Anthropic, Ingress::Google] {
             let resp = body_too_large(ingress, 1024);
             assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
             let body: Value = read_body(resp);
@@ -2352,6 +2508,7 @@ mod tests {
             ("/v1/chat/completions", Ingress::Chat),
             ("/v1/responses", Ingress::Responses),
             ("/v1/messages", Ingress::Anthropic),
+            ("/v1beta/models/m:generateContent", Ingress::Google),
         ] {
             let req = Request::builder()
                 .method("POST")

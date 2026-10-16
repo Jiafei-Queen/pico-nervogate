@@ -48,7 +48,8 @@ rotation works) — applies live.
 
 `enable`, `base_url` (default `default_base_url`), `path`
 (default `/models`), `interval_secs` (default `3600`, `0` = startup fetch
-only), `protocol` (assumed for discovered models, default `chat`),
+only), `protocol` (assumed for discovered models, default `chat`;
+`chat` | `anthropic` | `responses` | `google`),
 `prefix` (only discover matching ids), `prune_missing` (default `false`:
 additive only; `true` drops discovered models that vanish upstream).
 Explicit `[[models]]` entries always win; discovered models get models.dev
@@ -64,15 +65,28 @@ means the endpoint is real. Set `protocol` explicitly to skip probing.
 
 ## `[[models]]`
 
-`name` (public id), `protocol` (`chat` | `anthropic` | `responses`), optional
-`upstream`, `base_url`, `vision`, `extra_headers`, `thinking_type`
-(`adaptive` | `enabled`, default `adaptive`).
+`name` (public id), `protocol` (`chat` | `anthropic` | `responses` |
+`google`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
+`thinking_type` (`adaptive` | `enabled`, default `adaptive`), `google_auth`
+(`auto` | `api_key` | `bearer`, default `auto`).
 
 `thinking_type` controls how `reasoning_effort` renders as `thinking` for
 `anthropic` upstreams: `adaptive` sends `thinking: {"type":"adaptive"}` +
 `output_config: {"effort": ...}` (newer models reject the legacy shape);
 `enabled` sends the legacy `{"type":"enabled","budget_tokens":N}`. See
 [design.md](design.md) for the reverse mapping.
+
+`protocol = "google"` speaks Gemini `generateContent` /
+`streamGenerateContent` under `{base_url}/models/{upstream}`. Clients use
+the native path `POST /v1beta/models/{model}:generateContent` (or
+`:streamGenerateContent` for SSE; the model id lives in the URL, not the
+body). `google_auth` picks the credential: `api_key` sends
+`x-goog-api-key` (AI Studio), `bearer` sends `Authorization: Bearer`
+(Vertex), `auto` sniffs the base URL for `aiplatform.googleapis.com`.
+For Vertex the project/location/publisher path is part of `base_url` (see
+`examples/gateway.google.toml`). `reasoning_effort` renders as
+`generationConfig.thinkingConfig.thinkingBudget` (low 4k / medium 8k /
+high 16k); remote `https://` images become `fileData` (see design.md).
 
 Optional models.dev overrides (each set value wins over inferred data; keys
 mirror models.dev model entries, minus `id`):

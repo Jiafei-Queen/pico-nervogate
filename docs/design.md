@@ -8,12 +8,20 @@ use a protocol the upstream does not natively expose.
 Translation details worth knowing:
 
 - **Tool calls** round-trip in all directions (`function_calls` ↔ `tool_use` ↔
-  `function_call` items), including multi-call turns and tool results.
+  `function_call` items ↔ Gemini `functionCall`/`functionResponse` parts),
+  including multi-call turns and tool results. Gemini has no call ids, so the
+  gateway synthesizes `call_*` ids on the way to Chat and matches
+  `functionResponse` back by function name; tool output text that is not a
+  JSON object is wrapped as `{"result": ...}`.
 - **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
   Chat shape. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
-  `thinking` — for `anthropic` upstreams the per-model `thinking_type` picks
+  `thinking` ↔ Gemini `thinkingConfig.thinkingBudget` (+`includeThoughts`).
+  For `anthropic` upstreams the per-model `thinking_type` picks
   the shape: `adaptive` (default) sends `thinking: {"type":"adaptive"}` +
-  `output_config.effort`; `enabled` sends `thinking.budget_tokens`. Across a
+  `output_config.effort`; `enabled` sends `thinking.budget_tokens`. For
+  `google` upstreams the effort renders as a budget (low 4k / medium 8k /
+  high 16k) and thought parts (`{"thought": true, ...}`) round-trip as
+  `reasoning_content`. Across a
   _protocol change_, Anthropic thinking block _signatures_ arrive as `""`, so
   multi-turn thinking replay against a strict Anthropic upstream may be
   rejected. Same-protocol requests skip translation and keep their signatures.
@@ -22,10 +30,18 @@ Translation details worth knowing:
   for tag-parsing clients like OpenWebUI), or `both`. Translated paths only;
   same-protocol passthrough stays verbatim.
 - **Structured output**: `response_format` maps to `output_config.format` for
-  `anthropic` upstreams and to `text.format` for `responses` upstreams, so a
-  `json_schema` constraint is not silently dropped. Anthropic only accepts
-  `json_schema` there, so OpenAI's `json_object` is downgraded to an
-  unconstrained `{"type": "object"}` schema.
+  `anthropic` upstreams, to `text.format` for `responses` upstreams, and to
+  `generationConfig.responseMimeType` + `responseSchema` for `google`
+  upstreams, so a `json_schema` constraint is not silently dropped. Anthropic
+  only accepts `json_schema` there, so OpenAI's `json_object` is downgraded
+  to an unconstrained `{"type": "object"}` schema (same for Google).
+- **Google specifics**: the model travels in the URL path and streaming
+  switches the endpoint (`:streamGenerateContent?alt=sse`) instead of a body
+  flag; `data:` URLs become `inlineData`, remote `https://` images become
+  `fileData` (Gemini may not fetch arbitrary https — prefer base64);
+  `MALFORMED_FUNCTION_CALL` surfaces as a gateway error, never a normal tool
+  turn; `usageMetadata` maps onto the canonical usage including
+  `thoughtsTokenCount` → `reasoning_tokens`.
 - **Responses statefulness**: the gateway is stateless. `previous_response_id`,
   `background`, `store: true` and `item_reference` input items are rejected
   with HTTP 400 — they need server-side response storage and polling endpoints

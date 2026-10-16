@@ -14,6 +14,8 @@ pub enum Protocol {
     Anthropic,
     /// OpenAI Responses POST {base}/responses (translated).
     Responses,
+    /// Google Gemini POST {base}/models/{model}:generateContent (translated).
+    Google,
 }
 
 impl Protocol {
@@ -22,8 +24,23 @@ impl Protocol {
             Protocol::Chat => "chat",
             Protocol::Anthropic => "anthropic",
             Protocol::Responses => "responses",
+            Protocol::Google => "google",
         }
     }
+}
+
+/// How the gateway authenticates to a Google upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoogleAuth {
+    /// `bearer` when the base URL points at Vertex AI Platform,
+    /// otherwise `x-goog-api-key`.
+    #[default]
+    Auto,
+    /// AI Studio: `x-goog-api-key: {key}`.
+    ApiKey,
+    /// Vertex AI: `Authorization: Bearer {key}`.
+    Bearer,
 }
 
 /// How the gateway renders `thinking` for Anthropic upstreams.
@@ -70,6 +87,11 @@ pub struct ModelCfg {
     /// `enabled`. Only affects `protocol = "anthropic"` upstreams.
     #[serde(default)]
     pub thinking_type: Option<ThinkingMode>,
+    /// Google upstream auth: `auto` (default), `api_key` (AI Studio
+    /// `x-goog-api-key`) or `bearer` (Vertex `Authorization: Bearer`).
+    /// `auto` picks bearer when the base URL points at AI Platform.
+    #[serde(default)]
+    pub google_auth: GoogleAuth,
     /// Whether the model accepts image input (advertised via /v1/models).
     /// `None` (unset) lets models.dev inference fill it in; `Some(_)`
     /// always wins over inferred metadata.
@@ -198,6 +220,7 @@ impl ModelCfg {
             base_url: Some(base_url),
             extra_headers: HashMap::new(),
             thinking_type: None,
+            google_auth: GoogleAuth::Auto,
             vision: None,
             models_dev_id: None,
             display_name: None,
@@ -607,6 +630,30 @@ thinking_type = "adaptive"
 "#;
         let cfg: Config = toml::from_str(text).expect("parse toml");
         assert_eq!(cfg.models[0].thinking_mode(), ThinkingMode::Adaptive);
+    }
+
+    #[test]
+    fn google_protocol_parses_with_auto_auth_default() {
+        // Unset -> Auto.
+        let text = r#"
+[[models]]
+name = "g"
+protocol = "google"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.models[0].protocol, Protocol::Google);
+        assert_eq!(cfg.models[0].protocol.as_str(), "google");
+        assert_eq!(cfg.models[0].google_auth, GoogleAuth::Auto);
+
+        let text = r#"
+[[models]]
+name = "g"
+protocol = "google"
+google_auth = "bearer"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.models[0].google_auth, GoogleAuth::Bearer);
     }
 
     #[test]

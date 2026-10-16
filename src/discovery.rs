@@ -61,12 +61,21 @@ fn probe_body(protocol: &Protocol, model: &str) -> Value {
         Protocol::Responses => json!({
             "model": model, "max_output_tokens": 16, "input": "hi"
         }),
+        Protocol::Google => json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 1}
+        }),
     }
 }
 
 /// Order to try. `chat` first: it is the most common upstream shape and the
 /// configured default, so the common case costs a single request.
-const PROBE_ORDER: [Protocol; 3] = [Protocol::Chat, Protocol::Anthropic, Protocol::Responses];
+const PROBE_ORDER: [Protocol; 4] = [
+    Protocol::Chat,
+    Protocol::Anthropic,
+    Protocol::Responses,
+    Protocol::Google,
+];
 
 /// Which completion endpoint does this upstream actually serve?
 ///
@@ -82,7 +91,7 @@ const PROBE_ORDER: [Protocol; 3] = [Protocol::Chat, Protocol::Anthropic, Protoco
 pub async fn detect_protocol(st: &St, base: &str, model: &str) -> Option<Protocol> {
     for protocol in PROBE_ORDER {
         let m = ModelCfg::discovered(model.to_string(), protocol, base.to_string());
-        let url = crate::upstream_url(base, &m);
+        let url = crate::upstream_url(base, &m, false);
         let resp = st
             .client
             .post(&url)
@@ -260,6 +269,10 @@ mod tests {
         assert!(resp.get("messages").is_none());
         assert!(resp.get("max_output_tokens").is_some());
 
+        let goog = probe_body(&Protocol::Google, "m");
+        assert!(goog.get("contents").is_some());
+        assert!(goog.get("messages").is_none());
+
         // Nothing larger than a single token, so a probe is not a billable
         // generation.
         for (p, b) in [
@@ -308,9 +321,17 @@ mod tests {
             Protocol::Chat => "/v1/chat/completions",
             Protocol::Anthropic => "/v1/messages",
             Protocol::Responses => "/v1/responses",
+            // Google embeds the model id in the path; match by prefix below.
+            Protocol::Google => "/v1/models/",
         };
         let handler = move |req: Request<Body>| async move {
-            if req.uri().path() == want {
+            let path = req.uri().path().to_string();
+            let hit = if speaks == Protocol::Google {
+                path.starts_with(want) && path.contains(":generateContent")
+            } else {
+                path == want
+            };
+            if hit {
                 Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from(r#"{"choices":[]}"#))
@@ -330,9 +351,10 @@ mod tests {
         });
         let router = Router::new()
             .route("/v1/models", models)
-            .route("/v1/chat/completions", post(handler))
-            .route("/v1/messages", post(handler))
-            .route("/v1/responses", post(handler));
+            .route("/v1/chat/completions", post(handler.clone()))
+            .route("/v1/messages", post(handler.clone()))
+            .route("/v1/responses", post(handler.clone()))
+            .route("/v1/models/{action}", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -423,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn detects_chat_and_responses_upstreams() {
-        for speaks in [Protocol::Chat, Protocol::Responses] {
+        for speaks in [Protocol::Chat, Protocol::Responses, Protocol::Google] {
             let base = mock_upstream(speaks).await;
             let found = detect_protocol(&probe_state(), &base, "m").await;
             assert_eq!(found, Some(speaks));

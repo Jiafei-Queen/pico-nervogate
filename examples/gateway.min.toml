@@ -56,7 +56,8 @@ default_base_url = "https://api.example.com/v1"
 # both: keep the field and also wrap it.
 # reasoning_output = "reasoning_content"
 
-# protocol: "chat" | "anthropic" | "responses"
+# protocol: "chat" | "anthropic" | "responses" | "google"
+# ("google" speaks Gemini generateContent; see examples/gateway.google.toml)
 [[models]]
 name = "my-model"
 protocol = "chat"

@@ -11,12 +11,14 @@ under 1 MB of resident memory.
 
 ## Features
 
-- **Three protocol surfaces**, one upstream, translated both ways:
+- **Four protocol surfaces**, one upstream, translated both ways:
   `POST /v1/chat/completions` (OpenAI Chat),
   `POST /v1/responses` (OpenAI Responses),
-  `POST /v1/messages` (Anthropic Messages).
+  `POST /v1/messages` (Anthropic Messages),
+  `POST /v1beta/models/{model}:generateContent` /
+  `:streamGenerateContent` (Google Gemini).
   Each model's `protocol` picks the upstream wire format (`chat` /
-  `anthropic` / `responses`), so any client surface can reach any upstream.
+  `anthropic` / `responses` / `google`), so any client surface can reach any upstream.
 - **Same-protocol passthrough**: when the client's protocol already matches
   the model's, the request and response are forwarded verbatim — no round trip
   through the canonical chat shape, so `cache_control`, thinking signatures and
@@ -33,7 +35,7 @@ under 1 MB of resident memory.
   from the configured key. Client headers are **not** forwarded, and upstream
   `x-ratelimit-*` / `request-id` / `retry-after` are not relayed.
 - **Streaming**: SSE parsed and re-emitted in the client's own framing for all
-  three protocols, with errors surfaced in the client's error shape.
+  four protocols, with errors surfaced in the client's error shape.
 - **Config-driven models**: each model declares a `protocol`, optional
   `base_url`, `upstream` id and `vision` flag.
 - **models.dev enrichment** (opt-in `[models_dev]`): vision, prices and context
@@ -47,13 +49,15 @@ under 1 MB of resident memory.
 
 ## Endpoints
 
-| Method | Path                   | Description                                      |
-| ------ | ---------------------- | ------------------------------------------------ |
-| GET    | `/healthz`             | liveness check                                   |
-| GET    | `/v1/models`           | list configured models (OpenAI model list shape) |
-| POST   | `/v1/chat/completions` | OpenAI Chat Completions in/out                   |
-| POST   | `/v1/responses`        | OpenAI Responses in → Chat up → Responses out    |
-| POST   | `/v1/messages`         | Anthropic Messages in → Chat up → Anthropic out  |
+| Method | Path                                              | Description                                      |
+| ------ | ------------------------------------------------- | ------------------------------------------------ |
+| GET    | `/healthz`                                        | liveness check                                   |
+| GET    | `/v1/models`                                      | list configured models (OpenAI model list shape) |
+| POST   | `/v1/chat/completions`                            | OpenAI Chat Completions in/out                   |
+| POST   | `/v1/responses`                                   | OpenAI Responses in → Chat up → Responses out    |
+| POST   | `/v1/messages`                                    | Anthropic Messages in → Chat up → Anthropic out  |
+| POST   | `/v1beta/models/{model}:generateContent`         | Gemini generateContent in/out                   |
+| POST   | `/v1beta/models/{model}:streamGenerateContent`    | Gemini streaming in/out (SSE)                   |
 
 ## Quick start
 
@@ -132,7 +136,7 @@ cargo test
 
 Unit tests cover the translators and the SSE parser in isolation; `src/e2e.rs`
 drives a real mock upstream behind the real router over real sockets, across
-all nine client-surface × upstream protocol combinations, and asserts the
+all sixteen client-surface × upstream protocol combinations, and asserts the
 bytes a client would actually consume.
 
 ## Disclaimer

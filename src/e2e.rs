@@ -26,8 +26,34 @@ type Bytes = axum::body::Bytes;
 
 const ANSWER: &str = "hello there world";
 
-/// The three client-facing surfaces.
+/// The three client-facing surfaces (Google's path varies by verb; see below).
 const INGRESS: [&str; 3] = ["/v1/chat/completions", "/v1/responses", "/v1/messages"];
+
+const GOOGLE_NONSTREAM: &str = "/v1beta/models/m:generateContent";
+const GOOGLE_STREAM: &str = "/v1beta/models/m:streamGenerateContent";
+
+/// All four client surfaces for the given streaming mode.
+fn ingress_paths(stream: bool) -> [&'static str; 4] {
+    if stream {
+        [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            GOOGLE_STREAM,
+        ]
+    } else {
+        [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            GOOGLE_NONSTREAM,
+        ]
+    }
+}
+
+fn is_google_path(path: &str) -> bool {
+    path.starts_with("/v1beta/")
+}
 
 // ---------------------------------------------------------------------------
 // Mock upstream
@@ -67,12 +93,23 @@ impl Mock {
         // than a closure: a closure cannot be cloned into three routes.
         async fn handle(State(kind): State<Upstream>, body: Bytes) -> Response {
             let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            respond(&kind, &req)
+            respond(&kind, &req, None)
+        }
+        // Google selects streaming by endpoint, not by a `stream` field.
+        async fn handle_google(
+            State(kind): State<Upstream>,
+            axum::extract::Path(action): axum::extract::Path<String>,
+            body: Bytes,
+        ) -> Response {
+            let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let stream = action.ends_with(":streamGenerateContent");
+            respond(&kind, &req, Some(stream))
         }
         let router = Router::new()
             .route("/v1/chat/completions", route_post(handle))
             .route("/v1/messages", route_post(handle))
             .route("/v1/responses", route_post(handle))
+            .route("/v1/models/{action}", route_post(handle_google))
             .with_state(kind);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -91,8 +128,9 @@ impl Mock {
     }
 }
 
-fn respond(kind: &Upstream, req: &Value) -> Response {
-    let wants_stream = req.get("stream").and_then(|v| v.as_bool()) == Some(true);
+fn respond(kind: &Upstream, req: &Value, stream_override: Option<bool>) -> Response {
+    let wants_stream = stream_override
+        .unwrap_or_else(|| req.get("stream").and_then(|v| v.as_bool()) == Some(true));
     match kind {
         Upstream::Error(status, body) => Response::builder()
             .status(*status)
@@ -277,6 +315,25 @@ fn stream_frames(protocol: Protocol, text: &str) -> Vec<String> {
             ));
             out
         }
+        Protocol::Google => {
+            let mut out: Vec<String> = pieces
+                .iter()
+                .map(|p| {
+                    plain(json!({"candidates": [{
+                        "content": {"role": "model", "parts": [{"text": p}]},
+                        "index": 0
+                    }]}))
+                })
+                .collect();
+            out.push(plain(json!({"candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP", "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3, "candidatesTokenCount": 2,
+                "totalTokenCount": 5}})));
+            out
+        }
     }
 }
 
@@ -286,6 +343,7 @@ fn is_terminal_frame(frame: &str) -> bool {
         || frame.contains("response.completed")
         || frame.contains("[DONE]")
         || frame.contains("\"finish_reason\":\"stop\"")
+        || frame.contains("\"finishReason\":\"STOP\"")
         || frame.contains("message_delta")
 }
 
@@ -298,6 +356,7 @@ fn error_frame(protocol: Protocol, msg: &str) -> String {
             json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
         ),
         Protocol::Responses => plain(json!({"type": "error", "message": msg})),
+        Protocol::Google => plain(json!({"error": {"message": msg, "code": 13}})),
     }
 }
 
@@ -319,6 +378,15 @@ fn completion(protocol: Protocol, text: &str) -> Value {
                 "content": [{"type": "output_text", "text": text, "annotations": []}]}],
             "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
         }),
+        Protocol::Google => json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": text}]},
+                "finishReason": "STOP", "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3, "candidatesTokenCount": 2,
+                "totalTokenCount": 5}
+        }),
     }
 }
 
@@ -328,6 +396,11 @@ fn completion(protocol: Protocol, text: &str) -> Value {
 
 /// A client request body for `path`.
 fn client_body(path: &str, stream: bool) -> Value {
+    if is_google_path(path) {
+        return json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+    }
     match path {
         "/v1/chat/completions" => json!({
             "model": "m", "stream": stream,
@@ -372,6 +445,18 @@ async fn text(resp: Response) -> String {
 /// The answer a client of `path` reads out of a non-streaming JSON body.
 fn client_text(path: &str, body: &str) -> String {
     let v = parse_json(path, body);
+    if is_google_path(path) {
+        let parts = v["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} answer has no parts: {body}"));
+        let mut out = String::new();
+        for p in parts {
+            if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
     let got = match path {
         "/v1/chat/completions" => v["choices"][0]["message"]["content"].clone(),
         "/v1/responses" => v["output"][0]["content"][0]["text"].clone(),
@@ -388,6 +473,22 @@ fn parse_json(path: &str, body: &str) -> Value {
 
 /// The streamed text a client of `path` reassembles from `events`.
 fn streamed_text(path: &str, events: &[(Option<String>, String)]) -> String {
+    if is_google_path(path) {
+        return events
+            .iter()
+            .filter_map(|(_, d)| {
+                let v: Value = serde_json::from_str(d).ok()?;
+                v.pointer("/candidates/0/content/parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|q| q.get("text").and_then(|x| x.as_str()))
+                            .collect::<String>()
+                    })
+            })
+            .collect();
+    }
     events
         .iter()
         .filter_map(|(_, d)| {
@@ -411,6 +512,16 @@ fn streamed_text(path: &str, events: &[(Option<String>, String)]) -> String {
 /// recognises.
 fn terminal_kind(path: &str, events: &[(Option<String>, String)]) -> &'static str {
     let last = events.last().expect("at least one event");
+    if is_google_path(path) {
+        assert_eq!(last.0, None, "google events carry no `event:` name");
+        let fr = serde_json::from_str::<Value>(&last.1).unwrap()
+            .pointer("/candidates/0/finishReason")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(fr, "STOP", "google terminal finishReason");
+        return "STOP";
+    }
     match path {
         "/v1/chat/completions" => {
             assert_eq!(last.1, "[DONE]", "chat must close with [DONE]");
@@ -441,7 +552,7 @@ fn count_containing(events: &[(Option<String>, String)], needle: &str) -> usize 
 }
 
 // ---------------------------------------------------------------------------
-// The 9 protocol combinations
+// The 16 protocol combinations
 // ---------------------------------------------------------------------------
 
 /// Every client surface reaches every upstream protocol and gets a usable
@@ -451,9 +562,14 @@ fn count_containing(events: &[(Option<String>, String)], needle: &str) -> usize 
 /// committed. A break in any one cell is a whole protocol pair unusable,
 /// and no unit test covers the seam between them.
 #[tokio::test]
-async fn all_nine_protocol_combinations_answer() {
-    for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
-        for path in INGRESS {
+async fn all_sixteen_protocol_combinations_answer() {
+    for upstream in [
+        Protocol::Chat,
+        Protocol::Anthropic,
+        Protocol::Responses,
+        Protocol::Google,
+    ] {
+        for path in ingress_paths(false) {
             let mock = Mock::start(Upstream::Speak(upstream)).await;
             let resp = post(
                 app(mock.state_with(upstream)),
@@ -479,9 +595,14 @@ async fn all_nine_protocol_combinations_answer() {
 /// The same matrix, streaming: the client gets its own framing, the whole
 /// answer, and exactly one terminal event.
 #[tokio::test]
-async fn all_nine_protocol_combinations_stream() {
-    for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
-        for path in INGRESS {
+async fn all_sixteen_protocol_combinations_stream() {
+    for upstream in [
+        Protocol::Chat,
+        Protocol::Anthropic,
+        Protocol::Responses,
+        Protocol::Google,
+    ] {
+        for path in ingress_paths(true) {
             let mock = Mock::start(Upstream::Speak(upstream)).await;
             let resp = post(
                 app(mock.state_with(upstream)),
@@ -514,6 +635,7 @@ async fn all_nine_protocol_combinations_stream() {
             let openings = match path {
                 "/v1/chat/completions" => None,
                 "/v1/responses" => Some(count_containing(&events, "\"response.created\"")),
+                p if is_google_path(p) => None,
                 _ => Some(count_containing(&events, "\"message_start\"")),
             };
             if let Some(openings) = openings {
@@ -638,8 +760,13 @@ async fn upstream_429_is_shaped_for_every_ingress() {
         r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#
             .into(),
     );
-    for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
-        for path in INGRESS {
+    for upstream in [
+        Protocol::Chat,
+        Protocol::Anthropic,
+        Protocol::Responses,
+        Protocol::Google,
+    ] {
+        for path in ingress_paths(false) {
             let mock = Mock::start(kind.clone()).await;
             let resp = post(
                 app(mock.state_with(upstream)),
@@ -670,7 +797,7 @@ async fn upstream_500_is_not_dressed_up_as_success() {
         StatusCode::INTERNAL_SERVER_ERROR,
         r#"{"error":{"message":"boom"}}"#.into(),
     );
-    for path in INGRESS {
+    for path in ingress_paths(false) {
         let mock = Mock::start(kind.clone()).await;
         let resp = post(
             app(mock.state_with(Protocol::Chat)),
@@ -690,7 +817,7 @@ async fn upstream_500_is_not_dressed_up_as_success() {
 /// protocol, never an HTML page handed to an SDK.
 #[tokio::test]
 async fn non_json_upstream_body_becomes_a_502() {
-    for path in INGRESS {
+    for path in ingress_paths(false) {
         let mock = Mock::start(Upstream::NonJson("<html>502 Bad Gateway</html>".into())).await;
         let resp = post(
             app(mock.state_with(Protocol::Chat)),
@@ -714,8 +841,13 @@ async fn non_json_upstream_body_becomes_a_502() {
 /// truncated answer as if it were complete.
 #[tokio::test]
 async fn a_mid_stream_error_is_reported_as_an_error() {
-    for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
-        for path in INGRESS {
+    for upstream in [
+        Protocol::Chat,
+        Protocol::Anthropic,
+        Protocol::Responses,
+        Protocol::Google,
+    ] {
+        for path in ingress_paths(true) {
             let mock = Mock::start(Upstream::MidStreamError(upstream)).await;
             let resp = post(
                 app(mock.state_with(upstream)),
@@ -728,6 +860,7 @@ async fn a_mid_stream_error_is_reported_as_an_error() {
 
             let claims_success = events.iter().any(|(_, d)| {
                 d.contains("\"finish_reason\":\"stop\"")
+                    || d.contains("\"finishReason\":\"STOP\"")
                     || d.contains("response.completed")
                     || d.contains("\"message_stop\"")
             });
@@ -754,12 +887,21 @@ async fn a_mid_stream_error_is_reported_as_an_error() {
 /// own state machine, so this holds for every ingress there.
 #[tokio::test]
 async fn a_stream_that_just_stops_still_terminates_when_translated() {
-    for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
-        for path in INGRESS {
-            let ingress_protocol = match path {
-                "/v1/chat/completions" => Protocol::Chat,
-                "/v1/responses" => Protocol::Responses,
-                _ => Protocol::Anthropic,
+    for upstream in [
+        Protocol::Chat,
+        Protocol::Anthropic,
+        Protocol::Responses,
+        Protocol::Google,
+    ] {
+        for path in ingress_paths(true) {
+            let ingress_protocol = if is_google_path(path) {
+                Protocol::Google
+            } else {
+                match path {
+                    "/v1/chat/completions" => Protocol::Chat,
+                    "/v1/responses" => Protocol::Responses,
+                    _ => Protocol::Anthropic,
+                }
             };
             if ingress_protocol == upstream {
                 continue; // passthrough; covered separately
@@ -776,7 +918,8 @@ async fn a_stream_that_just_stops_still_terminates_when_translated() {
             let last = events.last().unwrap();
             let closes = last.1 == "[DONE]"
                 || last.0.as_deref() == Some("message_stop")
-                || last.1.contains("response.completed");
+                || last.1.contains("response.completed")
+                || last.1.contains("\"finishReason\"");
             assert!(
                 closes,
                 "{path} from {upstream:?} stream never closed: {last:?}"
@@ -856,6 +999,40 @@ async fn sampling_params_survive_the_trip_to_an_anthropic_upstream() {
     );
 }
 
+/// Sampling, thinking and tools survive the trip to a Google upstream.
+///
+/// The mock refuses unless the translated top-level fields actually arrive;
+/// the answer round-trips back through `google_to_chat`.
+#[tokio::test]
+async fn sampling_and_tools_survive_the_trip_to_a_google_upstream() {
+    let mock = Mock::start(Upstream::Requires(
+        Protocol::Google,
+        vec!["contents", "tools", "toolConfig", "generationConfig"],
+    ))
+    .await;
+    let mut body = client_body("/v1/chat/completions", false);
+    body["reasoning_effort"] = json!("high");
+    body["temperature"] = json!(0);
+    body["top_p"] = json!(0.9);
+    body["tools"] = json!([{"type": "function", "function": {
+        "name": "get_weather", "description": "weather",
+        "parameters": {"type": "object"}} }]);
+    body["tool_choice"] = json!("auto");
+
+    let resp = post(
+        app(mock.state_with(Protocol::Google)),
+        "/v1/chat/completions",
+        &body,
+    )
+    .await;
+    let text = text(resp).await;
+    assert_eq!(
+        parse_json("/v1/chat/completions", &text)["choices"][0]["message"]["content"],
+        json!(ANSWER),
+        "the google upstream never received the translated fields: {text}"
+    );
+}
+
 /// The same request must survive the streaming path. Stream setup takes a
 /// separate branch from the body translation, so "it works non-streaming" is
 /// not evidence about streaming.
@@ -900,12 +1077,23 @@ async fn an_unknown_model_is_a_404_in_protocol_shape() {
         let v = parse_json(path, &text(resp).await);
         assert!(v.pointer("/error/message").is_some(), "{path}");
     }
+    // Google takes the model from the URL path, not the body.
+    for path in [
+        "/v1beta/models/does-not-exist:generateContent",
+        "/v1beta/models/does-not-exist:streamGenerateContent",
+    ] {
+        let body = client_body(path, false);
+        let resp = post(app(mock.state_with(Protocol::Chat)), path, &body).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let v = parse_json(path, &text(resp).await);
+        assert!(v.pointer("/error/message").is_some(), "{path}");
+    }
 }
 
 #[tokio::test]
 async fn malformed_json_is_a_400_not_a_panic() {
     let mock = Mock::start(Upstream::Speak(Protocol::Chat)).await;
-    for path in INGRESS {
+    for path in ingress_paths(false) {
         let resp = send(
             app(mock.state_with(Protocol::Chat)),
             path,
