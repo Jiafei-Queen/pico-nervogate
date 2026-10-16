@@ -18,6 +18,7 @@
 | `extra_headers`                 | —                          | headers added to every upstream request            |
 | `anthropic_max_tokens`          | `8192`                     | `max_tokens` sent to Anthropic upstreams on omission |
 | `strict_params`                 | `false`                    | reject untranslatable parameters instead of warning |
+| `reasoning_output`              | `reasoning_content`        | Chat egress thinking render: `reasoning_content` / `think_tag` / `both` |
 | `max_body_bytes`                | `33554432` (32 MiB)        | largest client request body; `0` disables the limit |
 | `[models_dev]`                  | disabled                   | models.dev enrichment for `/v1/models`             |
 | `[reload]`                      | enabled                    | SIGHUP + mtime config hot-reload                   |

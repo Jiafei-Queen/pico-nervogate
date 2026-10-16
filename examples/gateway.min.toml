@@ -50,6 +50,12 @@ default_base_url = "https://api.example.com/v1"
 # [extra_headers]
 # X-Custom = "value"
 
+# Optional: where thinking lands on Chat egress (translated paths only).
+# reasoning_content (default): message/delta reasoning_content field.
+# think_tag: <think> block inside content (for tag-parsing clients).
+# both: keep the field and also wrap it.
+# reasoning_output = "reasoning_content"
+
 # protocol: "chat" | "anthropic" | "responses"
 [[models]]
 name = "my-model"

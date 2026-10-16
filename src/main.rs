@@ -23,12 +23,13 @@ use serde_json::{json, Value};
 use config::{Config, ModelCfg, Protocol};
 use discovery::refresh_discovery;
 use translate::{
-    anthropic_to_chat_request, anthropic_to_openai, chat_failure, chat_to_anthropic_fatal,
-    chat_to_anthropic_loss, chat_to_anthropic_response, chat_to_anthropic_thinking_conflict,
-    chat_to_responses_fatal, chat_to_responses_loss, chat_to_responses_request,
-    chat_to_responses_response, frame_data, frame_event, openai_to_anthropic_with_max,
-    responses_stateful_error, responses_to_chat_request, responses_to_openai, AnthropicStream,
-    ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, SseEvent,
+    anthropic_to_chat_request, anthropic_to_openai, apply_reasoning_output_to_message,
+    chat_failure, chat_to_anthropic_fatal, chat_to_anthropic_loss, chat_to_anthropic_response,
+    chat_to_anthropic_thinking_conflict, chat_to_responses_fatal, chat_to_responses_loss,
+    chat_to_responses_request, chat_to_responses_response, frame_data, frame_event,
+    openai_to_anthropic_with_max, responses_stateful_error, responses_to_chat_request,
+    responses_to_openai, AnthropicStream, ChatReasoningEgress, ChatToAnthropicStream,
+    ChatToResponsesStream, ResponsesStream, SseEvent,
 };
 
 struct Inner {
@@ -1042,7 +1043,9 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
             Protocol::Responses => Inbound::Responses(ResponsesStream::new(&name)),
         };
         let egress = match ingress {
-            Ingress::Chat => Egress::Chat,
+            Ingress::Chat => {
+                Egress::Chat(ChatReasoningEgress::new(st.cfg.read().unwrap().reasoning_output))
+            }
             Ingress::Responses => Egress::Responses(ChatToResponsesStream::new(&name)),
             Ingress::Anthropic => Egress::Anthropic(ChatToAnthropicStream::new(&name)),
         };
@@ -1131,7 +1134,13 @@ async fn handle_ingress(st: St, req: Request, ingress: Ingress) -> Response {
         // to `chat_failure`; it is not part of any wire protocol.
         chat.as_object_mut().map(|o| o.remove("upstream_error"));
         let out = match ingress {
-            Ingress::Chat => chat,
+            Ingress::Chat => {
+                let mode = st.cfg.read().unwrap().reasoning_output;
+                if let Some(msg) = chat.pointer_mut("/choices/0/message") {
+                    apply_reasoning_output_to_message(msg, mode);
+                }
+                chat
+            }
             Ingress::Responses => chat_to_responses_response(&chat, &name),
             Ingress::Anthropic => chat_to_anthropic_response(&chat, &name),
         };
@@ -1224,7 +1233,7 @@ impl Inbound {
 
 /// Canonical OpenAI chat chunks -> client-protocol SSE framing.
 enum Egress {
-    Chat,
+    Chat(ChatReasoningEgress),
     Responses(ChatToResponsesStream),
     Anthropic(ChatToAnthropicStream),
 }
@@ -1232,7 +1241,11 @@ enum Egress {
 impl Egress {
     fn handle(&mut self, chunk: &Value) -> Vec<String> {
         match self {
-            Egress::Chat => vec![frame_data(chunk)],
+            Egress::Chat(e) => {
+                let mut c = chunk.clone();
+                e.transform(&mut c);
+                vec![frame_data(&c)]
+            }
             Egress::Responses(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
             Egress::Anthropic(s) => s.handle(chunk).iter().map(|e| e.frame()).collect(),
         }
@@ -1254,12 +1267,12 @@ impl Egress {
                 // The upstream's own `[DONE]` is swallowed by the parser and
                 // has to be re-emitted; the other protocols terminate
                 // themselves upstream.
-                Egress::Chat => vec!["data: [DONE]\n\n".to_string()],
+                Egress::Chat(_) => vec!["data: [DONE]\n\n".to_string()],
                 _ => vec![],
             };
         }
         match self {
-            Egress::Chat => vec!["data: [DONE]\n\n".to_string()],
+            Egress::Chat(_) => vec!["data: [DONE]\n\n".to_string()],
             Egress::Responses(s) => match s.finish() {
                 Some(events) => events.iter().map(|e| e.frame()).collect(),
                 None => vec![],
@@ -1279,7 +1292,7 @@ impl Egress {
     /// close, so only the error frame itself is emitted.
     fn fail(&mut self, msg: &str, passthrough: bool) -> Vec<String> {
         match self {
-            Egress::Chat => vec![
+            Egress::Chat(_) => vec![
                 frame_data(&json!({
                     "error": {"message": msg, "type": "gateway_error"}
                 })),
@@ -1784,6 +1797,7 @@ fn sample_config() -> Config {
         extra_headers: HashMap::new(),
         anthropic_max_tokens: 8192,
         strict_params: false,
+        reasoning_output: Default::default(),
         max_body_bytes: 32 * 1024 * 1024,
         models_dev: Default::default(),
         reload: Default::default(),
@@ -2070,7 +2084,9 @@ mod tests {
 
         // Chat still needs its `[DONE]`: the upstream's own sentinel is
         // swallowed by the parser and must be re-emitted.
-        let mut chat = Egress::Chat;
+        let mut chat = Egress::Chat(ChatReasoningEgress::new(
+            crate::config::ReasoningOutput::ReasoningContent,
+        ));
         assert_eq!(chat.finish(true), vec!["data: [DONE]\n\n".to_string()]);
         assert_eq!(chat.fail("boom", true).len(), 2);
 
@@ -2097,7 +2113,9 @@ mod tests {
         // The main loop and the end-of-stream flush used to carry separate
         // copies of this check; both paths must agree.
         let mut inbound = Inbound::Responses(ResponsesStream::new("m"));
-        let mut egress = Egress::Chat;
+        let mut egress = Egress::Chat(ChatReasoningEgress::new(
+            crate::config::ReasoningOutput::ReasoningContent,
+        ));
         let block =
             b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}";
         let (_, err) = render_block(classify_block(block, &None, &mut inbound, &mut egress));

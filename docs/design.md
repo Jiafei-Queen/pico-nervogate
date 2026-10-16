@@ -17,6 +17,10 @@ Translation details worth knowing:
   _protocol change_, Anthropic thinking block _signatures_ arrive as `""`, so
   multi-turn thinking replay against a strict Anthropic upstream may be
   rejected. Same-protocol requests skip translation and keep their signatures.
+  On Chat egress the global `reasoning_output` picks the render:
+  `reasoning_content` (default), `think_tag` (`<think>` inside `content`,
+  for tag-parsing clients like OpenWebUI), or `both`. Translated paths only;
+  same-protocol passthrough stays verbatim.
 - **Structured output**: `response_format` maps to `output_config.format` for
   `anthropic` upstreams and to `text.format` for `responses` upstreams, so a
   `json_schema` constraint is not silently dropped. Anthropic only accepts

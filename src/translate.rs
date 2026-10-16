@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::config::ThinkingMode;
+use crate::config::{ReasoningOutput, ThinkingMode};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -667,6 +667,132 @@ fn chunk(id: &str, model: &str, delta: Value, finish: Option<&str>) -> Value {
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
     })
+}
+
+/// `<think>` framing for Chat egress. The trailing newline in each marker
+/// matches what tag-parsing clients expect (`<think>\n...`).
+pub const THINK_OPEN: &str = "<think>\n";
+pub const THINK_CLOSE: &str = "\n</think>\n";
+
+/// Render reasoning into a Chat completion message per `mode`.
+/// `ReasoningContent` is a no-op; the other modes prepend a `<think>`
+/// block to `content` (`ThinkTag` also drops `reasoning_content`).
+pub fn apply_reasoning_output_to_message(msg: &mut Value, mode: ReasoningOutput) {
+    if mode == ReasoningOutput::ReasoningContent {
+        return;
+    }
+    let reasoning = msg
+        .get("reasoning_content")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if reasoning.is_empty() {
+        return;
+    }
+    let orig = msg
+        .get("content")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    msg["content"] = json!(format!("{THINK_OPEN}{reasoning}{THINK_CLOSE}{orig}"));
+    if mode == ReasoningOutput::ThinkTag {
+        if let Some(o) = msg.as_object_mut() {
+            o.remove("reasoning_content");
+        }
+    }
+}
+
+/// Stateful Chat chunk rewriter for `reasoning_output`.
+/// Reasoning deltas open one `<think>` block; the first following content
+/// (or the finish chunk) closes it, so multi-chunk thinking stays a single
+/// block instead of one tag pair per chunk.
+pub struct ChatReasoningEgress {
+    mode: ReasoningOutput,
+    in_think: bool,
+}
+
+impl ChatReasoningEgress {
+    pub fn new(mode: ReasoningOutput) -> Self {
+        Self {
+            mode,
+            in_think: false,
+        }
+    }
+
+    pub fn transform(&mut self, chunk: &mut Value) {
+        if self.mode == ReasoningOutput::ReasoningContent {
+            return;
+        }
+        let keep = self.mode == ReasoningOutput::Both;
+        let finish = chunk
+            .pointer("/choices/0/finish_reason")
+            .is_some_and(|f| !f.is_null());
+        let delta = match chunk.pointer_mut("/choices/0/delta") {
+            Some(Value::Object(m)) => m,
+            _ => {
+                if finish && self.in_think {
+                    if let Some(o) = chunk
+                        .pointer_mut("/choices/0")
+                        .and_then(|c| c.as_object_mut())
+                    {
+                        o.insert("delta".into(), json!({"content": THINK_CLOSE}));
+                    }
+                    self.in_think = false;
+                }
+                return;
+            }
+        };
+        let reasoning = delta
+            .get("reasoning_content")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content = delta
+            .get("content")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !reasoning.is_empty() && !content.is_empty() {
+            let wrapped = if self.in_think {
+                format!("{reasoning}{THINK_CLOSE}{content}")
+            } else {
+                format!("{THINK_OPEN}{reasoning}{THINK_CLOSE}{content}")
+            };
+            self.in_think = false;
+            delta.insert("content".into(), json!(wrapped));
+            if !keep {
+                delta.remove("reasoning_content");
+            }
+            return;
+        }
+        if !reasoning.is_empty() {
+            let mut out = String::new();
+            if !self.in_think {
+                out.push_str(THINK_OPEN);
+            }
+            out.push_str(&reasoning);
+            if finish {
+                out.push_str(THINK_CLOSE);
+                self.in_think = false;
+            } else {
+                self.in_think = true;
+            }
+            delta.insert("content".into(), json!(out));
+            if !keep {
+                delta.remove("reasoning_content");
+            }
+            return;
+        }
+        if !content.is_empty() && self.in_think {
+            delta.insert("content".into(), json!(format!("{THINK_CLOSE}{content}")));
+            self.in_think = false;
+            return;
+        }
+        if finish && self.in_think {
+            delta.insert("content".into(), json!(THINK_CLOSE));
+            self.in_think = false;
+        }
+    }
 }
 
 /// Stateful translator for an Anthropic Messages SSE stream into OpenAI chunks.
@@ -4053,5 +4179,70 @@ mod tests {
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    // ---- reasoning_output ------------------------------------------------
+
+    #[test]
+    fn reasoning_output_message_modes() {
+        use crate::config::ReasoningOutput;
+        let mut msg = json!({"role": "assistant", "content": "hi", "reasoning_content": "hmm"});
+        apply_reasoning_output_to_message(&mut msg, ReasoningOutput::ReasoningContent);
+        assert_eq!(msg["content"], json!("hi"));
+        assert_eq!(msg["reasoning_content"], json!("hmm"));
+
+        let mut msg = json!({"role": "assistant", "content": "hi", "reasoning_content": "hmm"});
+        apply_reasoning_output_to_message(&mut msg, ReasoningOutput::ThinkTag);
+        assert_eq!(msg["content"], json!("<think>\nhmm\n</think>\nhi"));
+        assert!(msg.get("reasoning_content").is_none());
+
+        let mut msg = json!({"role": "assistant", "content": "hi", "reasoning_content": "hmm"});
+        apply_reasoning_output_to_message(&mut msg, ReasoningOutput::Both);
+        assert_eq!(msg["content"], json!("<think>\nhmm\n</think>\nhi"));
+        assert_eq!(msg["reasoning_content"], json!("hmm"));
+
+        // No reasoning: untouched, even in think_tag mode.
+        let mut msg = json!({"role": "assistant", "content": "hi"});
+        apply_reasoning_output_to_message(&mut msg, ReasoningOutput::ThinkTag);
+        assert_eq!(msg["content"], json!("hi"));
+    }
+
+    #[test]
+    fn reasoning_output_stream_wraps_one_block() {
+        use crate::config::ReasoningOutput;
+        let mut e = ChatReasoningEgress::new(ReasoningOutput::ThinkTag);
+        let mut c1 = chunk("i", "m", json!({"reasoning_content": "r1"}), None);
+        e.transform(&mut c1);
+        assert_eq!(
+            c1.pointer("/choices/0/delta/content").unwrap(),
+            "<think>\nr1"
+        );
+        assert!(c1.pointer("/choices/0/delta/reasoning_content").is_none());
+        let mut c2 = chunk("i", "m", json!({"reasoning_content": "r2"}), None);
+        e.transform(&mut c2);
+        assert_eq!(c2.pointer("/choices/0/delta/content").unwrap(), "r2");
+        let mut c3 = chunk("i", "m", json!({"content": "hi"}), None);
+        e.transform(&mut c3);
+        assert_eq!(
+            c3.pointer("/choices/0/delta/content").unwrap(),
+            "\n</think>\nhi"
+        );
+        let mut c4 = chunk("i", "m", json!({}), Some("stop"));
+        e.transform(&mut c4);
+        assert!(c4.pointer("/choices/0/delta/content").is_none());
+    }
+
+    #[test]
+    fn reasoning_output_stream_closes_on_finish_without_content() {
+        use crate::config::ReasoningOutput;
+        let mut e = ChatReasoningEgress::new(ReasoningOutput::ThinkTag);
+        let mut c1 = chunk("i", "m", json!({"reasoning_content": "r"}), None);
+        e.transform(&mut c1);
+        let mut c2 = chunk("i", "m", json!({}), Some("stop"));
+        e.transform(&mut c2);
+        assert_eq!(
+            c2.pointer("/choices/0/delta/content").unwrap(),
+            "\n</think>\n"
+        );
     }
 }

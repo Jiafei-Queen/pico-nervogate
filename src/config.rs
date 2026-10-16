@@ -37,6 +37,21 @@ pub enum ThinkingMode {
     Adaptive,
 }
 
+/// Where reasoning/thinking lands on Chat Completions egress
+/// (`POST /v1/chat/completions` responses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningOutput {
+    /// `message` / `delta` carry `reasoning_content` (current behavior).
+    #[default]
+    ReasoningContent,
+    /// Reasoning is wrapped in `<think>` tags inside `content`, so
+    /// tag-parsing clients (e.g. OpenWebUI) show a thinking block.
+    ThinkTag,
+    /// Both: keep `reasoning_content` and also wrap it in `<think>` tags.
+    Both,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelCfg {
     /// Public model id exposed to clients.
@@ -402,6 +417,13 @@ pub struct Config {
     /// drop (see PROTOCOL-AUDIT S-2). Off by default: warnings only.
     #[serde(default)]
     pub strict_params: bool,
+    /// Where reasoning/thinking lands on Chat Completions egress.
+    /// `reasoning_content` (default) keeps the `reasoning_content` field;
+    /// `think_tag` moves it into `content` wrapped in `<think>` tags;
+    /// `both` keeps the field and also wraps it. Translated paths only;
+    /// same-protocol passthrough stays verbatim.
+    #[serde(default)]
+    pub reasoning_output: ReasoningOutput,
     /// Largest client request body accepted, in bytes. Axum's built-in limit
     /// is 2 MiB, which rejects real workloads (base64 images, long agent
     /// histories) with a plain-text 413 that no SDK can parse. The gateway
@@ -601,5 +623,29 @@ protocol = "chat"
         assert!(!cfg.models_dev.enable);
         assert_eq!(cfg.models[0].vision, None);
         assert_eq!(cfg.models[0].model_type, None);
+    }
+
+    #[test]
+    fn reasoning_output_parses_with_content_default() {
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "chat"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(
+            cfg.reasoning_output,
+            ReasoningOutput::ReasoningContent
+        );
+
+        let text = r#"
+reasoning_output = "think_tag"
+
+[[models]]
+name = "m"
+protocol = "chat"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert_eq!(cfg.reasoning_output, ReasoningOutput::ThinkTag);
     }
 }
