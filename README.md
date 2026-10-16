@@ -17,8 +17,9 @@ under 1 MB of resident memory.
   `POST /v1/messages` (Anthropic Messages),
   `POST /v1beta/models/{model}:generateContent` /
   `:streamGenerateContent` (Google Gemini).
-  Each model's `protocol` picks the upstream wire format (`chat` /
-  `anthropic` / `responses` / `google`), so any client surface can reach any upstream.
+  Each model's `protocol` picks the upstream wire format
+  (`openai-compatible` / `anthropic` / `openai` / `google`, matching the
+  AI SDK package names), so any client surface can reach any upstream.
 - **Same-protocol passthrough**: when the client's protocol already matches
   the model's, the request and response are forwarded verbatim — no round trip
   through the canonical chat shape, so `cache_control`, thinking signatures and

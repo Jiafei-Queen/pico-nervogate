@@ -48,8 +48,9 @@ rotation works) — applies live.
 
 `enable`, `base_url` (default `default_base_url`), `path`
 (default `/models`), `interval_secs` (default `3600`, `0` = startup fetch
-only), `protocol` (assumed for discovered models, default `chat`;
-`chat` | `anthropic` | `responses` | `google`),
+only), `protocol` (assumed for discovered models, default
+`openai-compatible`;
+`openai-compatible` | `anthropic` | `openai` | `google`),
 `prefix` (only discover matching ids), `prune_missing` (default `false`:
 additive only; `true` drops discovered models that vanish upstream).
 Explicit `[[models]]` entries always win; discovered models get models.dev
@@ -59,14 +60,14 @@ A `/models` list says nothing about which completion endpoint the upstream
 speaks, so a wrong `protocol` makes every discovered model fail with a 404
 at request time. The gateway probes one discovered model with a
 `max_tokens: 1` request per refresh — one request in the common case, since
-`chat` is tried first — and logs the result (`discovery: upstream speaks
+`openai-compatible` is tried first — and logs the result (`discovery: upstream speaks
 anthropic`). A `404`/`405` means "not this endpoint"; any other status
 means the endpoint is real. Set `protocol` explicitly to skip probing.
 
 ## `[[models]]`
 
-`name` (public id), `protocol` (`chat` | `anthropic` | `responses` |
-`google`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
+`name` (public id), `protocol` (`openai-compatible` | `anthropic` |
+`openai` | `google`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
 `thinking_type` (`adaptive` | `enabled`, default `adaptive`), `google_auth`
 (`auto` | `api_key` | `bearer`, default `auto`).
 

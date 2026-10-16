@@ -38,7 +38,7 @@ default_base_url = "https://api.example.com/v1"
 # base_url = "https://api.example.com/v1"  # default: default_base_url
 # path = "/models"
 # interval_secs = 3600  # 0 = fetch once at startup only
-# protocol = "chat"     # chat | anthropic | responses
+# protocol = "openai-compatible"     # openai-compatible | anthropic | openai | google
 # prefix = "gpt-"       # only discover matching ids; omit for all
 # prune_missing = false # true: drop discovered models that vanish upstream
 
@@ -56,11 +56,11 @@ default_base_url = "https://api.example.com/v1"
 # both: keep the field and also wrap it.
 # reasoning_output = "reasoning_content"
 
-# protocol: "chat" | "anthropic" | "responses" | "google"
+# protocol: "openai-compatible" | "anthropic" | "openai" | "google"
 # ("google" speaks Gemini generateContent; see examples/gateway.google.toml)
 [[models]]
 name = "my-model"
-protocol = "chat"
+protocol = "openai-compatible"
 vision = false
 # Optional per-model overrides (each set value wins over models.dev;
 # keys mirror models.dev model entries, minus `id`):

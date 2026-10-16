@@ -8,22 +8,28 @@ use serde_json::Value as JsonValue;
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// OpenAI-compatible POST {base}/chat/completions (pass-through).
+    /// Package: `@ai-sdk/openai-compatible`.
+    #[serde(rename = "openai-compatible")]
     #[default]
-    Chat,
+    OpenAiCompatible,
     /// Anthropic POST {base}/messages (translated).
+    /// Package: `@ai-sdk/anthropic`.
     Anthropic,
     /// OpenAI Responses POST {base}/responses (translated).
-    Responses,
+    /// Package: `@ai-sdk/openai`.
+    #[serde(rename = "openai")]
+    OpenAi,
     /// Google Gemini POST {base}/models/{model}:generateContent (translated).
+    /// Package: `@ai-sdk/google`.
     Google,
 }
 
 impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Protocol::Chat => "chat",
+            Protocol::OpenAiCompatible => "openai-compatible",
             Protocol::Anthropic => "anthropic",
-            Protocol::Responses => "responses",
+            Protocol::OpenAi => "openai",
             Protocol::Google => "google",
         }
     }
@@ -393,7 +399,7 @@ impl Default for DiscoveryCfg {
             base_url: None,
             path: default_discovery_path(),
             interval_secs: default_discovery_interval(),
-            protocol: Protocol::Chat,
+            protocol: Protocol::OpenAiCompatible,
             prefix: None,
             prune_missing: false,
         }
@@ -530,7 +536,7 @@ default_base_url = "https://api.example.com/v1"
 
 [[models]]
 name = "m"
-protocol = "chat"
+protocol = "openai-compatible"
 display_name = "M Display"
 description = "d"
 family = "f"
@@ -664,7 +670,7 @@ default_base_url = "https://api.example.com/v1"
 
 [[models]]
 name = "m"
-protocol = "chat"
+protocol = "openai-compatible"
 "#;
         let cfg: Config = toml::from_str(text).expect("parse toml");
         assert!(!cfg.models_dev.enable);
@@ -677,7 +683,7 @@ protocol = "chat"
         let text = r#"
 [[models]]
 name = "m"
-protocol = "chat"
+protocol = "openai-compatible"
 "#;
         let cfg: Config = toml::from_str(text).expect("parse toml");
         assert_eq!(
@@ -690,7 +696,7 @@ reasoning_output = "think_tag"
 
 [[models]]
 name = "m"
-protocol = "chat"
+protocol = "openai-compatible"
 "#;
         let cfg: Config = toml::from_str(text).expect("parse toml");
         assert_eq!(cfg.reasoning_output, ReasoningOutput::ThinkTag);

@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::translate::{chat_usage, warn_dropped_block, SseEvent};
+use super::common::*;
 
 // ---------------------------------------------------------------------------
 // Action parsing (ingress path)
@@ -1308,6 +1308,9 @@ fn accumulate_egress_tool(tools: &mut Vec<PendingEgressTool>, tc: &Value) {
 mod tests {
     use super::*;
 
+    use crate::state::{config_for, test_state};
+    use crate::upstream::{upstream_headers, upstream_url};
+
     fn chat_req() -> Value {
         json!({
             "model": "m",
@@ -1611,7 +1614,7 @@ mod tests {
 
     #[test]
     fn api_key_auth_sends_x_goog_api_key_without_bearer() {
-        let st = crate::test_state(crate::config_for(
+        let st = test_state(config_for(
             "https://generativelanguage.googleapis.com/v1beta",
             vec![google_model(
                 "https://generativelanguage.googleapis.com/v1beta",
@@ -1622,7 +1625,7 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta",
             crate::config::GoogleAuth::Auto,
         );
-        let h = crate::upstream_headers(&st, &m);
+        let h = upstream_headers(&st, &m);
         assert!(h.contains_key("x-goog-api-key"));
         assert!(!h.contains_key(axum::http::header::AUTHORIZATION));
     }
@@ -1630,17 +1633,17 @@ mod tests {
     #[test]
     fn vertex_base_url_sniffs_bearer_and_override_wins() {
         let vertex = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models";
-        let st = crate::test_state(crate::config_for(
+        let st = test_state(config_for(
             vertex,
             vec![google_model(vertex, crate::config::GoogleAuth::Auto)],
         ));
         let auto = google_model(vertex, crate::config::GoogleAuth::Auto);
-        let h = crate::upstream_headers(&st, &auto);
+        let h = upstream_headers(&st, &auto);
         assert!(h.contains_key(axum::http::header::AUTHORIZATION));
         assert!(!h.contains_key("x-goog-api-key"));
 
         let forced = google_model(vertex, crate::config::GoogleAuth::ApiKey);
-        let h = crate::upstream_headers(&st, &forced);
+        let h = upstream_headers(&st, &forced);
         assert!(h.contains_key("x-goog-api-key"));
         assert!(!h.contains_key(axum::http::header::AUTHORIZATION));
     }
@@ -1649,11 +1652,11 @@ mod tests {
     fn upstream_url_embeds_model_and_stream_verb() {
         let m = google_model("https://generativelanguage.googleapis.com/v1beta/", crate::config::GoogleAuth::Auto);
         assert_eq!(
-            crate::upstream_url("https://generativelanguage.googleapis.com/v1beta/", &m, false),
+            upstream_url("https://generativelanguage.googleapis.com/v1beta/", &m, false),
             "https://generativelanguage.googleapis.com/v1beta/models/m:generateContent"
         );
         assert_eq!(
-            crate::upstream_url("https://generativelanguage.googleapis.com/v1beta/", &m, true),
+            upstream_url("https://generativelanguage.googleapis.com/v1beta/", &m, true),
             "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse"
         );
     }

@@ -30,7 +30,7 @@ Translation details worth knowing:
   for tag-parsing clients like OpenWebUI), or `both`. Translated paths only;
   same-protocol passthrough stays verbatim.
 - **Structured output**: `response_format` maps to `output_config.format` for
-  `anthropic` upstreams, to `text.format` for `responses` upstreams, and to
+  `anthropic` upstreams, to `text.format` for `openai` upstreams, and to
   `generationConfig.responseMimeType` + `responseSchema` for `google`
   upstreams, so a `json_schema` constraint is not silently dropped. Anthropic
   only accepts `json_schema` there, so OpenAI's `json_object` is downgraded
@@ -46,7 +46,7 @@ Translation details worth knowing:
   `background`, `store: true` and `item_reference` input items are rejected
   with HTTP 400 — they need server-side response storage and polling endpoints
   that do not exist here; upstream requests always carry `store: false`;
-  `include` is passed through to `responses` upstreams.
+  `include` is passed through to `openai` upstreams.
 - **Usage** is remapped per protocol (`prompt_tokens` ↔ `input_tokens` ↔
   `usage`, including `cached_tokens` / `reasoning_tokens` details). Anthropic
   reports cache reads and writes outside `input_tokens` while OpenAI folds

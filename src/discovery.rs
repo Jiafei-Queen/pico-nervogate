@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::config::{ModelCfg, Protocol};
-use crate::St;
+use crate::state::St;
 
 /// Parse a `/models` response body into model ids. Accepts the OpenAI list
 /// shape (`{"data": [{"id": ...}]}`) and a bare array (of `{id}` objects
@@ -50,7 +50,7 @@ pub fn parse_models_list(text: &str) -> Result<Vec<String>, String> {
 /// meaningful — the response body is discarded either way.
 fn probe_body(protocol: &Protocol, model: &str) -> Value {
     match protocol {
-        Protocol::Chat => json!({
+        Protocol::OpenAiCompatible => json!({
             "model": model, "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}]
         }),
@@ -58,7 +58,7 @@ fn probe_body(protocol: &Protocol, model: &str) -> Value {
             "model": model, "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}]
         }),
-        Protocol::Responses => json!({
+        Protocol::OpenAi => json!({
             "model": model, "max_output_tokens": 16, "input": "hi"
         }),
         Protocol::Google => json!({
@@ -68,12 +68,12 @@ fn probe_body(protocol: &Protocol, model: &str) -> Value {
     }
 }
 
-/// Order to try. `chat` first: it is the most common upstream shape and the
+/// Order to try. `openai-compatible` first: it is the most common upstream shape and the
 /// configured default, so the common case costs a single request.
 const PROBE_ORDER: [Protocol; 4] = [
-    Protocol::Chat,
+    Protocol::OpenAiCompatible,
     Protocol::Anthropic,
-    Protocol::Responses,
+    Protocol::OpenAi,
     Protocol::Google,
 ];
 
@@ -91,11 +91,11 @@ const PROBE_ORDER: [Protocol; 4] = [
 pub async fn detect_protocol(st: &St, base: &str, model: &str) -> Option<Protocol> {
     for protocol in PROBE_ORDER {
         let m = ModelCfg::discovered(model.to_string(), protocol, base.to_string());
-        let url = crate::upstream_url(base, &m, false);
+        let url = crate::upstream::upstream_url(base, &m, false);
         let resp = st
             .client
             .post(&url)
-            .headers(crate::upstream_headers(st, &m))
+            .headers(crate::upstream::upstream_headers(st, &m))
             .json(&probe_body(&protocol, model))
             .send()
             .await;
@@ -240,7 +240,7 @@ mod tests {
     fn discovered_ctor_leaves_metadata_unset() {
         let m = ModelCfg::discovered(
             "x".into(),
-            crate::config::Protocol::Responses,
+            crate::config::Protocol::OpenAi,
             "https://h/v1".into(),
         );
         assert_eq!(m.base_url.as_deref(), Some("https://h/v1"));
@@ -256,7 +256,7 @@ mod tests {
         // Anthropic rejects a request without `max_tokens`; Responses rejects
         // one without `input`. A malformed probe would report "not this
         // protocol" for the protocol that is actually in use.
-        let chat = probe_body(&Protocol::Chat, "m");
+        let chat = probe_body(&Protocol::OpenAiCompatible, "m");
         assert!(chat.get("messages").is_some());
         assert_eq!(chat["max_tokens"], 1);
 
@@ -264,7 +264,7 @@ mod tests {
         assert!(anth.get("messages").is_some());
         assert_eq!(anth["max_tokens"], 1);
 
-        let resp = probe_body(&Protocol::Responses, "m");
+        let resp = probe_body(&Protocol::OpenAi, "m");
         assert!(resp.get("input").is_some());
         assert!(resp.get("messages").is_none());
         assert!(resp.get("max_output_tokens").is_some());
@@ -276,9 +276,9 @@ mod tests {
         // Nothing larger than a single token, so a probe is not a billable
         // generation.
         for (p, b) in [
-            (Protocol::Chat, &chat),
+            (Protocol::OpenAiCompatible, &chat),
             (Protocol::Anthropic, &anth),
-            (Protocol::Responses, &resp),
+            (Protocol::OpenAi, &resp),
         ] {
             assert_eq!(b["model"], "m", "{p:?} lost the model id");
         }
@@ -318,9 +318,9 @@ mod tests {
         use axum::Router;
 
         let want: &'static str = match speaks {
-            Protocol::Chat => "/v1/chat/completions",
+            Protocol::OpenAiCompatible => "/v1/chat/completions",
             Protocol::Anthropic => "/v1/messages",
-            Protocol::Responses => "/v1/responses",
+            Protocol::OpenAi => "/v1/responses",
             // Google embeds the model id in the path; match by prefix below.
             Protocol::Google => "/v1/models/",
         };
@@ -373,7 +373,7 @@ mod tests {
                 base_url: Some(base.to_string()),
                 ..Default::default()
             },
-            ..crate::sample_config()
+            ..crate::state::sample_config()
         }
     }
 
@@ -381,10 +381,10 @@ mod tests {
     async fn refresh_registers_discovered_models_with_the_detected_protocol() {
         // The end-to-end version of the M-10 fix: an Anthropic upstream whose
         // `/models` list looks identical to a chat one. Before detection these
-        // two models would both be registered as `chat` and every request
+        // two models would both be registered as `openai-compatible` and every request
         // would 404 on POST {base}/chat/completions.
         let base = mock_upstream(Protocol::Anthropic).await;
-        let st = crate::test_state(discovery_config(&base));
+        let st = crate::state::test_state(discovery_config(&base));
         let n = refresh_discovery(&st).await.expect("discovery succeeds");
         assert_eq!(n, 2);
         let disc = st.discovered.read().unwrap();
@@ -403,7 +403,7 @@ mod tests {
     async fn refresh_falls_back_to_the_configured_protocol_when_unreachable() {
         // Nothing listening: the list cannot be fetched at all, so discovery
         // fails rather than registering models of an unknown protocol.
-        let st = crate::test_state(discovery_config("http://127.0.0.1:1/v1"));
+        let st = crate::state::test_state(discovery_config("http://127.0.0.1:1/v1"));
         assert!(refresh_discovery(&st).await.is_err());
         assert!(st.discovered.read().unwrap().is_empty());
     }
@@ -415,7 +415,7 @@ mod tests {
         let base = mock_upstream(Protocol::Anthropic).await;
         let mut cfg = discovery_config(&base);
         cfg.discovery.prefix = Some("m".to_string());
-        let st = crate::test_state(cfg);
+        let st = crate::state::test_state(cfg);
         let n = refresh_discovery(&st).await.expect("discovery succeeds");
         assert_eq!(n, 2);
         assert!(st
@@ -427,15 +427,15 @@ mod tests {
     }
 
     fn probe_state() -> St {
-        crate::test_state(crate::config::Config {
+        crate::state::test_state(crate::config::Config {
             api_key: Some("test".into()),
-            ..crate::sample_config()
+            ..crate::state::sample_config()
         })
     }
 
     #[tokio::test]
     async fn detects_an_anthropic_upstream_that_defaults_to_chat() {
-        // The exact M-10 failure: discovery defaults to `chat`, the upstream
+        // The exact M-10 failure: discovery defaults to `openai-compatible`, the upstream
         // speaks Anthropic, and without detection every discovered model 404s
         // at request time with nothing pointing at the real cause.
         let base = mock_upstream(Protocol::Anthropic).await;
@@ -445,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn detects_chat_and_responses_upstreams() {
-        for speaks in [Protocol::Chat, Protocol::Responses, Protocol::Google] {
+        for speaks in [Protocol::OpenAiCompatible, Protocol::OpenAi, Protocol::Google] {
             let base = mock_upstream(speaks).await;
             let found = detect_protocol(&probe_state(), &base, "m").await;
             assert_eq!(found, Some(speaks));
@@ -462,12 +462,12 @@ mod tests {
 
     #[tokio::test]
     async fn detection_costs_one_request_in_the_common_case() {
-        // The default `chat` upstream must be identified by its first probe;
+        // The default `openai-compatible` upstream must be identified by its first probe;
         // every extra request is latency added to every discovery refresh.
-        let base = mock_upstream(Protocol::Chat).await;
+        let base = mock_upstream(Protocol::OpenAiCompatible).await;
         assert_eq!(
             detect_protocol(&probe_state(), &base, "m").await,
-            Some(Protocol::Chat)
+            Some(Protocol::OpenAiCompatible)
         );
     }
 }

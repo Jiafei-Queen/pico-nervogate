@@ -513,7 +513,7 @@ mod tests {
         ModelCfg {
             name: name.into(),
             upstream: None,
-            protocol: Protocol::Chat,
+            protocol: Protocol::OpenAiCompatible,
             base_url: None,
             extra_headers: HashMap::new(),
             thinking_type: None,

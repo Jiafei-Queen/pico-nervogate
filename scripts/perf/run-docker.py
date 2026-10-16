@@ -175,13 +175,13 @@ enable = false
 watch_interval_secs = 0
 [[models]]
 name = "bench-chat"
-protocol = "chat"
+protocol = "openai-compatible"
 [[models]]
 name = "bench-anthropic"
 protocol = "anthropic"
 [[models]]
 name = "bench-responses"
-protocol = "responses"
+protocol = "openai"
 ''')
             self.binds = [f"{config}:/gateway.toml:ro"]
         else:

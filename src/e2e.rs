@@ -20,7 +20,7 @@ use axum::Router;
 use serde_json::{json, Value};
 
 use crate::config::{ModelCfg, Protocol};
-use crate::{app, parse_sse, test_state, St};
+use crate::{app, sse::parse_sse, state::{test_state, St}};
 
 type Bytes = axum::body::Bytes;
 
@@ -124,7 +124,7 @@ impl Mock {
     /// A gateway state whose only model speaks `protocol` on this upstream.
     fn state_with(&self, protocol: Protocol) -> St {
         let m: ModelCfg = crate::config::test_model("m", protocol, &self.base);
-        test_state(crate::config_for(&self.base, vec![m]))
+        test_state(crate::state::config_for(&self.base, vec![m]))
     }
 }
 
@@ -218,19 +218,19 @@ fn plain(data: Value) -> String {
 fn stream_frames(protocol: Protocol, text: &str) -> Vec<String> {
     let pieces: Vec<&str> = text.split_inclusive(' ').collect();
     match protocol {
-        Protocol::Chat => {
+        Protocol::OpenAiCompatible => {
             let mut out: Vec<String> = pieces
                 .iter()
                 .map(|p| {
                     format!(
                         "data: {}\n\n",
-                        crate::chat_chunk(json!({"content": p}), None)
+                        crate::sse::chat_chunk(json!({"content": p}), None)
                     )
                 })
                 .collect();
             out.push(format!(
                 "data: {}\n\n",
-                crate::chat_chunk(json!({}), Some("stop"))
+                crate::sse::chat_chunk(json!({}), Some("stop"))
             ));
             out.push("data: [DONE]\n\n".to_string());
             out
@@ -270,7 +270,7 @@ fn stream_frames(protocol: Protocol, text: &str) -> Vec<String> {
             out.push(named("message_stop", json!({"type": "message_stop"})));
             out
         }
-        Protocol::Responses => {
+        Protocol::OpenAi => {
             let item_done = json!({"id": "msg_1", "type": "message", "role": "assistant",
                 "status": "completed",
                 "content": [{"type": "output_text", "text": text, "annotations": []}]});
@@ -350,12 +350,12 @@ fn is_terminal_frame(frame: &str) -> bool {
 /// The mid-stream error frame each protocol uses to report a failure.
 fn error_frame(protocol: Protocol, msg: &str) -> String {
     match protocol {
-        Protocol::Chat => plain(json!({"error": {"message": msg, "type": "api_error"}})),
+        Protocol::OpenAiCompatible => plain(json!({"error": {"message": msg, "type": "api_error"}})),
         Protocol::Anthropic => named(
             "error",
             json!({"type": "error", "error": {"type": "api_error", "message": msg}}),
         ),
-        Protocol::Responses => plain(json!({"type": "error", "message": msg})),
+        Protocol::OpenAi => plain(json!({"type": "error", "message": msg})),
         Protocol::Google => plain(json!({"error": {"message": msg, "code": 13}})),
     }
 }
@@ -363,14 +363,14 @@ fn error_frame(protocol: Protocol, msg: &str) -> String {
 /// The non-streaming response an upstream speaking `protocol` returns.
 fn completion(protocol: Protocol, text: &str) -> Value {
     match protocol {
-        Protocol::Chat => crate::chat_completion(text),
+        Protocol::OpenAiCompatible => crate::sse::chat_completion(text),
         Protocol::Anthropic => json!({
             "id": "msg_1", "type": "message", "role": "assistant", "model": "mock",
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn", "stop_sequence": null,
             "usage": {"input_tokens": 3, "output_tokens": 2}
         }),
-        Protocol::Responses => json!({
+        Protocol::OpenAi => json!({
             "id": "resp_1", "object": "response", "created_at": 1, "model": "mock",
             "status": "completed",
             "output": [{"id": "msg_1", "type": "message", "role": "assistant",
@@ -564,9 +564,9 @@ fn count_containing(events: &[(Option<String>, String)], needle: &str) -> usize 
 #[tokio::test]
 async fn all_sixteen_protocol_combinations_answer() {
     for upstream in [
-        Protocol::Chat,
+        Protocol::OpenAiCompatible,
         Protocol::Anthropic,
-        Protocol::Responses,
+        Protocol::OpenAi,
         Protocol::Google,
     ] {
         for path in ingress_paths(false) {
@@ -597,9 +597,9 @@ async fn all_sixteen_protocol_combinations_answer() {
 #[tokio::test]
 async fn all_sixteen_protocol_combinations_stream() {
     for upstream in [
-        Protocol::Chat,
+        Protocol::OpenAiCompatible,
         Protocol::Anthropic,
-        Protocol::Responses,
+        Protocol::OpenAi,
         Protocol::Google,
     ] {
         for path in ingress_paths(true) {
@@ -697,10 +697,10 @@ async fn anthropic_passthrough_keeps_event_names_and_one_terminal() {
 /// not add a second `response.completed`.
 #[tokio::test]
 async fn responses_passthrough_terminates_exactly_once() {
-    let mock = Mock::start(Upstream::Speak(Protocol::Responses)).await;
+    let mock = Mock::start(Upstream::Speak(Protocol::OpenAi)).await;
     let path = "/v1/responses";
     let resp = post(
-        app(mock.state_with(Protocol::Responses)),
+        app(mock.state_with(Protocol::OpenAi)),
         path,
         &client_body(path, true),
     )
@@ -725,10 +725,10 @@ async fn responses_passthrough_terminates_exactly_once() {
 /// sentinel is consumed by the parser and has to be re-emitted.
 #[tokio::test]
 async fn chat_passthrough_sends_done_exactly_once() {
-    let mock = Mock::start(Upstream::Speak(Protocol::Chat)).await;
+    let mock = Mock::start(Upstream::Speak(Protocol::OpenAiCompatible)).await;
     let path = "/v1/chat/completions";
     let resp = post(
-        app(mock.state_with(Protocol::Chat)),
+        app(mock.state_with(Protocol::OpenAiCompatible)),
         path,
         &client_body(path, true),
     )
@@ -761,9 +761,9 @@ async fn upstream_429_is_shaped_for_every_ingress() {
             .into(),
     );
     for upstream in [
-        Protocol::Chat,
+        Protocol::OpenAiCompatible,
         Protocol::Anthropic,
-        Protocol::Responses,
+        Protocol::OpenAi,
         Protocol::Google,
     ] {
         for path in ingress_paths(false) {
@@ -800,7 +800,7 @@ async fn upstream_500_is_not_dressed_up_as_success() {
     for path in ingress_paths(false) {
         let mock = Mock::start(kind.clone()).await;
         let resp = post(
-            app(mock.state_with(Protocol::Chat)),
+            app(mock.state_with(Protocol::OpenAiCompatible)),
             path,
             &client_body(path, false),
         )
@@ -820,7 +820,7 @@ async fn non_json_upstream_body_becomes_a_502() {
     for path in ingress_paths(false) {
         let mock = Mock::start(Upstream::NonJson("<html>502 Bad Gateway</html>".into())).await;
         let resp = post(
-            app(mock.state_with(Protocol::Chat)),
+            app(mock.state_with(Protocol::OpenAiCompatible)),
             path,
             &client_body(path, false),
         )
@@ -842,9 +842,9 @@ async fn non_json_upstream_body_becomes_a_502() {
 #[tokio::test]
 async fn a_mid_stream_error_is_reported_as_an_error() {
     for upstream in [
-        Protocol::Chat,
+        Protocol::OpenAiCompatible,
         Protocol::Anthropic,
-        Protocol::Responses,
+        Protocol::OpenAi,
         Protocol::Google,
     ] {
         for path in ingress_paths(true) {
@@ -888,9 +888,9 @@ async fn a_mid_stream_error_is_reported_as_an_error() {
 #[tokio::test]
 async fn a_stream_that_just_stops_still_terminates_when_translated() {
     for upstream in [
-        Protocol::Chat,
+        Protocol::OpenAiCompatible,
         Protocol::Anthropic,
-        Protocol::Responses,
+        Protocol::OpenAi,
         Protocol::Google,
     ] {
         for path in ingress_paths(true) {
@@ -898,8 +898,8 @@ async fn a_stream_that_just_stops_still_terminates_when_translated() {
                 Protocol::Google
             } else {
                 match path {
-                    "/v1/chat/completions" => Protocol::Chat,
-                    "/v1/responses" => Protocol::Responses,
+                    "/v1/chat/completions" => Protocol::OpenAiCompatible,
+                    "/v1/responses" => Protocol::OpenAi,
                     _ => Protocol::Anthropic,
                 }
             };
@@ -1068,11 +1068,11 @@ async fn sampling_params_survive_the_trip_on_a_stream() {
 
 #[tokio::test]
 async fn an_unknown_model_is_a_404_in_protocol_shape() {
-    let mock = Mock::start(Upstream::Speak(Protocol::Chat)).await;
+    let mock = Mock::start(Upstream::Speak(Protocol::OpenAiCompatible)).await;
     for path in INGRESS {
         let mut body = client_body(path, false);
         body["model"] = json!("does-not-exist");
-        let resp = post(app(mock.state_with(Protocol::Chat)), path, &body).await;
+        let resp = post(app(mock.state_with(Protocol::OpenAiCompatible)), path, &body).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
         let v = parse_json(path, &text(resp).await);
         assert!(v.pointer("/error/message").is_some(), "{path}");
@@ -1083,7 +1083,7 @@ async fn an_unknown_model_is_a_404_in_protocol_shape() {
         "/v1beta/models/does-not-exist:streamGenerateContent",
     ] {
         let body = client_body(path, false);
-        let resp = post(app(mock.state_with(Protocol::Chat)), path, &body).await;
+        let resp = post(app(mock.state_with(Protocol::OpenAiCompatible)), path, &body).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
         let v = parse_json(path, &text(resp).await);
         assert!(v.pointer("/error/message").is_some(), "{path}");
@@ -1092,10 +1092,10 @@ async fn an_unknown_model_is_a_404_in_protocol_shape() {
 
 #[tokio::test]
 async fn malformed_json_is_a_400_not_a_panic() {
-    let mock = Mock::start(Upstream::Speak(Protocol::Chat)).await;
+    let mock = Mock::start(Upstream::Speak(Protocol::OpenAiCompatible)).await;
     for path in ingress_paths(false) {
         let resp = send(
-            app(mock.state_with(Protocol::Chat)),
+            app(mock.state_with(Protocol::OpenAiCompatible)),
             path,
             b"{not json".to_vec(),
         )
