@@ -113,3 +113,65 @@ pub(crate) fn sample_config() -> Config {
         models: vec![],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Protocol;
+
+    fn tables() -> (HashMap<String, ModelCfg>, HashMap<String, ModelCfg>) {
+        let mut statics = HashMap::new();
+        statics.insert(
+            "pinned".to_string(),
+            ModelCfg::discovered(
+                "pinned".to_string(),
+                Protocol::OpenAi,
+                "https://h/v1".to_string(),
+            ),
+        );
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "claude-haiku-5-5".to_string(),
+            ModelCfg::discovered(
+                "claude-haiku-5-5".to_string(),
+                Protocol::OpenAiCompatible,
+                "https://h/v1".to_string(),
+            ),
+        );
+        (statics, discovered)
+    }
+
+    #[test]
+    fn lookup_prefers_exact_then_static() {
+        let (s, d) = tables();
+        assert_eq!(find_model_in(&s, &d, "pinned").unwrap().name, "pinned");
+        assert_eq!(
+            find_model_in(&s, &d, "claude-haiku-5-5").unwrap().name,
+            "claude-haiku-5-5"
+        );
+        assert!(find_model_in(&s, &d, "nope").is_none());
+    }
+
+    #[test]
+    fn lookup_falls_back_to_normalized_match() {
+        let (s, d) = tables();
+        // Dotted client spelling matches the dashed upstream id.
+        let m = find_model_in(&s, &d, "claude-haiku-5.5").unwrap();
+        assert_eq!(m.name, "claude-haiku-5-5");
+    }
+
+    #[test]
+    fn lookup_refuses_ambiguous_normalized_match() {
+        let (mut s, d) = tables();
+        // Same normalized form as the discovered entry, but explicit.
+        s.insert(
+            "claude.haiku_5-5".to_string(),
+            ModelCfg::discovered(
+                "claude.haiku_5-5".to_string(),
+                Protocol::OpenAiCompatible,
+                "https://h/v1".to_string(),
+            ),
+        );
+        assert!(find_model_in(&s, &d, "claude-haiku-5.5").is_none());
+    }
+}

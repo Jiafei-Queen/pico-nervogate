@@ -264,3 +264,42 @@ pub(crate) async fn call_upstream(
 // Ingress handlers: POST /v1/chat/completions, /v1/responses, /v1/messages,
 // /v1beta/models/{action}
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn body_summary_reports_keys_never_values() {
+        // The outbound body is the user's prompt. Whatever we log about it
+        // must not contain any of the content.
+        let secret = "sk-live-DO-NOT-LOG-THIS";
+        let body = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": secret}],
+            "temperature": 0.5,
+        });
+        let summary = body_summary(&body);
+        assert_eq!(summary, "messages,model,temperature");
+        assert!(!summary.contains(secret));
+        assert!(!summary.contains("gpt-4"));
+
+        // A non-object body degrades to its type rather than its content.
+        assert_eq!(body_summary(&json!("hi")), "string");
+        assert_eq!(body_summary(&json!([1, 2])), "array");
+    }
+
+    #[test]
+    fn x_nervogate_is_stripped_on_every_path() {
+        // README promises the reserved key never reaches the wire, and the
+        // native path forwards the client's body verbatim.
+        let m = ModelCfg::discovered("m".to_string(), Protocol::Anthropic, "https://h/v1".into());
+        let req = json!({"model": "m", "x_nervogate": {"top_k": 5}});
+        let body = build_body(&m, &req, false, Some(&req), 4096);
+        assert!(
+            body.get("x_nervogate").is_none(),
+            "reserved key leaked upstream: {body}"
+        );
+    }
+}

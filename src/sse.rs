@@ -609,3 +609,254 @@ pub(crate) fn parse_sse(body: &str) -> Vec<(Option<String>, String)> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ReasoningOutput;
+    use crate::translate::{ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream};
+    use serde_json::json;
+
+    /// Feed raw bytes through the parser and collect every dispatched block.
+    fn parse_all(chunks: &[&[u8]]) -> Vec<String> {
+        let mut p = SseParser::new();
+        let mut out = vec![];
+        for c in chunks {
+            p.push(c);
+            while let Some(r) = p.next_block() {
+                let d = sse_fields(p.block(r)).data;
+                if !d.is_empty() {
+                    out.push(d);
+                }
+            }
+        }
+        if let Some(r) = p.finish() {
+            let d = sse_fields(p.block(r)).data;
+            if !d.is_empty() {
+                out.push(d);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sse_splits_on_lf_crlf_and_cr_blank_lines() {
+        for (label, sep) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+            let raw = format!("data: one{sep}{sep}data: two{sep}{sep}");
+            let got = parse_all(&[raw.as_bytes()]);
+            assert_eq!(got, vec!["one", "two"], "separator {label}");
+        }
+    }
+
+    #[test]
+    fn sse_handles_mixed_terminators_and_split_chunks() {
+        // CRLF/LF mixed, and an event split mid-payload across chunks.
+        let got = parse_all(&[b"data: a\r\n\r\ndata: b\n\nda", b"ta: c\r\r"]);
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn sse_does_not_split_a_crlf_across_chunks() {
+        // The trailing CR of chunk 1 must not be read as a lone terminator,
+        // which would split `data: x` into an early dispatch.
+        let mut p = SseParser::new();
+        p.push(b"data: x\r");
+        assert!(p.next_block().is_none());
+        p.push(b"\n\r\n");
+        let (s, e) = p.next_block().expect("event after CRLF completes");
+        assert_eq!(sse_fields(p.block((s, e))).data, "x");
+    }
+
+    #[test]
+    fn sse_strips_only_one_leading_space_and_skips_comments() {
+        let got = parse_all(&[b": keep-alive\ndata:  {\"a\":1}\n\n"]);
+        assert_eq!(got, vec![" {\"a\":1}"]);
+    }
+
+    #[test]
+    fn sse_multi_line_data_joins_with_newline() {
+        let got = parse_all(&[b"data: {\"a\":\ndata: 1}\n\n"]);
+        assert_eq!(got, vec!["{\"a\":\n1}"]);
+    }
+
+    #[test]
+    fn sse_flushes_trailing_event_without_blank_line() {
+        // B-3: upstream closed without a trailing blank line. The last event
+        // (here the finish chunk) must still be delivered.
+        let mut p = SseParser::new();
+        p.push(b"data: {\"choices\":[]}\n\ndata: {\"finish\":1}");
+        assert!(p.next_block().is_some());
+        assert!(p.next_block().is_none());
+        let r = p.finish().expect("trailing event");
+        assert_eq!(sse_fields(p.block(r)).data, "{\"finish\":1}");
+        // Draining must not repeat the same event.
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn sse_reclaims_consumed_prefix_across_many_events() {
+        // L-7: repeatedly dispatching events must not grow the buffer
+        // without bound, and scanning must not rescan consumed bytes.
+        let mut p = SseParser::new();
+        let mut events = 0;
+        for i in 0..2000 {
+            p.push(format!("data: {{\"i\":{i},\"pad\":\"{}\"}}\n\n", "x".repeat(200)).as_bytes());
+            while let Some(r) = p.next_block() {
+                assert!(!sse_fields(p.block(r)).data.is_empty());
+                events += 1;
+            }
+            // Compaction keeps the live window bounded regardless of how
+            // many events have already gone out.
+            assert!(
+                p.buf.len() < 64 * 1024,
+                "buffer grew to {} after {} events",
+                p.buf.len(),
+                events
+            );
+        }
+        assert_eq!(events, 2000);
+    }
+
+    #[test]
+    fn sse_parser_tolerates_use_after_finish() {
+        // `finish()` resets the cursors; a later `next_block()` used to
+        // underflow `line_start - pos`, which under `panic = "abort"` would
+        // take the whole gateway down.
+        let mut p = SseParser::new();
+        p.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}");
+        while p.next_block().is_some() {}
+        assert!(p.finish().is_some());
+        assert!(p.next_block().is_none());
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn sse_keeps_the_event_name_anthropic_clients_dispatch_on() {
+        // The official Anthropic SDK branches on `sse.event` and silently
+        // drops an event that has none, so the name must survive parsing.
+        let f = sse_fields(b"event: message_delta\ndata: {\"t\":1}");
+        assert_eq!(f.name.as_deref(), Some("message_delta"));
+        assert_eq!(f.data, "{\"t\":1}");
+
+        // Field order is irrelevant to the spec.
+        let f = sse_fields(b"data: {\"t\":1}\nevent: message_stop");
+        assert_eq!(f.name.as_deref(), Some("message_stop"));
+        assert_eq!(f.data, "{\"t\":1}");
+
+        // Chat framing carries no name.
+        assert_eq!(sse_fields(b"data: [DONE]").name, None);
+        // Comments and unknown fields must not be mistaken for the name.
+        assert_eq!(sse_fields(b": ping\nid: 7\ndata: x").name, None);
+        assert_eq!(sse_fields(b": ping\nid: 7\ndata: x").data, "x");
+    }
+
+    #[test]
+    fn null_error_field_is_not_a_stream_error() {
+        // S-5: some OpenAI-compatible servers send `"error": null` on
+        // healthy chunks. Treating that as a failure kills a good stream.
+        assert!(!is_stream_error(
+            &json!({"choices": [{"delta": {}}], "error": null})
+        ));
+        assert!(is_stream_error(&json!({"error": {"message": "boom"}})));
+        assert!(is_stream_error(
+            &json!({"type": "error", "message": "boom"})
+        ));
+        assert!(!is_stream_error(
+            &json!({"type": "response.output_text.delta"})
+        ));
+        // An empty object carries the same intent as `null` only when the
+        // upstream meant it as a placeholder; as a standalone failure it is
+        // the shape some gateways emit, and missing it is the worse error.
+        assert!(is_stream_error(
+            &json!({"choices": [{"delta": {}}], "error": {}})
+        ));
+        assert!(!is_stream_error(&json!({"error": ""})));
+    }
+
+    #[test]
+    fn stream_error_msg_prefers_nested_message() {
+        assert_eq!(
+            stream_error_msg(&json!({"error": {"message": "rate limited"}}), "{}"),
+            "rate limited"
+        );
+        assert_eq!(
+            stream_error_msg(&json!({"response": {"error": {"message": "nope"}}}), "{}"),
+            "nope"
+        );
+        assert_eq!(stream_error_msg(&json!({"message": "flat"}), "{}"), "flat");
+        // Falls back to the raw payload when there is no message field.
+        assert_eq!(stream_error_msg(&json!({"code": "x"}), "raw"), "raw");
+    }
+
+    #[test]
+    fn passthrough_keeps_the_upstream_event_name() {
+        let mut inbound = Inbound::Responses(ResponsesStream::new("m"));
+        let mut egress = Egress::Responses(ChatToResponsesStream::new("m"));
+        let name = Some("m".to_string());
+        let block = b"event: response.output_text.delta\ndata: {\"type\":\"x\"}";
+        let (lines, err) = render_block(classify_block(block, &name, &mut inbound, &mut egress));
+        assert!(err.is_none());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("event: response.output_text.delta\ndata: "),
+            "event name was dropped: {}",
+            lines[0]
+        );
+        // ...and the public model id is still rewritten on the way out.
+        assert!(lines[0].contains("\"model\":\"m\""));
+    }
+
+    #[test]
+    fn passthrough_does_not_synthesize_a_second_terminal_event() {
+        // The gateway never ran a chunk through these state machines on the
+        // native path, so `terminated` is still false. Calling `finish()`
+        // unconditionally appended a duplicate `message_start` /
+        // `response.created` to an already-complete stream.
+        let mut anthropic = Egress::Anthropic(ChatToAnthropicStream::new("m"));
+        assert!(
+            anthropic.finish(true).is_empty(),
+            "anthropic passthrough must defer to the upstream's own terminal event"
+        );
+        let fail = anthropic.fail("boom", true);
+        assert_eq!(fail.len(), 1, "only the error frame, no block bookkeeping");
+        assert!(fail[0].starts_with("event: error\n"));
+
+        let mut responses = Egress::Responses(ChatToResponsesStream::new("m"));
+        assert!(responses.finish(true).is_empty());
+        let fail = responses.fail("boom", true);
+        assert_eq!(fail.len(), 1);
+        assert!(fail[0].contains("\"type\":\"error\""));
+
+        // Chat still needs its `[DONE]`: the upstream's own sentinel is
+        // swallowed by the parser and must be re-emitted.
+        let mut chat = Egress::Chat(ChatReasoningEgress::new(
+            ReasoningOutput::ReasoningContent,
+        ));
+        assert_eq!(chat.finish(true), vec!["data: [DONE]\n\n".to_string()]);
+        assert_eq!(chat.fail("boom", true).len(), 2);
+
+        // The translated path is unchanged and still synthesizes.
+        let mut responses = Egress::Responses(ChatToResponsesStream::new("m"));
+        assert!(!responses.finish(false).is_empty());
+    }
+
+    #[test]
+    fn classify_block_treats_a_failed_chunk_as_a_stream_error() {
+        // The main loop and the end-of-stream flush used to carry separate
+        // copies of this check; both paths must agree.
+        let mut inbound = Inbound::Responses(ResponsesStream::new("m"));
+        let mut egress = Egress::Chat(ChatReasoningEgress::new(
+            ReasoningOutput::ReasoningContent,
+        ));
+        let block =
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}";
+        let (_, err) = render_block(classify_block(block, &None, &mut inbound, &mut egress));
+        assert_eq!(err.as_deref(), Some("upstream response failed"));
+
+        // A healthy event is not an error.
+        let block = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}";
+        let (lines, err) = render_block(classify_block(block, &None, &mut inbound, &mut egress));
+        assert!(err.is_none());
+        assert!(!lines.is_empty());
+    }
+}

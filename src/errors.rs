@@ -200,3 +200,151 @@ pub(crate) fn kind_of(v: &Value) -> &'static str {
         Value::Object(_) => "object",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Assert `body` is a well-formed error for `ingress`, and return the
+    /// message. A body missing that field is exactly the bug: the SDK
+    /// surfaces `undefined` and the user sees nothing useful.
+    fn assert_error_shape(ingress: Ingress, body: &Value) -> String {
+        match ingress {
+            Ingress::Anthropic => assert_eq!(
+                body["type"], "error",
+                "Anthropic clients dispatch on the top-level `type`: {body}"
+            ),
+            _ => assert!(
+                body.get("error").is_some(),
+                "missing `error` object: {body}"
+            ),
+        }
+        assert!(
+            body.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .is_some(),
+            "no readable message for {ingress:?}: {body}"
+        );
+        body.pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn upstream_errors_are_reshaped_for_every_ingress() {
+        // A client must never receive an error in a protocol it does not
+        // speak: an OpenAI-shaped 429 handed to an Anthropic SDK fails to
+        // parse and the user sees `undefined` instead of the rate limit.
+        let upstreams = [
+            // OpenAI / Responses
+            r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
+            // Anthropic
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            // bare string
+            r#"{"error":"nope"}"#,
+            // bare message
+            r#"{"message":"bad request"}"#,
+            // not JSON at all
+            "<html>502 Bad Gateway</html>",
+            // empty
+            "",
+        ];
+        for up in upstreams {
+            for ingress in [Ingress::OpenAiCompatible, Ingress::OpenAi, Ingress::Anthropic, Ingress::Google] {
+                let body = upstream_error_body(ingress, up);
+                let msg = assert_error_shape(ingress, &body);
+                assert!(!msg.is_empty(), "empty message from {up:?} -> {ingress:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_error_keeps_the_status_code_and_extra_fields() {
+        // SDK retry logic keys on the status, and operators debug with the
+        // upstream's own `code` / `param` fields; neither may be flattened.
+        let up = r#"{"error":{"message":"bad","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#;
+        for ingress in [Ingress::OpenAiCompatible, Ingress::OpenAi, Ingress::Anthropic, Ingress::Google] {
+            let resp = upstream_error_response(
+                ingress,
+                UpstreamError::Status(StatusCode::TOO_MANY_REQUESTS, up.to_string()),
+            );
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        let chat = upstream_error_body(Ingress::OpenAiCompatible, up);
+        assert_eq!(chat["error"]["code"], "model_not_found");
+        assert_eq!(chat["error"]["param"], "model");
+        let anth = upstream_error_body(Ingress::Anthropic, up);
+        assert_eq!(anth["error"]["code"], "model_not_found");
+    }
+
+    #[test]
+    fn anthropic_error_class_is_always_a_class_the_sdk_knows() {
+        // The literal "error" is Anthropic's SSE framing marker, not an
+        // error class. An OpenAI class is meaningless to an Anthropic SDK and
+        // makes its retry logic fall through to the generic branch.
+        for (upstream, want) in [
+            (r#"{"type":"error","message":"boom"}"#, "api_error"),
+            (
+                r#"{"error":{"message":"m","type":"rate_limit_exceeded"}}"#,
+                "api_error",
+            ),
+            (r#"{"error":{"message":"m","type":""}}"#, "api_error"),
+            (r#"{"message":"m"}"#, "api_error"),
+            // Real Anthropic classes survive untouched.
+            (
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#,
+                "overloaded_error",
+            ),
+            (
+                r#"{"error":{"message":"m","type":"invalid_request_error"}}"#,
+                "invalid_request_error",
+            ),
+        ] {
+            let out = upstream_error_body(Ingress::Anthropic, upstream);
+            assert_eq!(out["type"], "error", "envelope: {out}");
+            assert_eq!(out["error"]["type"], want, "class from {upstream}");
+        }
+
+        // The upstream's own value is not discarded, only relabelled.
+        let out = upstream_error_body(
+            Ingress::Anthropic,
+            r#"{"error":{"message":"m","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}"#,
+        );
+        assert_eq!(out["error"]["code"], "rate_limit_exceeded");
+    }
+
+    #[test]
+    fn non_json_upstream_error_stays_bounded() {
+        // A proxy's HTML error page must not become a megabyte-long message
+        // in both the log and the response body.
+        let html = format!("<html>{}</html>", "x".repeat(5000));
+        let out = upstream_error_body(Ingress::OpenAiCompatible, &html);
+        let msg = &out["error"]["message"];
+        assert!(msg.as_str().unwrap().starts_with("upstream error: <html>"));
+        assert!(
+            msg.as_str().unwrap().len() < 600,
+            "unbounded: {}",
+            msg.as_str().unwrap().len()
+        );
+
+        // An empty body still produces something a client can read.
+        let out = upstream_error_body(Ingress::OpenAiCompatible, "");
+        assert!(!out["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_object_upstream_body_is_a_502_not_a_panic() {
+        // B-1: `Value` IndexMut panics on arrays/strings/numbers and the
+        // release profile is panic = "abort", so this killed the gateway.
+        for bad in [json!([]), json!("OK"), json!(null), json!(7)] {
+            assert!(!bad.is_object(), "{:?} must not pass the object guard", bad);
+            assert_ne!(kind_of(&bad), "object");
+        }
+        assert_eq!(kind_of(&json!([])), "array");
+        assert_eq!(kind_of(&json!("OK")), "string");
+        assert_eq!(kind_of(&Value::Null), "null");
+        assert_eq!(kind_of(&json!({})), "object");
+    }
+}

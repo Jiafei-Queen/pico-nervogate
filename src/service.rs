@@ -327,3 +327,75 @@ pub(crate) async fn serve_normalized(
 // ---------------------------------------------------------------------------
 // SSE pipeline: upstream -> canonical chat chunks -> client framing
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::sample_config;
+    use axum::response::Response;
+    use serde_json::Value;
+
+    /// Assert `body` is a well-formed error for `ingress`, and return the
+    /// message.
+    fn assert_error_shape(ingress: Ingress, body: &Value) -> String {
+        match ingress {
+            Ingress::Anthropic => assert_eq!(
+                body["type"], "error",
+                "Anthropic clients dispatch on the top-level `type`: {body}"
+            ),
+            _ => assert!(
+                body.get("error").is_some(),
+                "missing `error` object: {body}"
+            ),
+        }
+        body.pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .expect("error body carries a readable message")
+            .to_string()
+    }
+
+    /// Drain a `Response` body into JSON.
+    fn read_body(resp: Response) -> Value {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("read body");
+                serde_json::from_slice(&bytes).expect("body is JSON")
+            })
+    }
+
+    #[test]
+    fn zero_body_limit_means_unlimited() {
+        // `to_bytes(body, 0)` rejects everything; 0 is the config's way of
+        // saying "no limit" and must not reach it as an actual zero.
+        assert_eq!(
+            body_limit(&Config {
+                max_body_bytes: 0,
+                ..sample_config()
+            }),
+            usize::MAX
+        );
+        assert_eq!(
+            body_limit(&Config {
+                max_body_bytes: 4096,
+                ..sample_config()
+            }),
+            4096
+        );
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_in_the_ingress_protocol_shape() {
+        // Axum's own limit produced a plain-text 413 that no SDK can parse;
+        // the client could not tell a size rejection from a proxy error.
+        for ingress in [Ingress::OpenAiCompatible, Ingress::OpenAi, Ingress::Anthropic, Ingress::Google] {
+            let resp = body_too_large(ingress, 1024);
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body: Value = read_body(resp);
+            assert!(assert_error_shape(ingress, &body).contains("1024"));
+        }
+    }
+}

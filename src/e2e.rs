@@ -10,6 +10,20 @@
 //! So these tests drive `app()` end to end: a client request goes in over a
 //! real socket to a real router, which calls a real mock upstream over
 //! another socket, and the response is parsed the way an SDK would parse it.
+//!
+//! Sections, in file order:
+//!
+//! - protocol matrix: every client surface x every upstream protocol,
+//!   non-streaming and streaming;
+//! - same-protocol passthrough: `event:` names kept, one terminal event;
+//! - error paths: upstream 429 / 500 / non-JSON / mid-stream error /
+//!   truncated stream;
+//! - sampling params under thinking (M-6): forwarded, not stripped;
+//! - gateway rejections: unknown model, malformed JSON;
+//! - A. parameter passthrough matrix (`Capture` mock asserts the upstream
+//!   body pointer by pointer);
+//! - B. vision input across ingresses and upstreams;
+//! - C. multi-round tool calls + Google regressions (issues 4/5/6).
 
 use axum::body::Body;
 use axum::extract::State;
