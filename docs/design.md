@@ -44,7 +44,10 @@ Translation details worth knowing:
   `thoughtsTokenCount` → `reasoning_tokens`; tools without a function name
   (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped and
   `additionalProperties` is stripped from tool schemas at every depth —
-  Gemini rejects both with a 400.
+  Gemini rejects both with a 400; thinking-model `thoughtSignature`
+  round-trips as `extra_content.google.thought_signature` on chat tool
+  calls (outbound SSE and non-stream responses attach it, inbound
+  follow-ups send it back — follow-ups without it are rejected).
 - **Responses statefulness**: the gateway is stateless. `previous_response_id`,
   `background`, `store: true` and `item_reference` input items are rejected
   with HTTP 400 — they need server-side response storage and polling endpoints

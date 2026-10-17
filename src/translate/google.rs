@@ -94,6 +94,22 @@ fn get_function_call(p: &Value) -> Option<(&str, Value)> {
     Some((name, args))
 }
 
+/// Thought-signature round-trip for thinking models. Gemini attaches
+/// `thoughtSignature` as a sibling of `functionCall` parts and requires it
+/// back on multi-turn follow-ups; OpenAI-shaped clients (e.g. OpenWebUI)
+/// carry it on the tool call as `extra_content.google.thought_signature`.
+fn part_thought_signature(p: &Value) -> Option<&str> {
+    p.get("thoughtSignature")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn tool_call_thought_signature(tc: &Value) -> Option<&str> {
+    tc.pointer("/extra_content/google/thought_signature")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+}
+
 fn get_function_response(p: &Value) -> Option<(&str, Value)> {
     let r = p
         .get("functionResponse")
@@ -260,9 +276,12 @@ pub fn chat_to_google_request(req: &Value) -> Value {
                                 .unwrap_or("{}");
                             let args: Value =
                                 serde_json::from_str(args).unwrap_or(json!({}));
-                            parts.push(
-                                json!({"functionCall": {"name": name, "args": args}}),
-                            );
+                            let mut part =
+                                json!({"functionCall": {"name": name, "args": args}});
+                            if let Some(sig) = tool_call_thought_signature(tc) {
+                                part["thoughtSignature"] = json!(sig);
+                            }
+                            parts.push(part);
                         }
                     }
                     if !parts.is_empty() {
@@ -629,10 +648,14 @@ pub fn google_to_chat(resp: &Value, model: &str) -> Value {
                 _ => serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
             };
             let call_id = crate::translate::gen_id("call_");
-            tool_calls.push(json!({
+            let mut call = json!({
                 "id": call_id, "type": "function",
                 "function": {"name": name, "arguments": args_str}
-            }));
+            });
+            if let Some(sig) = part_thought_signature(&p) {
+                call["extra_content"] = json!({"google": {"thought_signature": sig}});
+            }
+            tool_calls.push(call);
         } else if get_function_response(&p).is_some() {
             // Echoed function results are conversation history, not output.
         } else if is_thought_part(&p) {
@@ -1022,7 +1045,11 @@ pub fn chat_to_google_response(chat: &Value, model: &str) -> Value {
                 .and_then(|x| x.as_str())
                 .unwrap_or("{}");
             let args: Value = serde_json::from_str(args).unwrap_or(json!({}));
-            parts.push(json!({"functionCall": {"name": name, "args": args}}));
+            let mut part = json!({"functionCall": {"name": name, "args": args}});
+            if let Some(sig) = tool_call_thought_signature(tc) {
+                part["thoughtSignature"] = json!(sig);
+            }
+            parts.push(part);
         }
     }
     if parts.is_empty() {
@@ -1122,12 +1149,17 @@ impl GoogleStream {
                 };
                 let idx = self.tool_index;
                 self.tool_index += 1;
+                let mut call = json!({"index": idx, "id": crate::translate::gen_id("call_"),
+                    "type": "function", "function": {"name": name, "arguments": ""}});
+                if let Some(sig) = part_thought_signature(&p) {
+                    call["extra_content"] =
+                        json!({"google": {"thought_signature": sig}});
+                }
                 out.push(json!({
                     "id": self.id, "object": "chat.completion.chunk",
                     "created": crate::translate::now_ts(), "model": self.model,
                     "choices": [{"index": 0,
-                        "delta": {"tool_calls": [{"index": idx, "id": crate::translate::gen_id("call_"),
-                            "type": "function", "function": {"name": name, "arguments": ""}}]},
+                        "delta": {"tool_calls": [call]},
                         "finish_reason": Value::Null}]
                 }));
                 // Args arrive complete (object), so emit as one delta.
@@ -1586,6 +1618,74 @@ mod tests {
         assert!(
             !chat_to_google_loss(&clean)
                 .contains(&"tool additionalProperties stripped (unsupported by Google)")
+        );
+    }
+
+    #[test]
+    fn thought_signature_round_trips_for_tool_calls() {
+        // Thinking models attach thoughtSignature as a sibling of
+        // functionCall parts and require it back on follow-ups.
+        let resp = json!({"candidates": [{
+            "content": {"role": "model", "parts": [
+                {"thoughtSignature": "sig123",
+                 "functionCall": {"name": "f", "args": {"x": 1}}}
+            ]},
+            "finishReason": "STOP", "index": 0
+        }]});
+
+        // Outbound non-stream: signature rides extra_content.
+        let out = google_to_chat(&resp, "m");
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["extra_content"],
+            json!({"google": {"thought_signature": "sig123"}})
+        );
+
+        // Outbound SSE: same contract on the tool-call delta.
+        let mut inbound = GoogleStream::new("m");
+        let chunks = inbound.handle(&resp);
+        let delta = chunks
+            .iter()
+            .find(|c| c.pointer("/choices/0/delta/tool_calls").is_some())
+            .unwrap();
+        assert_eq!(
+            delta.pointer("/choices/0/delta/tool_calls/0/extra_content"),
+            Some(&json!({"google": {"thought_signature": "sig123"}}))
+        );
+
+        // Inbound: extra_content becomes the sibling thoughtSignature.
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "{}"},
+                     "extra_content": {"google": {"thought_signature": "sig123"}}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+            ]
+        });
+        let out = chat_to_google_request(&req);
+        let parts = out["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["functionCall"]["name"], json!("f"));
+        assert_eq!(parts[0]["thoughtSignature"], json!("sig123"));
+
+        // Absent signature stays absent (no empty field sent upstream).
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "{}"}}
+                ]}
+            ]
+        });
+        let out = chat_to_google_request(&req);
+        assert!(
+            out["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
         );
     }
 
