@@ -175,33 +175,70 @@ fn tool_output_to_response_object(text: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Google's function-declaration schemas are a restricted subset: unknown
-/// keywords such as `additionalProperties` are rejected with a 400.
-/// Strip that key at every depth of a parameter schema in place.
-fn strip_additional_properties(schema: &mut Value) {
+/// keywords are rejected with a 400 (streaming answers with an empty body,
+/// so the client learns nothing). Strip the rejected keys at every depth of
+/// a parameter schema. The list below is the set the upstream itself reports
+/// as `Unknown name ... Cannot find field` (verified 2026-10-18 against
+/// `gemini-4-argon-contributor`, non-streaming error text).
+const UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
+    "additionalProperties",
+    "$schema",
+    "$id",
+    "$defs",
+    "$anchor",
+    "$comment",
+    "$dynamicRef",
+    "$recursiveRef",
+    "definitions",
+    "$ref",
+    "strict",
+    "examples",
+    "const",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "uniqueItems",
+    "readOnly",
+    "writeOnly",
+    "contentMediaType",
+    "contentEncoding",
+    "prefixItems",
+    "contains",
+    "propertyNames",
+    "unevaluatedProperties",
+    "if",
+    "then",
+    "else",
+    "dependentRequired",
+];
+
+fn sanitize_google_schema(schema: &mut Value) {
     match schema {
         Value::Object(map) => {
-            map.remove("additionalProperties");
+            for k in UNSUPPORTED_SCHEMA_KEYS {
+                map.remove(*k);
+            }
             for v in map.values_mut() {
-                strip_additional_properties(v);
+                sanitize_google_schema(v);
             }
         }
         Value::Array(items) => {
             for v in items {
-                strip_additional_properties(v);
+                sanitize_google_schema(v);
             }
         }
         _ => {}
     }
 }
 
-/// True when a parameter schema contains `additionalProperties` anywhere.
-fn has_additional_properties(schema: &Value) -> bool {
+/// True when a parameter schema contains a key Gemini rejects.
+fn has_unsupported_schema_keys(schema: &Value) -> bool {
     match schema {
         Value::Object(map) => {
-            map.contains_key("additionalProperties")
-                || map.values().any(has_additional_properties)
+            UNSUPPORTED_SCHEMA_KEYS.iter().any(|k| map.contains_key(*k))
+                || map.values().any(has_unsupported_schema_keys)
         }
-        Value::Array(items) => items.iter().any(has_additional_properties),
+        Value::Array(items) => items.iter().any(has_unsupported_schema_keys),
         _ => false,
     }
 }
@@ -311,7 +348,7 @@ pub fn chat_to_google_request(req: &Value) -> Value {
     // `{"type": "code_interpreter"}`, which has no Google equivalent) are
     // dropped: Gemini rejects empty declaration names with a 400.
     // Parameter schemas are sanitized for Google's restricted subset
-    // (`additionalProperties` is rejected with a 400).
+    // (unknown keys are rejected with a 400, empty on streaming).
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let decls: Vec<Value> = tools
             .iter()
@@ -324,7 +361,7 @@ pub fn chat_to_google_request(req: &Value) -> Value {
                     .pointer("/function/parameters")
                     .cloned()
                     .unwrap_or(json!({"type":"object"}));
-                strip_additional_properties(&mut parameters);
+                sanitize_google_schema(&mut parameters);
                 Some(json!({
                     "name": name,
                     "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
@@ -563,18 +600,18 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
     {
         out.push("nameless tools (dropped: not function tools)");
     }
-    // `additionalProperties` is stripped from tool schemas (see above).
+    // Unsupported schema keys are stripped from tool schemas (see above).
     if req
         .get("tools")
         .and_then(|t| t.as_array())
         .is_some_and(|ts| {
             ts.iter().any(|t| {
                 t.pointer("/function/parameters")
-                    .is_some_and(has_additional_properties)
+                    .is_some_and(has_unsupported_schema_keys)
             })
         })
     {
-        out.push("tool additionalProperties stripped (unsupported by Google)");
+        out.push("tool schema keys stripped (unsupported by Google)");
     }
     out
 }
@@ -1595,10 +1632,10 @@ mod tests {
             params["properties"]["items"]["items"],
             json!({"type": "object"})
         );
-        assert!(!has_additional_properties(params));
+        assert!(!has_unsupported_schema_keys(params));
         assert!(
             chat_to_google_loss(&req)
-                .contains(&"tool additionalProperties stripped (unsupported by Google)")
+                .contains(&"tool schema keys stripped (unsupported by Google)")
         );
 
         // Schemas without it are untouched and report no loss.
@@ -1617,8 +1654,35 @@ mod tests {
         );
         assert!(
             !chat_to_google_loss(&clean)
-                .contains(&"tool additionalProperties stripped (unsupported by Google)")
+                .contains(&"tool schema keys stripped (unsupported by Google)")
         );
+    }
+
+    #[test]
+    fn unsupported_schema_keys_stripped_from_tool_schemas() {
+        // `$schema` / `strict` / `examples` / `const` fail Gemini the same
+        // way `additionalProperties` does (400, empty body on streaming),
+        // so they must go too.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "t",
+                "description": "t",
+                "parameters": {"type": "object", "$schema": "http://json-schema.org/draft-07/schema#",
+                    "strict": true, "examples": ["x"],
+                    "properties": {"a": {"type": "string", "$id": "x", "const": "c",
+                        "exclusiveMinimum": 0, "readOnly": true}}}
+            }}]
+        });
+        let out = chat_to_google_request(&req);
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        let s = serde_json::to_string(params).unwrap_or_default();
+        for bad in ["$schema", "strict", "examples", "$id", "const", "exclusiveMinimum", "readOnly"] {
+            assert!(!s.contains(bad), "missed {bad}: {s}");
+        }
+        assert!(!has_unsupported_schema_keys(params));
+        assert_eq!(params["properties"]["a"], json!({"type": "string"}));
     }
 
     #[test]

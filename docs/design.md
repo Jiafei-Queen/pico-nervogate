@@ -43,8 +43,9 @@ Translation details worth knowing:
   turn; `usageMetadata` maps onto the canonical usage including
   `thoughtsTokenCount` → `reasoning_tokens`; tools without a function name
   (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped and
-  `additionalProperties` is stripped from tool schemas at every depth —
-  Gemini rejects both with a 400; thinking-model `thoughtSignature`
+  `additionalProperties`, `$schema`, `$id`, `$defs`, `$ref` and `strict`
+  are stripped from tool schemas at every depth —
+  Gemini rejects them with a 400 (empty body on streaming); thinking-model `thoughtSignature`
   round-trips as `extra_content.google.thought_signature` on chat tool
   calls (outbound SSE and non-stream responses attach it, inbound
   follow-ups send it back — follow-ups without it are rejected).

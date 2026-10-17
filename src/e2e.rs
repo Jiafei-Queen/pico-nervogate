@@ -467,14 +467,46 @@ fn completion(protocol: Protocol, text: &str) -> Value {
 // StrictGoogle + Scripted helpers (A/B/C harness)
 // ---------------------------------------------------------------------------
 
-/// Recursively true when any object key is `additionalProperties`.
-fn contains_additional_properties(v: &Value) -> bool {
+/// Recursively true when any object key is one Gemini rejects
+/// (`additionalProperties`, `$schema`, `examples`, `const`, ...).
+fn contains_unsupported_schema_keys(v: &Value) -> bool {
+    const BAD: &[&str] = &[
+        "additionalProperties",
+        "$schema",
+        "$id",
+        "$defs",
+        "$anchor",
+        "$comment",
+        "$dynamicRef",
+        "$recursiveRef",
+        "definitions",
+        "$ref",
+        "strict",
+        "examples",
+        "const",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "uniqueItems",
+        "readOnly",
+        "writeOnly",
+        "contentMediaType",
+        "contentEncoding",
+        "prefixItems",
+        "contains",
+        "propertyNames",
+        "unevaluatedProperties",
+        "if",
+        "then",
+        "else",
+        "dependentRequired",
+    ];
     match v {
         Value::Object(m) => {
-            m.contains_key("additionalProperties")
-                || m.values().any(contains_additional_properties)
+            BAD.iter().any(|k| m.contains_key(*k))
+                || m.values().any(contains_unsupported_schema_keys)
         }
-        Value::Array(a) => a.iter().any(contains_additional_properties),
+        Value::Array(a) => a.iter().any(contains_unsupported_schema_keys),
         _ => false,
     }
 }
@@ -520,8 +552,8 @@ fn strict_google_rejection(req: &Value, wants_stream: bool) -> Option<Response> 
     if names.iter().any(|n| n.as_deref().is_none_or(str::is_empty)) {
         return Some(empty_400());
     }
-    // `additionalProperties` anywhere is rejected the same way.
-    if contains_additional_properties(req) {
+    // Unsupported schema keys anywhere are rejected the same way.
+    if contains_unsupported_schema_keys(req) {
         return Some(empty_400());
     }
     // A follow-up turn (it carries a `functionResponse`) must replay the

@@ -38,7 +38,7 @@ pub(crate) fn upstream_error_response(ingress: Ingress, e: UpstreamError) -> Res
     match e {
         UpstreamError::Message(msg) => ingress_error(ingress, StatusCode::BAD_GATEWAY, &msg),
         UpstreamError::Status(status, body) => {
-            json_response(status, upstream_error_body(ingress, &body))
+            json_response(status, upstream_error_body(ingress, status, &body))
         }
     }
 }
@@ -67,7 +67,7 @@ pub(crate) const ANTHROPIC_ERROR_CLASSES: &[&str] = &[
 ///
 /// - OpenAI (Chat, Responses and Google share it): `{"error": {...}}`
 /// - Anthropic: `{"type": "error", "error": {...}}`
-pub(crate) fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
+pub(crate) fn upstream_error_body(ingress: Ingress, status: StatusCode, body: &str) -> Value {
     let inner = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| match v.get("error") {
@@ -76,7 +76,7 @@ pub(crate) fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
         })
         .unwrap_or_else(|| {
             json!({
-                "message": upstream_error_message(body),
+                "message": upstream_error_message(status, body),
                 "type": "upstream_error",
             })
         });
@@ -85,7 +85,7 @@ pub(crate) fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
         Ingress::Anthropic => {
             let mut o = inner.as_object().cloned().unwrap_or_default();
             o.entry("message")
-                .or_insert_with(|| json!(upstream_error_message(body)));
+                .or_insert_with(|| json!(upstream_error_message(status, body)));
             // Anthropic puts the error *class* inside `error`, and its
             // clients branch on it. Only real Anthropic classes may pass
             // through: the literal "error" is the SSE framing marker, and an
@@ -103,21 +103,21 @@ pub(crate) fn upstream_error_body(ingress: Ingress, body: &str) -> Value {
         _ => {
             let mut o = inner.as_object().cloned().unwrap_or_default();
             o.entry("message")
-                .or_insert_with(|| json!(upstream_error_message(body)));
+                .or_insert_with(|| json!(upstream_error_message(status, body)));
             json!({"error": Value::Object(o)})
         }
     }
 }
 
 /// Best-effort `message` out of an upstream error body of any protocol.
-pub(crate) fn upstream_error_message(body: &str) -> String {
+pub(crate) fn upstream_error_message(status: StatusCode, body: &str) -> String {
     let text = body.trim();
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         // Not JSON at all: an HTML error page or a proxy banner. The raw
         // text is still the most useful thing we have, bounded so a stray
         // megabyte of markup cannot end up in a log line or a response.
-        Err(_) => return fallback_error_message(text),
+        Err(_) => return fallback_error_message(status, text),
     };
     // `{"error": "rate limited"}` — some gateways send a bare string.
     if let Some(s) = v.get("error").and_then(|x| x.as_str()) {
@@ -129,12 +129,12 @@ pub(crate) fn upstream_error_message(body: &str) -> String {
         .or_else(|| v.get("detail"))
         .and_then(|x| x.as_str())
         .filter(|s| !s.trim().is_empty())
-        .map_or_else(|| fallback_error_message(text), |s| s.to_string())
+        .map_or_else(|| fallback_error_message(status, text), |s| s.to_string())
 }
 
-pub(crate) fn fallback_error_message(text: &str) -> String {
+pub(crate) fn fallback_error_message(status: StatusCode, text: &str) -> String {
     if text.is_empty() {
-        "upstream returned an empty error body".to_string()
+        format!("upstream returned status {} with an empty error body", status.as_u16())
     } else {
         format!("upstream error: {}", trunc(text, 500))
     }
@@ -253,7 +253,7 @@ mod tests {
         ];
         for up in upstreams {
             for ingress in [Ingress::OpenAiCompatible, Ingress::OpenAi, Ingress::Anthropic, Ingress::Google] {
-                let body = upstream_error_body(ingress, up);
+                let body = upstream_error_body(ingress, StatusCode::BAD_GATEWAY, up);
                 let msg = assert_error_shape(ingress, &body);
                 assert!(!msg.is_empty(), "empty message from {up:?} -> {ingress:?}");
             }
@@ -272,10 +272,10 @@ mod tests {
             );
             assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         }
-        let chat = upstream_error_body(Ingress::OpenAiCompatible, up);
+        let chat = upstream_error_body(Ingress::OpenAiCompatible, StatusCode::TOO_MANY_REQUESTS, up);
         assert_eq!(chat["error"]["code"], "model_not_found");
         assert_eq!(chat["error"]["param"], "model");
-        let anth = upstream_error_body(Ingress::Anthropic, up);
+        let anth = upstream_error_body(Ingress::Anthropic, StatusCode::TOO_MANY_REQUESTS, up);
         assert_eq!(anth["error"]["code"], "model_not_found");
     }
 
@@ -302,7 +302,7 @@ mod tests {
                 "invalid_request_error",
             ),
         ] {
-            let out = upstream_error_body(Ingress::Anthropic, upstream);
+            let out = upstream_error_body(Ingress::Anthropic, StatusCode::BAD_GATEWAY, upstream);
             assert_eq!(out["type"], "error", "envelope: {out}");
             assert_eq!(out["error"]["type"], want, "class from {upstream}");
         }
@@ -310,6 +310,7 @@ mod tests {
         // The upstream's own value is not discarded, only relabelled.
         let out = upstream_error_body(
             Ingress::Anthropic,
+            StatusCode::BAD_GATEWAY,
             r#"{"error":{"message":"m","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}"#,
         );
         assert_eq!(out["error"]["code"], "rate_limit_exceeded");
@@ -320,7 +321,7 @@ mod tests {
         // A proxy's HTML error page must not become a megabyte-long message
         // in both the log and the response body.
         let html = format!("<html>{}</html>", "x".repeat(5000));
-        let out = upstream_error_body(Ingress::OpenAiCompatible, &html);
+        let out = upstream_error_body(Ingress::OpenAiCompatible, StatusCode::BAD_GATEWAY, &html);
         let msg = &out["error"]["message"];
         assert!(msg.as_str().unwrap().starts_with("upstream error: <html>"));
         assert!(
@@ -330,8 +331,14 @@ mod tests {
         );
 
         // An empty body still produces something a client can read.
-        let out = upstream_error_body(Ingress::OpenAiCompatible, "");
+        let out = upstream_error_body(Ingress::OpenAiCompatible, StatusCode::BAD_REQUEST, "");
         assert!(!out["error"]["message"].as_str().unwrap().is_empty());
+        // The empty case carries the status so operators can tell it apart.
+        assert!(
+            out["error"]["message"].as_str().unwrap().contains("400"),
+            "empty body lost the status: {}",
+            out["error"]["message"]
+        );
     }
 
     #[test]
