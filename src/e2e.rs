@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 use crate::config::{ModelCfg, Protocol};
 use crate::{app, sse::parse_sse, state::{test_state, St}};
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 type Bytes = axum::body::Bytes;
 
 const ANSWER: &str = "hello there world";
@@ -80,6 +83,30 @@ enum Upstream {
     /// upstream — the response alone cannot show a parameter the gateway
     /// silently stripped.
     Requires(Protocol, Vec<&'static str>),
+    /// Record the full upstream body for pointer-level assertions, then
+    /// answer 200 in `proto`'s shape. Unlike `Requires` (top-level presence
+    /// only), tests inspect `seen` afterwards for nested fields such as
+    /// `generationConfig.thinkingConfig.thinkingBudget`.
+    Capture {
+        proto: Protocol,
+        seen: Arc<Mutex<Value>>,
+    },
+    /// Mimic Gemini's strict rejections with empty-body 400s:
+    /// - a `functionDeclaration` without a name,
+    /// - `additionalProperties` at any depth,
+    /// - a follow-up turn carrying `functionResponse` whose sibling
+    ///   `functionCall` lost its `thoughtSignature`.
+    /// Streaming failures use an empty body (what Gemini actually sends);
+    /// non-streaming carries a JSON error so the gateway has a message.
+    StrictGoogle,
+    /// Return queued raw upstream bodies in order, recording each inbound
+    /// request. Powers multi-round tool tests: first pop is the tool_call,
+    /// second pop the final answer. Empty queue falls back to `ANSWER`.
+    Scripted {
+        proto: Protocol,
+        queue: Arc<Mutex<VecDeque<Value>>>,
+        seen: Arc<Mutex<Vec<Value>>>,
+    },
 }
 
 /// A mock upstream listening on an ephemeral port.
@@ -163,6 +190,38 @@ fn respond(kind: &Upstream, req: &Value, stream_override: Option<bool>) -> Respo
                 sse(&stream_frames(*p, ANSWER))
             } else {
                 json(StatusCode::OK, &completion(*p, ANSWER))
+            }
+        }
+        Upstream::Capture { proto, seen } => {
+            *seen.lock().unwrap() = req.clone();
+            if wants_stream {
+                sse(&stream_frames(*proto, ANSWER))
+            } else {
+                json(StatusCode::OK, &completion(*proto, ANSWER))
+            }
+        }
+        Upstream::StrictGoogle => {
+            if let Some(msg) = strict_google_rejection(req, wants_stream) {
+                return msg;
+            }
+            if wants_stream {
+                sse(&stream_frames(Protocol::Google, ANSWER))
+            } else {
+                json(StatusCode::OK, &completion(Protocol::Google, ANSWER))
+            }
+        }
+        Upstream::Scripted { proto, queue, seen } => {
+            seen.lock().unwrap().push(req.clone());
+            let next = queue.lock().unwrap().pop_front();
+            match next {
+                Some(v) => json(StatusCode::OK, &v),
+                None => {
+                    if wants_stream {
+                        sse(&stream_frames(*proto, ANSWER))
+                    } else {
+                        json(StatusCode::OK, &completion(*proto, ANSWER))
+                    }
+                }
             }
         }
         Upstream::Truncated(p) => {
@@ -388,6 +447,168 @@ fn completion(protocol: Protocol, text: &str) -> Value {
                 "totalTokenCount": 5}
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// StrictGoogle + Scripted helpers (A/B/C harness)
+// ---------------------------------------------------------------------------
+
+/// Recursively true when any object key is `additionalProperties`.
+fn contains_additional_properties(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => {
+            m.contains_key("additionalProperties")
+                || m.values().any(contains_additional_properties)
+        }
+        Value::Array(a) => a.iter().any(contains_additional_properties),
+        _ => false,
+    }
+}
+
+/// Collect every `functionDeclaration` name; `None` marks a missing/empty one.
+fn google_decl_names(req: &Value) -> Vec<Option<String>> {
+    let mut out = vec![];
+    if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
+        for t in tools {
+            if let Some(decls) = t
+                .get("functionDeclarations")
+                .and_then(|d| d.as_array())
+            {
+                for d in decls {
+                    out.push(
+                        d.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+fn google_parts(req: &Value) -> Vec<Value> {
+    let mut parts = vec![];
+    if let Some(contents) = req.get("contents").and_then(|c| c.as_array()) {
+        for c in contents {
+            if let Some(ps) = c.get("parts").and_then(|p| p.as_array()) {
+                parts.extend(ps.iter().cloned());
+            }
+        }
+    }
+    parts
+}
+
+/// Gemini-strict rejection, or `None` when the request would get a 200.
+fn strict_google_rejection(req: &Value, wants_stream: bool) -> Option<Response> {
+    // Empty-name declarations are rejected with an empty-body 400.
+    let names = google_decl_names(req);
+    if names.iter().any(|n| n.as_deref().is_none_or(str::is_empty)) {
+        return Some(empty_400());
+    }
+    // `additionalProperties` anywhere is rejected the same way.
+    if contains_additional_properties(req) {
+        return Some(empty_400());
+    }
+    // A follow-up turn (it carries a `functionResponse`) must replay the
+    // `thoughtSignature` next to every `functionCall`. A missing sibling
+    // is a 400; streaming carries an empty body, like the real endpoint.
+    let parts = google_parts(req);
+    let has_response = parts.iter().any(|p| p.get("functionResponse").is_some());
+    if has_response {
+        let missing_sig = parts.iter().any(|p| {
+            p.get("functionCall").is_some()
+                && p.get("thoughtSignature").and_then(|s| s.as_str()).is_none_or(str::is_empty)
+        });
+        if missing_sig {
+            if wants_stream {
+                return Some(empty_400());
+            }
+            return Some(json(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": {"message": "Function call is missing a thought_signature", "code": 400}}),
+            ));
+        }
+    }
+    None
+}
+
+fn empty_400() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(vec![]))
+        .unwrap()
+}
+
+/// Upstream tool-call responses, one per wire protocol.
+fn tool_completion(protocol: Protocol, name: &str, args: &Value) -> Value {
+    let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+    match protocol {
+        Protocol::OpenAiCompatible => json!({
+            "id": "chatcmpl-tool", "object": "chat.completion", "created": 1,
+            "model": "mock",
+            "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": Value::Null,
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                        "function": {"name": name, "arguments": args_str}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }),
+        Protocol::Anthropic => json!({
+            "id": "msg_tool", "type": "message", "role": "assistant", "model": "mock",
+            "content": [{"type": "tool_use", "id": "tu_1", "name": name, "input": args}],
+            "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        }),
+        Protocol::OpenAi => json!({
+            "id": "resp_tool", "object": "response", "created_at": 1, "model": "mock",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                 "name": name, "arguments": args_str, "status": "completed"}
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        }),
+        Protocol::Google => json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {"name": name, "args": args}}
+                ]},
+                "finishReason": "STOP", "index": 0
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+        }),
+    }
+}
+
+/// Google tool-call response carrying a `thoughtSignature` sibling.
+fn google_tool_with_signature(name: &str, args: &Value, sig: &str) -> Value {
+    json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [
+                {"functionCall": {"name": name, "args": args},
+                 "thoughtSignature": sig}
+            ]},
+            "finishReason": "STOP", "index": 0
+        }],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+    })
+}
+
+fn new_capture(proto: Protocol) -> (Upstream, Arc<Mutex<Value>>) {
+    let seen = Arc::new(Mutex::new(Value::Null));
+    (Upstream::Capture { proto, seen: Arc::clone(&seen) }, seen)
+}
+
+fn new_scripted(proto: Protocol, steps: Vec<Value>) -> (Upstream, Arc<Mutex<Vec<Value>>>) {
+    let queue = Arc::new(Mutex::new(VecDeque::from(steps)));
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    (
+        Upstream::Scripted { proto, queue: Arc::clone(&queue), seen: Arc::clone(&seen) },
+        seen,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,4 +1325,701 @@ async fn malformed_json_is_a_400_not_a_panic() {
         let v = parse_json(path, &text(resp).await);
         assert!(v.pointer("/error/message").is_some(), "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A. Parameter passthrough matrix
+// ---------------------------------------------------------------------------
+
+/// Assert a JSON pointer in the captured upstream body.
+fn assert_ptr(seen: &Value, ptr: &str, expected: &Value, ctx: &str) {
+    let got = seen.pointer(ptr);
+    assert_eq!(
+        got,
+        Some(expected),
+        "{ctx}: upstream pointer {ptr} mismatch: seen={seen}"
+    );
+}
+
+/// POST `body` to `path` through a `Capture` mock and return the seen body.
+async fn captured_post(proto: Protocol, path: &str, body: &Value) -> (Response, Value) {
+    let (kind, seen) = new_capture(proto);
+    let mock = Mock::start(kind).await;
+    let resp = post(app(mock.state_with(proto)), path, body).await;
+    let v = seen.lock().unwrap().clone();
+    (resp, v)
+}
+
+#[tokio::test]
+async fn reasoning_effort_reaches_every_translated_upstream() {
+    for stream in [false, true] {
+        // Anthropic: adaptive thinking + effort in output_config.
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["reasoning_effort"] = json!("high");
+        let (resp, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(&seen, "/thinking/type", &json!("adaptive"), "anthropic");
+        assert_ptr(&seen, "/output_config/effort", &json!("high"), "anthropic");
+
+        // Responses: reasoning.effort.
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["reasoning_effort"] = json!("high");
+        let (resp, seen) =
+            captured_post(Protocol::OpenAi, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(&seen, "/reasoning/effort", &json!("high"), "responses");
+
+        // Google: thinking budget 16384 + includeThoughts.
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["reasoning_effort"] = json!("high");
+        let (resp, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(
+            &seen,
+            "/generationConfig/thinkingConfig/thinkingBudget",
+            &json!(16384),
+            "google",
+        );
+        assert_ptr(
+            &seen,
+            "/generationConfig/thinkingConfig/includeThoughts",
+            &json!(true),
+            "google",
+        );
+
+        // `none` disables thinking everywhere: no thinking keys upstream.
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["reasoning_effort"] = json!("none");
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert!(seen.get("thinking").is_none(), "anthropic none: {seen}");
+        let (_, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert!(
+            seen.pointer("/generationConfig/thinkingConfig").is_none(),
+            "google none: {seen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_format_reaches_every_translated_upstream() {
+    let schema = json!({"type": "object", "properties": {"n": {"type": "string"}}});
+    for stream in [false, true] {
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["response_format"] = json!({"type": "json_schema",
+            "json_schema": {"name": "person", "schema": schema}});
+        let (resp, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(
+            &seen,
+            "/output_config/format/type",
+            &json!("json_schema"),
+            "anthropic",
+        );
+        assert_ptr(
+            &seen,
+            "/output_config/format/schema/properties/n/type",
+            &json!("string"),
+            "anthropic",
+        );
+
+        let (resp, seen) =
+            captured_post(Protocol::OpenAi, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(&seen, "/text/format/type", &json!("json_schema"), "responses");
+        assert_ptr(
+            &seen,
+            "/text/format/schema/properties/n/type",
+            &json!("string"),
+            "responses",
+        );
+
+        let (resp, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ptr(
+            &seen,
+            "/generationConfig/responseMimeType",
+            &json!("application/json"),
+            "google",
+        );
+        // Gemini uppercases schema types.
+        assert_ptr(
+            &seen,
+            "/generationConfig/responseSchema/type",
+            &json!("OBJECT"),
+            "google",
+        );
+
+        // `json_object` downgrades to an unconstrained object schema.
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["response_format"] = json!({"type": "json_object"});
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_ptr(
+            &seen,
+            "/output_config/format/schema",
+            &json!({"type": "object"}),
+            "anthropic json_object",
+        );
+    }
+}
+
+#[tokio::test]
+async fn temperature_and_top_p_are_forwarded_verbatim() {
+    for proto in [Protocol::Anthropic, Protocol::OpenAi, Protocol::Google] {
+        for stream in [false, true] {
+            let mut body = client_body("/v1/chat/completions", stream);
+            body["temperature"] = json!(0.2);
+            body["top_p"] = json!(0.9);
+            let (resp, seen) =
+                captured_post(proto, "/v1/chat/completions", &body).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{proto:?} stream={stream}");
+            let (tptr, pptr) = match proto {
+                Protocol::Google => ("/generationConfig/temperature", "/generationConfig/topP"),
+                _ => ("/temperature", "/top_p"),
+            };
+            assert_ptr(&seen, tptr, &json!(0.2), &format!("{proto:?}"));
+            assert_ptr(&seen, pptr, &json!(0.9), &format!("{proto:?}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn tools_and_tool_choice_reach_every_translated_upstream() {
+    fn tool_body(stream: bool) -> Value {
+        let mut b = client_body("/v1/chat/completions", stream);
+        b["tools"] = json!([{"type": "function", "function": {
+            "name": "get_weather", "description": "weather",
+            "parameters": {"type": "object",
+                "properties": {"city": {"type": "string"}}}} }]);
+        b
+    }
+    for stream in [false, true] {
+        // `auto`.
+        let mut body = tool_body(stream);
+        body["tool_choice"] = json!("auto");
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_ptr(&seen, "/tools/0/name", &json!("get_weather"), "anthropic tools");
+        assert_ptr(&seen, "/tool_choice/type", &json!("auto"), "anthropic choice");
+        let (_, seen) =
+            captured_post(Protocol::OpenAi, "/v1/chat/completions", &body).await;
+        assert_ptr(&seen, "/tools/0/name", &json!("get_weather"), "responses tools");
+        assert_ptr(&seen, "/tool_choice", &json!("auto"), "responses choice");
+        let (_, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert_ptr(
+            &seen,
+            "/tools/0/functionDeclarations/0/name",
+            &json!("get_weather"),
+            "google tools",
+        );
+        assert_ptr(
+            &seen,
+            "/toolConfig/functionCallingConfig/mode",
+            &json!("AUTO"),
+            "google choice",
+        );
+
+        // Named choice.
+        let mut body = tool_body(stream);
+        body["tool_choice"] =
+            json!({"type": "function", "function": {"name": "get_weather"}});
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_ptr(&seen, "/tool_choice/name", &json!("get_weather"), "anthropic named");
+        let (_, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert_ptr(
+            &seen,
+            "/toolConfig/functionCallingConfig/mode",
+            &json!("ANY"),
+            "google named mode",
+        );
+        assert_ptr(
+            &seen,
+            "/toolConfig/functionCallingConfig/allowedFunctionNames/0",
+            &json!("get_weather"),
+            "google named fn",
+        );
+
+        // `none` removes tools upstream.
+        let mut body = tool_body(stream);
+        body["tool_choice"] = json!("none");
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert!(seen.get("tools").is_none(), "anthropic none keeps tools: {seen}");
+    }
+}
+
+#[tokio::test]
+async fn max_tokens_maps_to_each_upstream_limit_field() {
+    for stream in [false, true] {
+        let mut body = client_body("/v1/chat/completions", stream);
+        body["max_tokens"] = json!(55);
+        let (_, seen) =
+            captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+        assert_ptr(&seen, "/max_tokens", &json!(55), "anthropic");
+        let (_, seen) =
+            captured_post(Protocol::OpenAi, "/v1/chat/completions", &body).await;
+        assert_ptr(&seen, "/max_output_tokens", &json!(55), "responses");
+        let (_, seen) =
+            captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+        assert_ptr(
+            &seen,
+            "/generationConfig/maxOutputTokens",
+            &json!(55),
+            "google",
+        );
+    }
+    // Anthropic requires the field: omitted client value falls back to 8192.
+    let body = client_body("/v1/chat/completions", false);
+    let (_, seen) =
+        captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+    assert_ptr(&seen, "/max_tokens", &json!(8192), "anthropic default");
+}
+
+#[tokio::test]
+async fn three_ingress_shapes_converge_on_one_upstream_shape() {
+    // Responses `reasoning.effort` + `max_output_tokens` -> Anthropic thinking.
+    let mut body = client_body("/v1/responses", false);
+    body["reasoning"] = json!({"effort": "high"});
+    body["max_output_tokens"] = json!(77);
+    let (_, seen) =
+        captured_post(Protocol::Anthropic, "/v1/responses", &body).await;
+    assert_ptr(&seen, "/thinking/type", &json!("adaptive"), "resp->anthropic");
+    assert_ptr(&seen, "/output_config/effort", &json!("high"), "resp->anthropic");
+    assert_ptr(&seen, "/max_tokens", &json!(77), "resp->anthropic");
+
+    // Anthropic `thinking` + `output_config.effort` -> Google budget.
+    let mut body = client_body("/v1/messages", false);
+    body["thinking"] = json!({"type": "adaptive"});
+    body["output_config"] = json!({"effort": "low"});
+    let (_, seen) =
+        captured_post(Protocol::Google, "/v1/messages", &body).await;
+    assert_ptr(
+        &seen,
+        "/generationConfig/thinkingConfig/thinkingBudget",
+        &json!(4096),
+        "anthropic->google",
+    );
+
+    // Google `thinkingBudget` -> Anthropic effort.
+    let mut body = client_body(GOOGLE_NONSTREAM, false);
+    body["generationConfig"] =
+        json!({"thinkingConfig": {"thinkingBudget": 16384}, "maxOutputTokens": 99});
+    let (_, seen) =
+        captured_post(Protocol::Anthropic, GOOGLE_NONSTREAM, &body).await;
+    assert_ptr(&seen, "/output_config/effort", &json!("high"), "google->anthropic");
+    assert_ptr(&seen, "/max_tokens", &json!(99), "google->anthropic");
+}
+
+// ---------------------------------------------------------------------------
+// B. Vision input
+// ---------------------------------------------------------------------------
+
+const VISION_B64: &str = "AA==";
+const VISION_REMOTE: &str = "https://example.com/remote.png";
+
+/// Chat request carrying one base64 image and one remote image.
+fn chat_vision_body(stream: bool) -> Value {
+    json!({
+        "model": "m", "stream": stream,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{VISION_B64}")}},
+            {"type": "image_url", "image_url": {"url": VISION_REMOTE}}
+        ]}]
+    })
+}
+
+fn body_contains(seen: &Value, needle: &str, ctx: &str) {
+    let s = serde_json::to_string(seen).unwrap_or_default();
+    assert!(
+        s.contains(needle),
+        "{ctx}: upstream body lost image payload {needle:?}: {s}"
+    );
+}
+
+#[tokio::test]
+async fn vision_images_survive_chat_to_every_upstream() {
+    for stream in [false, true] {
+        let body = chat_vision_body(stream);
+        for proto in [
+            Protocol::OpenAiCompatible,
+            Protocol::Anthropic,
+            Protocol::OpenAi,
+            Protocol::Google,
+        ] {
+            let (kind, seen) = new_capture(proto);
+            let mock = Mock::start(kind).await;
+            let resp = post(app(mock.state_with(proto)), "/v1/chat/completions", &body).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{proto:?} stream={stream}");
+            let seen_body = seen.lock().unwrap().clone();
+            body_contains(&seen_body, VISION_B64, &format!("{proto:?} base64"));
+            body_contains(&seen_body, VISION_REMOTE, &format!("{proto:?} remote"));
+            // The client still gets a readable answer back.
+            if !stream {
+                let text = text(resp).await;
+                assert_eq!(
+                    parse_json("/v1/chat/completions", &text)["choices"][0]["message"]
+                        ["content"],
+                    json!(ANSWER),
+                    "{proto:?} lost the answer"
+                );
+            } else {
+                let events = parse_sse(&text(resp).await);
+                assert_eq!(
+                    streamed_text("/v1/chat/completions", &events),
+                    ANSWER,
+                    "{proto:?} lost the stream"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn vision_google_splits_inline_and_file_data() {
+    let body = chat_vision_body(false);
+    let (_, seen) = captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+    let parts: Vec<Value> = seen
+        .pointer("/contents/0/parts")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        parts.iter().any(|p| {
+            p.pointer("/inlineData/data").and_then(|d| d.as_str()) == Some(VISION_B64)
+        }),
+        "data: URL must become inlineData: {seen}"
+    );
+    assert!(
+        parts.iter().any(|p| {
+            p.pointer("/fileData/fileUri").and_then(|u| u.as_str()) == Some(VISION_REMOTE)
+        }),
+        "remote URL must become fileData: {seen}"
+    );
+}
+
+#[tokio::test]
+async fn vision_anthropic_splits_base64_and_url() {
+    let body = chat_vision_body(false);
+    let (_, seen) = captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+    let s = serde_json::to_string(&seen).unwrap_or_default();
+    assert!(s.contains("\"type\":\"base64\""), "base64 source: {s}");
+    assert!(s.contains("\"type\":\"url\""), "url source: {s}");
+    body_contains(&seen, VISION_REMOTE, "anthropic remote");
+}
+
+#[tokio::test]
+async fn vision_other_ingresses_reach_a_translated_upstream() {
+    // Responses `input_image` -> Google `inlineData`/`fileData`.
+    let body = json!({
+        "model": "m",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": format!("data:image/png;base64,{VISION_B64}")},
+            {"type": "input_image", "image_url": VISION_REMOTE}
+        ]}]
+    });
+    let (_, seen) = captured_post(Protocol::Google, "/v1/responses", &body).await;
+    body_contains(&seen, VISION_B64, "responses->google base64");
+    body_contains(&seen, VISION_REMOTE, "responses->google remote");
+
+    // Anthropic `image` blocks -> Google parts.
+    let body = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": VISION_B64}},
+            {"type": "image", "source": {"type": "url", "url": VISION_REMOTE}}
+        ]}]
+    });
+    let (_, seen) = captured_post(Protocol::Google, "/v1/messages", &body).await;
+    body_contains(&seen, VISION_B64, "anthropic->google base64");
+    body_contains(&seen, VISION_REMOTE, "anthropic->google remote");
+
+    // Google `inlineData`/`fileData` -> Anthropic images.
+    let body = json!({
+        "contents": [{"role": "user", "parts": [
+            {"text": "look"},
+            {"inlineData": {"mimeType": "image/png", "data": VISION_B64}},
+            {"fileData": {"fileUri": VISION_REMOTE}}
+        ]}]
+    });
+    let (_, seen) = captured_post(Protocol::Anthropic, GOOGLE_NONSTREAM, &body).await;
+    body_contains(&seen, VISION_B64, "google->anthropic base64");
+    body_contains(&seen, VISION_REMOTE, "google->anthropic remote");
+}
+
+// ---------------------------------------------------------------------------
+// C. Multi-round tool calls + Google regressions (issues 4/5/6)
+// ---------------------------------------------------------------------------
+
+fn chat_tool_first_turn() -> Value {
+    json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "weather in Paris?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather", "description": "weather",
+            "parameters": {"type": "object",
+                "properties": {"city": {"type": "string"}}}}}],
+        "tool_choice": "auto"
+    })
+}
+
+/// Build the Chat follow-up turn from the gateway's own first answer:
+/// copy the assistant `tool_calls` (including any `extra_content`
+/// signature) and append the `tool` result, like a real client would.
+fn chat_tool_follow_up(first_answer: &Value, result: &str) -> Value {
+    let msg = first_answer
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or(json!({}));
+    let tcs = msg.get("tool_calls").cloned().unwrap_or(json!([]));
+    let call_id = tcs
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("id"))
+        .and_then(|i| i.as_str())
+        .unwrap_or("call_1")
+        .to_string();
+    json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": Value::Null, "tool_calls": tcs},
+            {"role": "tool", "tool_call_id": call_id, "content": result}
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather", "description": "weather",
+            "parameters": {"type": "object",
+                "properties": {"city": {"type": "string"}}}}}],
+        "tool_choice": "auto"
+    })
+}
+
+#[tokio::test]
+async fn multi_round_tool_calls_close_the_loop_on_every_upstream() {
+    for proto in [
+        Protocol::OpenAiCompatible,
+        Protocol::Anthropic,
+        Protocol::OpenAi,
+        Protocol::Google,
+    ] {
+        let args = json!({"city": "Paris"});
+        let (kind, seen) = new_scripted(
+            proto,
+            vec![tool_completion(proto, "get_weather", &args), completion(proto, ANSWER)],
+        );
+        let mock = Mock::start(kind).await;
+        let router = app(mock.state_with(proto));
+
+        // Turn 1: the model asks for a tool call.
+        let resp = post(router.clone(), "/v1/chat/completions", &chat_tool_first_turn()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{proto:?} turn 1");
+        let first = parse_json("/v1/chat/completions", &text(resp).await);
+        let tc = first.pointer("/choices/0/message/tool_calls/0").unwrap_or_else(|| {
+            panic!("{proto:?} turn 1 has no tool_calls: {first}")
+        });
+        assert_eq!(tc.pointer("/function/name").unwrap(), "get_weather");
+        assert_eq!(
+            tc.pointer("/function/arguments").unwrap(),
+            &serde_json::to_string(&args).unwrap()
+        );
+
+        // Turn 2: the client returns the tool result; the model answers.
+        let follow = chat_tool_follow_up(&first, "sunny, 21C");
+        let resp = post(router, "/v1/chat/completions", &follow).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{proto:?} turn 2");
+        let second = parse_json("/v1/chat/completions", &text(resp).await);
+        assert_eq!(
+            second.pointer("/choices/0/message/content").unwrap(),
+            &json!(ANSWER),
+            "{proto:?} lost the final answer"
+        );
+
+        // The tool result actually reached the upstream on turn 2.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{proto:?} expected exactly 2 upstream calls");
+        let s = serde_json::to_string(&seen[1]).unwrap_or_default();
+        assert!(
+            s.contains("sunny"),
+            "{proto:?} upstream never saw the tool result: {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn google_drops_nameless_tools_like_code_interpreter() {
+    // Real OpenWebUI shape: a `code_interpreter` entry with no function name
+    // next to a normal tool, plus an explicitly empty-named function.
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {
+                "name": "get_weather", "description": "weather",
+                "parameters": {"type": "object"}}},
+            {"type": "code_interpreter"},
+            {"type": "function", "function": {"name": "", "parameters": {"type": "object"}}}
+        ],
+        "tool_choice": "auto"
+    });
+    let mock = Mock::start(Upstream::StrictGoogle).await;
+    let resp = post(app(mock.state_with(Protocol::Google)), "/v1/chat/completions", &body).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "nameless tools must be dropped, not sent to Gemini"
+    );
+    let v = parse_json("/v1/chat/completions", &text(resp).await);
+    assert_eq!(
+        v.pointer("/choices/0/message/content").unwrap(),
+        &json!(ANSWER)
+    );
+
+    // Same request on the streaming endpoint: still a 200, not an empty 400.
+    let mut stream_body = body.clone();
+    stream_body["stream"] = json!(true);
+    let mock = Mock::start(Upstream::StrictGoogle).await;
+    let resp = post(
+        app(mock.state_with(Protocol::Google)),
+        "/v1/chat/completions",
+        &stream_body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = parse_sse(&text(resp).await);
+    assert_eq!(
+        streamed_text("/v1/chat/completions", &events),
+        ANSWER,
+        "streaming nameless-tool request lost the answer"
+    );
+}
+
+#[tokio::test]
+async fn google_strips_additional_properties_at_every_depth() {
+    // Three poison schemas mirroring the OpenWebUI report: nested
+    // `additionalProperties` keys that Gemini rejects with a bare 400.
+    let poisoned = |name: &str| {
+        json!({"type": "function", "function": {
+            "name": name, "description": "d",
+            "parameters": {"type": "object",
+                "properties": {"payload": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {"inner": {
+                        "type": "object", "additionalProperties": {"type": "string"}}}}},
+                "additionalProperties": false}}})
+    };
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [poisoned("ask_user"), poisoned("update_memory"),
+                  poisoned("replace_note_content")],
+        "tool_choice": "auto"
+    });
+    // StrictGoogle 400s on any surviving key, so 200 proves the strip.
+    let mock = Mock::start(Upstream::StrictGoogle).await;
+    let resp = post(app(mock.state_with(Protocol::Google)), "/v1/chat/completions", &body).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "additionalProperties must be stripped before Gemini sees it"
+    );
+
+    // And the clean part of the schema survives the strip.
+    let (resp, seen) = captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = serde_json::to_string(&seen).unwrap_or_default();
+    assert!(!s.contains("additionalProperties"), "strip missed a nest: {s}");
+    assert!(
+        s.contains("ask_user") && s.contains("update_memory"),
+        "clean schema was damaged: {s}"
+    );
+}
+
+#[tokio::test]
+async fn google_thought_signature_round_trips_across_turns() {
+    let sig = "thought-sig-123";
+    let args = json!({"city": "Paris"});
+    let (kind, seen) = new_scripted(
+        Protocol::Google,
+        vec![
+            google_tool_with_signature("get_weather", &args, sig),
+            completion(Protocol::Google, ANSWER),
+        ],
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Google));
+
+    // Turn 1: the signature arrives as `extra_content` for OpenAI-shaped clients.
+    let resp = post(router.clone(), "/v1/chat/completions", &chat_tool_first_turn()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first = parse_json("/v1/chat/completions", &text(resp).await);
+    let got = first
+        .pointer("/choices/0/message/tool_calls/0/extra_content/google/thought_signature")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    assert_eq!(got, sig, "signature missing on the way out: {first}");
+
+    // Turn 2 replays it; the gateway must send it back as a sibling part.
+    let follow = chat_tool_follow_up(&first, "sunny, 21C");
+    let resp = post(router, "/v1/chat/completions", &follow).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let second = parse_json("/v1/chat/completions", &text(resp).await);
+    assert_eq!(
+        second.pointer("/choices/0/message/content").unwrap(),
+        &json!(ANSWER)
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let s = serde_json::to_string(&seen[1]).unwrap_or_default();
+    assert!(
+        s.contains(sig),
+        "follow-up never sent the thoughtSignature upstream: {s}"
+    );
+}
+
+#[tokio::test]
+async fn google_streaming_empty_400_becomes_a_readable_gateway_error() {
+    // Force the empty-body 400 Gemini actually sends (nameless tool on a
+    // raw path cannot happen through the gateway, so send a follow-up
+    // without its signature by hand: assistant tool_call without
+    // extra_content plus a tool result).
+    let body = json!({
+        "model": "m", "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": Value::Null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather", "parameters": {"type": "object"}}}]
+    });
+    // Sanity: a bare StrictGoogle mock really does answer empty on streams.
+    // (The gateway must turn that into something an SDK can read.)
+    let mock = Mock::start(Upstream::StrictGoogle).await;
+    let resp = post(app(mock.state_with(Protocol::Google)), "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected the strict 400");
+    let text = text(resp).await;
+    // Non-stream-shaped even for a stream request (fast failure): JSON with
+    // a message, never an empty body handed to the SDK.
+    assert!(!text.is_empty(), "gateway forwarded Gemini's empty body");
+    let v: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|_| panic!("gateway error was not JSON: {text:?}"));
+    assert!(
+        v.pointer("/error/message").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()),
+        "no readable message in {v}"
+    );
 }
