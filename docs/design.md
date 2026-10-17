@@ -41,7 +41,10 @@ Translation details worth knowing:
   `fileData` (Gemini may not fetch arbitrary https — prefer base64);
   `MALFORMED_FUNCTION_CALL` surfaces as a gateway error, never a normal tool
   turn; `usageMetadata` maps onto the canonical usage including
-  `thoughtsTokenCount` → `reasoning_tokens`.
+  `thoughtsTokenCount` → `reasoning_tokens`; tools without a function name
+  (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped and
+  `additionalProperties` is stripped from tool schemas at every depth —
+  Gemini rejects both with a 400.
 - **Responses statefulness**: the gateway is stateless. `previous_response_id`,
   `background`, `store: true` and `item_reference` input items are rejected
   with HTTP 400 — they need server-side response storage and polling endpoints

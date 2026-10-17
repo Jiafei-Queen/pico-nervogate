@@ -158,6 +158,38 @@ fn tool_output_to_response_object(text: &str) -> Value {
 // Chat -> Google request
 // ---------------------------------------------------------------------------
 
+/// Google's function-declaration schemas are a restricted subset: unknown
+/// keywords such as `additionalProperties` are rejected with a 400.
+/// Strip that key at every depth of a parameter schema in place.
+fn strip_additional_properties(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            map.remove("additionalProperties");
+            for v in map.values_mut() {
+                strip_additional_properties(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                strip_additional_properties(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when a parameter schema contains `additionalProperties` anywhere.
+fn has_additional_properties(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            map.contains_key("additionalProperties")
+                || map.values().any(has_additional_properties)
+        }
+        Value::Array(items) => items.iter().any(has_additional_properties),
+        _ => false,
+    }
+}
+
 /// Canonical chat request -> Gemini `generateContent` request body.
 pub fn chat_to_google_request(req: &Value) -> Value {
     let mut out = serde_json::Map::new();
@@ -256,19 +288,32 @@ pub fn chat_to_google_request(req: &Value) -> Value {
     }
     out.insert("contents".into(), Value::Array(contents));
 
-    // Tools.
+    // Tools. Entries without a function name (e.g. OpenAI's
+    // `{"type": "code_interpreter"}`, which has no Google equivalent) are
+    // dropped: Gemini rejects empty declaration names with a 400.
+    // Parameter schemas are sanitized for Google's restricted subset
+    // (`additionalProperties` is rejected with a 400).
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
-        if !tools.is_empty() {
-            let decls: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or(""),
-                        "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
-                        "parameters": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type":"object"}))
-                    })
-                })
-                .collect();
+        let decls: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.pointer("/function/name").and_then(|x| x.as_str())?;
+                if name.is_empty() {
+                    return None;
+                }
+                let mut parameters = t
+                    .pointer("/function/parameters")
+                    .cloned()
+                    .unwrap_or(json!({"type":"object"}));
+                strip_additional_properties(&mut parameters);
+                Some(json!({
+                    "name": name,
+                    "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
+                    "parameters": parameters
+                }))
+            })
+            .collect();
+        if !decls.is_empty() {
             out.insert(
                 "tools".into(),
                 json!([{"functionDeclarations": decls}]),
@@ -479,10 +524,40 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
         "parallel_tool_calls",
         "metadata",
     ];
-    LOST.iter()
+    let mut out: Vec<&'static str> = LOST
+        .iter()
         .copied()
         .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
-        .collect()
+        .collect();
+    // Non-function tools (e.g. `{"type": "code_interpreter"}`) have no
+    // Google equivalent and are dropped from the request.
+    if req
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|ts| {
+            ts.iter().any(|t| {
+                t.pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .map_or(true, str::is_empty)
+            })
+        })
+    {
+        out.push("nameless tools (dropped: not function tools)");
+    }
+    // `additionalProperties` is stripped from tool schemas (see above).
+    if req
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|ts| {
+            ts.iter().any(|t| {
+                t.pointer("/function/parameters")
+                    .is_some_and(has_additional_properties)
+            })
+        })
+    {
+        out.push("tool additionalProperties stripped (unsupported by Google)");
+    }
+    out
 }
 
 /// `n > 1` would silently collapse to a single candidate.
@@ -1433,6 +1508,85 @@ mod tests {
         assert!(chat_to_google_loss(&req).contains(&"user"));
         assert!(chat_to_google_loss(&req).contains(&"logprobs"));
         assert!(chat_to_google_fatal(&req).is_some());
+    }
+
+    #[test]
+    fn nameless_tools_are_dropped_not_emptied() {
+        // Open WebUI's code interpreter arrives as a bare non-function
+        // tool; translating it to an empty-name declaration makes the
+        // upstream reject the request with a 400.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [{"type": "code_interpreter"}]
+        });
+        let out = chat_to_google_request(&req);
+        assert!(out.get("tools").is_none());
+        assert!(
+            chat_to_google_loss(&req)
+                .contains(&"nameless tools (dropped: not function tools)")
+        );
+
+        // ... while real function tools alongside it still pass through.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [
+                {"type": "code_interpreter"},
+                {"type": "function", "function": {"name": "get_time", "description": "t"}}
+            ]
+        });
+        let out = chat_to_google_request(&req);
+        let decls = out["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"], json!("get_time"));
+    }
+
+    #[test]
+    fn additional_properties_stripped_from_tool_schemas() {
+        // Google rejects `additionalProperties` in function declarations
+        // with a 400; it must be stripped at every depth, keeping the rest.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "ask_user",
+                "description": "ask",
+                "parameters": {"type": "object",
+                    "properties": {"items": {"type": "array",
+                        "items": {"type": "object", "additionalProperties": true}}}}
+            }}]
+        });
+        let out = chat_to_google_request(&req);
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(
+            params["properties"]["items"]["items"],
+            json!({"type": "object"})
+        );
+        assert!(!has_additional_properties(params));
+        assert!(
+            chat_to_google_loss(&req)
+                .contains(&"tool additionalProperties stripped (unsupported by Google)")
+        );
+
+        // Schemas without it are untouched and report no loss.
+        let clean = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_time",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        });
+        let out = chat_to_google_request(&clean);
+        assert_eq!(
+            out["tools"][0]["functionDeclarations"][0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert!(
+            !chat_to_google_loss(&clean)
+                .contains(&"tool additionalProperties stripped (unsupported by Google)")
+        );
     }
 
     #[test]
