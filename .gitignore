@@ -5,4 +5,5 @@ __pycache__/
 gateway.local.toml
 gateway.local.toml.bak
 models.dev.json
+/tmp
 .*.swp
