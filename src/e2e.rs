@@ -2028,9 +2028,11 @@ async fn multi_round_tool_calls_close_the_loop_on_every_upstream() {
 }
 
 #[tokio::test]
-async fn google_drops_nameless_tools_like_code_interpreter() {
-    // Real OpenWebUI shape: a `code_interpreter` entry with no function name
-    // next to a normal tool, plus an explicitly empty-named function.
+async fn google_drops_nameless_function_tools() {
+    // Real OpenWebUI shape: a `code_interpreter` built-in next to a normal
+    // tool, plus an explicitly empty-named function. The built-in becomes
+    // `codeExecution`; the empty-name declaration is dropped (Gemini 400s
+    // on it).
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
@@ -2102,11 +2104,11 @@ async fn forced_tool_choice_with_only_builtin_tools_is_rejected() {
         assert!(seen.is_null(), "{proto:?} upstream must not be called");
     }
 
-    // Chat ingress: a built-in the Chat wire cannot name.
+    // Chat ingress: a built-in the hub cannot carry.
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "code_interpreter"}],
+        "tools": [{"type": "file_search"}],
         "tool_choice": "required"
     });
     for proto in [Protocol::Anthropic, Protocol::Google, Protocol::OpenAi] {
@@ -2143,9 +2145,9 @@ async fn named_tool_choice_for_a_dropped_tool_is_rejected() {
         "tools": [
             {"type": "function", "function": {
                 "name": "get_weather", "parameters": {"type": "object"}}},
-            {"type": "code_interpreter"}
+            {"type": "file_search"}
         ],
-        "tool_choice": {"type": "function", "function": {"name": "code_interpreter"}}
+        "tool_choice": {"type": "function", "function": {"name": "file_search"}}
     });
     for proto in [Protocol::Anthropic, Protocol::Google, Protocol::OpenAi] {
         let (resp, seen) = captured_post(proto, "/v1/chat/completions", &body).await;
@@ -2179,7 +2181,7 @@ async fn auto_with_only_dropped_tools_leaves_no_contradictory_choice() {
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "code_interpreter"}],
+        "tools": [{"type": "file_search"}],
         "tool_choice": "auto"
     });
     let (resp, seen) = captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
@@ -2191,6 +2193,229 @@ async fn auto_with_only_dropped_tools_leaves_no_contradictory_choice() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(seen.get("tools").is_none(), "{seen}");
     assert!(seen.get("tool_choice").is_none(), "{seen}");
+}
+
+// ---- server tools: web search and code execution ---------------------
+
+fn google_grounding_body() -> Value {
+    json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": "Paris is the capital."}]},
+            "finishReason": "STOP", "index": 0,
+            "groundingMetadata": {
+                "webSearchQueries": ["capital of France"],
+                "groundingChunks": [{"web": {
+                    "uri": "https://e.com/paris", "title": "Paris"}}],
+                "groundingSupports": [{
+                    "segment": {"startIndex": 0, "endIndex": 5, "text": "Paris"},
+                    "groundingChunkIndices": [0]
+                }]
+            }
+        }],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2,
+                          "totalTokenCount": 5}
+    })
+}
+
+fn google_grounding_frames() -> Vec<String> {
+    vec![
+        plain(json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "Paris is the capital."}]},
+            "index": 0
+        }]})),
+        plain(json!({"candidates": [{
+            "content": {"role": "model", "parts": []},
+            "finishReason": "STOP", "index": 0,
+            "groundingMetadata": {
+                "webSearchQueries": ["capital of France"],
+                "groundingChunks": [{"web": {
+                    "uri": "https://e.com/paris", "title": "Paris"}}],
+                "groundingSupports": [{
+                    "segment": {"startIndex": 0, "endIndex": 5, "text": "Paris"},
+                    "groundingChunkIndices": [0]
+                }]
+            }
+        }],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2,
+                          "totalTokenCount": 5}})),
+    ]
+}
+
+fn anthropic_web_search_body() -> Value {
+    json!({
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+             "input": {"query": "capital"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+             "content": [{"type": "web_search_result",
+                          "url": "https://e.com/p", "title": "P"}]},
+            {"type": "text", "text": "Paris is the capital.",
+             "citations": [{"type": "web_search_result_location",
+                            "url": "https://e.com/p", "title": "P",
+                            "cited_text": "Paris"}]}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 2}
+    })
+}
+
+/// Responses ingress -> Google upstream. Asserts both the translated request
+/// (`googleSearch`) and the synthesized `web_search_call` + citations.
+#[tokio::test]
+async fn responses_web_search_round_trips_via_google() {
+    let body = json!({
+        "model": "m",
+        "input": [{"role": "user", "content": "capital of France?"}],
+        "tools": [{"type": "web_search"}]
+    });
+    let (kind, seen) = new_frames(google_grounding_body(), google_grounding_frames(), None);
+    let mock = Mock::start(kind).await;
+    let resp = post(
+        app(mock.state_with(Protocol::Google)),
+        "/v1/responses",
+        &body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = parse_json("/v1/responses", &text(resp).await);
+    let call = v["output"]
+        .as_array()
+        .expect("output")
+        .iter()
+        .find(|i| i["type"] == "web_search_call")
+        .expect("web_search_call");
+    assert_eq!(call["action"]["query"], json!("capital of France"));
+    let msg = v["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("message");
+    assert_eq!(
+        msg.pointer("/content/0/annotations/0/url").unwrap(),
+        &json!("https://e.com/paris")
+    );
+
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent[0]["tools"][0], json!({"googleSearch": {}}));
+}
+
+/// The streaming path uses its own state machines, so it is not implied by
+/// the non-streaming test above.
+#[tokio::test]
+async fn responses_web_search_streams_via_google() {
+    let body = json!({
+        "model": "m", "stream": true,
+        "input": [{"role": "user", "content": "capital of France?"}],
+        "tools": [{"type": "web_search"}]
+    });
+    let (kind, _) = new_frames(google_grounding_body(), google_grounding_frames(), None);
+    let mock = Mock::start(kind).await;
+    let resp = post(
+        app(mock.state_with(Protocol::Google)),
+        "/v1/responses",
+        &body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = parse_sse(&text(resp).await);
+    let done = events
+        .iter()
+        .filter_map(|(_, d)| serde_json::from_str::<Value>(d).ok())
+        .find(|v| v["type"] == "response.completed")
+        .expect("response.completed");
+    let out = done
+        .pointer("/response/output")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(
+        out.iter().any(|i| i["type"] == "web_search_call"),
+        "stream lost the search call: {done}"
+    );
+    let msg = out
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("message item");
+    assert_eq!(
+        msg.pointer("/content/0/annotations/0/url").unwrap(),
+        &json!("https://e.com/paris")
+    );
+}
+
+/// Anthropic ingress -> Google upstream: code execution in both directions.
+#[tokio::test]
+async fn anthropic_code_execution_round_trips_via_google() {
+    let body = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "run it"}],
+        "tools": [{"type": "code_execution_20250522", "name": "code_execution"}]
+    });
+    let upstream = json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [
+                {"executableCode": {"language": "PYTHON", "code": "print(1)"}},
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1"}},
+                {"text": "It printed 1."}
+            ]},
+            "finishReason": "STOP", "index": 0
+        }],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2,
+                          "totalTokenCount": 5}
+    });
+    let (kind, seen) = new_frames(upstream, vec![], None);
+    let mock = Mock::start(kind).await;
+    let resp = post(
+        app(mock.state_with(Protocol::Google)),
+        "/v1/messages",
+        &body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = parse_json("/v1/messages", &text(resp).await);
+    let kinds: Vec<&str> = v["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["server_tool_use", "code_execution_tool_result", "text"]
+    );
+    assert_eq!(v["content"][0]["input"]["code"], json!("print(1)"));
+    assert_eq!(v["content"][1]["content"]["stdout"], json!("1"));
+
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent[0]["tools"][0], json!({"codeExecution": {}}));
+}
+
+/// Google ingress -> Anthropic upstream: same pair in the other direction.
+#[tokio::test]
+async fn google_web_search_round_trips_via_anthropic() {
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "capital?"}]}],
+        "tools": [{"googleSearch": {}}]
+    });
+    let (kind, seen) = new_frames(anthropic_web_search_body(), vec![], None);
+    let mock = Mock::start(kind).await;
+    let resp = post(
+        app(mock.state_with(Protocol::Anthropic)),
+        GOOGLE_NONSTREAM,
+        &body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = parse_json(GOOGLE_NONSTREAM, &text(resp).await);
+    let gm = &v["candidates"][0]["groundingMetadata"];
+    assert_eq!(gm["webSearchQueries"][0], json!("capital"));
+    assert_eq!(
+        gm["groundingChunks"][0]["web"]["uri"],
+        json!("https://e.com/p")
+    );
+
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent[0]["tools"][0]["type"], json!("web_search_20250305"));
 }
 
 #[tokio::test]

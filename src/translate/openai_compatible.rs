@@ -13,6 +13,12 @@ pub const THINK_CLOSE: &str = "\n</think>\n";
 /// `ReasoningContent` is a no-op; the other modes prepend a `<think>`
 /// block to `content` (`ThinkTag` also drops `reasoning_content`).
 pub fn apply_reasoning_output_to_message(msg: &mut Value, mode: ReasoningOutput) {
+    // Server-tool bookkeeping is canonical only; a Chat client has no field
+    // for it (and could not have requested it: Chat has no server tools).
+    if let Some(o) = msg.as_object_mut() {
+        o.remove("server_tool_calls");
+        o.remove("citations");
+    }
     if mode == ReasoningOutput::ReasoningContent {
         return;
     }
@@ -55,6 +61,14 @@ impl ChatReasoningEgress {
     }
 
     pub fn transform(&mut self, chunk: &mut Value) {
+        // Canonical server-tool events have no Chat wire representation.
+        if let Some(delta) = chunk
+            .pointer_mut("/choices/0/delta")
+            .and_then(|d| d.as_object_mut())
+        {
+            delta.remove("server_tool_calls");
+            delta.remove("citations");
+        }
         if self.mode == ReasoningOutput::ReasoningContent {
             return;
         }

@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 
 use super::common::*;
+use super::server_tool;
 pub fn responses_input_parts(c: &Value) -> Vec<Value> {
     let mut parts: Vec<Value> = vec![];
     match c {
@@ -244,16 +245,34 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
         }
     }
     let mut has_tools = false;
+    let mut has_function_tools = false;
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
-        // Responses rejects an empty function name, so a nameless Chat tool
-        // (a built-in the client cannot represent here) is dropped instead.
+        // Responses rejects an empty function name, so a nameless non-server
+        // tool (one the client cannot represent here) is dropped instead.
         let rt: Vec<Value> = tools
             .iter()
             .filter_map(|t| {
+                if let Some(kind) = server_tool::kind_of(t) {
+                    return Some(match kind {
+                        server_tool::WEB_SEARCH => {
+                            let mut v = json!({"type": "web_search"});
+                            let domains = server_tool::allowed_domains(t);
+                            if !domains.is_empty() {
+                                v["filters"] = json!({"allowed_domains": domains});
+                            }
+                            v
+                        }
+                        _ => json!({
+                            "type": "code_interpreter",
+                            "container": {"type": "auto"}
+                        }),
+                    });
+                }
                 let name = t
                     .pointer("/function/name")
                     .and_then(|x| x.as_str())
                     .filter(|s| !s.is_empty())?;
+                has_function_tools = true;
                 Some(json!({
                     "type": "function",
                     "name": name,
@@ -267,8 +286,9 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
             out.insert("tools".into(), Value::Array(rt));
         }
     }
-    // Never force a choice the translated request cannot satisfy.
-    if has_tools {
+    // `tool_choice` constrains function calls; server tools are not a
+    // function the client can force.
+    if has_tools && has_function_tools {
         if let Some(tc) = req.get("tool_choice") {
             let mapped = match tc.as_str() {
                 Some("auto") => Some(json!("auto")),
@@ -331,24 +351,42 @@ pub fn chat_to_responses_loss(req: &Value) -> Vec<&'static str> {
 }
 
 /// Tools a Responses request cannot carry into the canonical Chat shape:
-/// built-ins such as `web_search` have no `name` field, so the ingress
-/// normalizer drops them.
+/// entries that are neither server tools nor named functions.
 pub fn responses_to_chat_loss(req: &Value) -> Vec<&'static str> {
     let dropped = req
         .get("tools")
         .and_then(|t| t.as_array())
         .is_some_and(|tools| {
             tools.iter().any(|t| {
-                t.get("name")
-                    .and_then(|x| x.as_str())
-                    .filter(|s| !s.is_empty())
-                    .is_none()
+                responses_server_tool(t).is_none()
+                    && t.get("name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .is_none()
             })
         });
     dropped
-        .then_some("nameless tools (dropped: not function tools)")
+        .then_some("nameless tools (dropped: not function or server tools)")
         .into_iter()
         .collect()
+}
+
+/// Responses hosted tools the hub can carry, with their web-search domain
+/// filter.
+fn responses_server_tool(t: &Value) -> Option<(&'static str, Vec<Value>)> {
+    let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    if ty.starts_with("web_search") {
+        let domains = t
+            .pointer("/filters/allowed_domains")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter(|d| d.is_string()).cloned().collect())
+            .unwrap_or_default();
+        return Some((server_tool::WEB_SEARCH, domains));
+    }
+    if ty == "code_interpreter" {
+        return Some((server_tool::CODE_EXECUTION, vec![]));
+    }
+    None
 }
 
 /// `n > 1` would silently collapse to a single candidate.
@@ -363,12 +401,42 @@ pub fn chat_to_responses_fatal(req: &Value) -> Option<String> {
     None
 }
 
+/// Collect `url_citation` annotations from one Responses content part.
+fn collect_url_citations(part: &Value, out: &mut Vec<Value>) {
+    let Some(anns) = part.get("annotations").and_then(|a| a.as_array()) else {
+        return;
+    };
+    for a in anns {
+        if a.get("type").and_then(|x| x.as_str()) != Some("url_citation") {
+            continue;
+        }
+        let url = a.get("url").and_then(|x| x.as_str()).unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        let mut c = server_tool::citation(
+            url,
+            a.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+            "",
+        );
+        if let Some(s) = a.get("start_index").and_then(|x| x.as_u64()) {
+            c["start_index"] = json!(s);
+        }
+        if let Some(e) = a.get("end_index").and_then(|x| x.as_u64()) {
+            c["end_index"] = json!(e);
+        }
+        out.push(c);
+    }
+}
+
 pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
     let id = gen_id("chatcmpl-");
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut reasoning_details: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
+    let mut server_calls: Vec<Value> = vec![];
+    let mut citations: Vec<Value> = vec![];
 
     if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
         for item in output {
@@ -381,6 +449,7 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
                                     if let Some(t) = c.get("text").and_then(|x| x.as_str()) {
                                         text.push_str(t);
                                     }
+                                    collect_url_citations(c, &mut citations);
                                 }
                                 Some("refusal") => {
                                     if let Some(t) = c.get("refusal").and_then(|x| x.as_str()) {
@@ -391,6 +460,50 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
                             }
                         }
                     }
+                }
+                "web_search_call" => {
+                    let query = item
+                        .pointer("/action/query")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let mut call = server_tool::web_search(query, vec![]);
+                    if let Some(call_id) = item
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        call["id"] = json!(call_id);
+                    }
+                    if let Some(status) = item.get("status").and_then(|x| x.as_str()) {
+                        call["status"] = json!(status);
+                    }
+                    server_calls.push(call);
+                }
+                "code_interpreter_call" => {
+                    let code = item.get("code").and_then(|x| x.as_str()).unwrap_or("");
+                    let output = item
+                        .get("outputs")
+                        .and_then(|o| o.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| {
+                                    x.get("logs")
+                                        .or_else(|| x.get("output"))
+                                        .and_then(|l| l.as_str())
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    let mut call = server_tool::code_execution(code, &output);
+                    if let Some(call_id) = item
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        call["id"] = json!(call_id);
+                    }
+                    server_calls.push(call);
                 }
                 "reasoning" => {
                     let mut item_text = String::new();
@@ -466,6 +579,39 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
         }
     }
 
+    // Provider offsets are per content part, the canonical text is the whole
+    // answer; reconcile them before the egress renders annotations.
+    for c in &mut citations {
+        let (Some(start), Some(end)) = (
+            c.get("start_index").and_then(|x| x.as_u64()),
+            c.get("end_index").and_then(|x| x.as_u64()),
+        ) else {
+            continue;
+        };
+        let slice: String = text
+            .chars()
+            .skip(start as usize)
+            .take(end.saturating_sub(start) as usize)
+            .collect();
+        if !slice.is_empty() {
+            c["cited_text"] = json!(slice);
+        }
+    }
+    server_tool::locate_citations(&mut citations, &text);
+    // A Responses search reports citations, not a result list; derive the
+    // canonical results so Anthropic/Google egresses can render them.
+    if !citations.is_empty() {
+        let results = server_tool::results_from_citations(&citations);
+        for call in &mut server_calls {
+            if call["type"] == server_tool::WEB_SEARCH
+                && call["results"].as_array().is_some_and(|r| r.is_empty())
+                && !results.is_empty()
+            {
+                call["results"] = json!(results);
+            }
+        }
+    }
+
     let status = resp
         .get("status")
         .and_then(|s| s.as_str())
@@ -510,6 +656,12 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
         message["content"] = Value::Null;
+    }
+    if !server_calls.is_empty() {
+        message["server_tool_calls"] = Value::Array(server_calls);
+    }
+    if !citations.is_empty() {
+        message["citations"] = Value::Array(citations);
     }
 
     json!({
@@ -576,6 +728,11 @@ pub struct ResponsesStream {
     pending_reasoning: Vec<String>,
     /// Chunks held while a reasoning blob is still pending.
     pending_chunks: Vec<Value>,
+    /// Server-tool items already forwarded, keyed by item id, so a terminal
+    /// `response.output` scan does not duplicate them.
+    server_done: Vec<String>,
+    /// Whether annotation events already carried the citations.
+    annotations_seen: bool,
     finish: Option<String>,
 }
 
@@ -594,6 +751,8 @@ impl ResponsesStream {
             reasoning_done: vec![],
             pending_reasoning: vec![],
             pending_chunks: vec![],
+            server_done: vec![],
+            annotations_seen: false,
             finish: None,
         }
     }
@@ -638,6 +797,78 @@ impl ResponsesStream {
                 None,
             ));
         }
+    }
+
+    /// Forward one completed server-tool output item into the canonical
+    /// stream. Returns true when something was emitted.
+    fn emit_server_item(&mut self, out: &mut Vec<Value>, item: &Value) -> bool {
+        let ty = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let item_id = item
+            .get("id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty());
+        let key = item_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{ty}:{}", self.server_done.len()));
+        if self.server_done.iter().any(|k| k == &key) {
+            return false;
+        }
+        let mut call = match ty {
+            "web_search_call" => {
+                let query = item
+                    .pointer("/action/query")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                server_tool::web_search(query, vec![])
+            }
+            "code_interpreter_call" => {
+                let code = item.get("code").and_then(|x| x.as_str()).unwrap_or("");
+                let output = item
+                    .get("outputs")
+                    .and_then(|o| o.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                x.get("logs")
+                                    .or_else(|| x.get("output"))
+                                    .and_then(|l| l.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                server_tool::code_execution(code, &output)
+            }
+            _ => return false,
+        };
+        if let Some(id) = item_id {
+            call["id"] = json!(id);
+        }
+        self.server_done.push(key);
+        let c = chunk(
+            &self.id,
+            &self.model,
+            json!({"server_tool_calls": [call]}),
+            None,
+        );
+        self.emit_or_hold(out, c);
+        true
+    }
+
+    /// Forward the `url_citation` annotations of one message item.
+    fn emit_annotations(&mut self, out: &mut Vec<Value>, content: &Value) {
+        let mut citations: Vec<Value> = vec![];
+        if let Some(parts) = content.as_array() {
+            for part in parts {
+                collect_url_citations(part, &mut citations);
+            }
+        }
+        if citations.is_empty() {
+            return;
+        }
+        self.annotations_seen = true;
+        let c = chunk(&self.id, &self.model, json!({"citations": citations}), None);
+        self.emit_or_hold(out, c);
     }
 
     /// Forward one reasoning item's opaque blob into the canonical stream.
@@ -776,17 +1007,41 @@ impl ResponsesStream {
                     self.emit_or_hold(&mut out, c);
                 }
             }
+            "response.output_text.annotation.added" => {
+                if let Some(ann) = ev.get("annotation") {
+                    let part = json!({"annotations": [ann.clone()]});
+                    let mut citations: Vec<Value> = vec![];
+                    collect_url_citations(&part, &mut citations);
+                    if !citations.is_empty() {
+                        self.annotations_seen = true;
+                        let c = chunk(&self.id, &self.model, json!({"citations": citations}), None);
+                        self.emit_or_hold(&mut out, c);
+                    }
+                }
+            }
             "response.output_item.done" => {
                 let item = ev.get("item").cloned().unwrap_or(json!({}));
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    self.tool_index += 1;
-                    self.cur_call = None;
-                }
-                if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
-                    let key = Self::reasoning_key(ev);
-                    let emitted = self.emit_reasoning_blob(&mut out, &item);
-                    if emitted {
-                        self.release_reasoning(&key, &mut out);
+                match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "function_call" => {
+                        self.tool_index += 1;
+                        self.cur_call = None;
+                    }
+                    "reasoning" => {
+                        let key = Self::reasoning_key(ev);
+                        let emitted = self.emit_reasoning_blob(&mut out, &item);
+                        if emitted {
+                            self.release_reasoning(&key, &mut out);
+                        }
+                    }
+                    "message" => {
+                        if !self.annotations_seen {
+                            if let Some(content) = item.get("content") {
+                                self.emit_annotations(&mut out, content);
+                            }
+                        }
+                    }
+                    _ => {
+                        self.emit_server_item(&mut out, &item);
                     }
                 }
             }
@@ -795,6 +1050,19 @@ impl ResponsesStream {
                 if let Some(items) = ev.pointer("/response/output").and_then(|x| x.as_array()) {
                     for item in items {
                         self.emit_reasoning_blob(&mut out, item);
+                        match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                            "message" => {
+                                if !self.annotations_seen {
+                                    if let Some(content) = item.get("content") {
+                                        self.emit_annotations(&mut out, content);
+                                    }
+                                }
+                            }
+                            "reasoning" | "function_call" => {}
+                            _ => {
+                                self.emit_server_item(&mut out, item);
+                            }
+                        }
                     }
                 }
                 // The terminal event is the last chance for a blob. Release
@@ -1203,12 +1471,14 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
     }
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         if !tools.is_empty() {
-            // Responses tools are flat, and built-ins like `web_search`
-            // carry no name. Chat has no equivalent for those, and emitting
-            // an empty function name is a hard 400 upstream.
+            // Responses tools are flat: built-ins carry no name, function
+            // tools do. Server tools ride the hub as their own entries.
             let ot: Vec<Value> = tools
                 .iter()
                 .filter_map(|t| {
+                    if let Some((kind, domains)) = responses_server_tool(t) {
+                        return Some(server_tool::request_entry(kind, domains));
+                    }
                     let name = t
                         .get("name")
                         .and_then(|x| x.as_str())
@@ -1344,16 +1614,64 @@ pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
     }
 
     let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let mut citations = msg
+        .get("citations")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let text_len = text.chars().count();
+    server_tool::locate_citations(&mut citations, text);
+
+    if let Some(calls) = msg.get("server_tool_calls").and_then(|x| x.as_array()) {
+        for call in calls {
+            match call.get("type").and_then(|x| x.as_str()) {
+                Some(server_tool::WEB_SEARCH) => output.push(json!({
+                    "type": "web_search_call",
+                    "id": call.get("id").cloned().unwrap_or_else(|| json!(gen_id("ws_"))),
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": call.get("query").cloned().unwrap_or(json!(""))
+                    }
+                })),
+                Some(server_tool::CODE_EXECUTION) => output.push(json!({
+                    "type": "code_interpreter_call",
+                    "id": call.get("id").cloned().unwrap_or_else(|| json!(gen_id("ci_"))),
+                    "status": "completed",
+                    "container_id": gen_id("cntr_"),
+                    "code": call.get("code").cloned().unwrap_or(json!("")),
+                    "outputs": [{
+                        "type": "logs",
+                        "logs": call.get("output").cloned().unwrap_or(json!(""))
+                    }]
+                })),
+                _ => {}
+            }
+        }
+    }
+
     // `refusal` carries the reply when `content` is empty; dropping it
     // yields an empty message the client cannot explain.
     let refusal = msg.get("refusal").and_then(|c| c.as_str()).unwrap_or("");
+    let annotations: Vec<Value> = citations
+        .iter()
+        .map(|c| {
+            json!({
+                "type": "url_citation",
+                "url": c.get("url").cloned().unwrap_or(json!("")),
+                "title": c.get("title").cloned().unwrap_or(json!("")),
+                "start_index": c.get("start_index").cloned().unwrap_or(json!(0)),
+                "end_index": c.get("end_index").cloned().unwrap_or(json!(text_len))
+            })
+        })
+        .collect();
     if !text.is_empty() {
         output.push(json!({
             "type": "message",
             "id": gen_id("msg_"),
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "output_text", "text": text, "annotations": []}]
+            "content": [{"type": "output_text", "text": text, "annotations": annotations}]
         }));
     } else if !refusal.is_empty() {
         output.push(json!({
@@ -1445,6 +1763,8 @@ pub struct ChatToResponsesStream {
     /// Tool calls buffered until the stream ends, keyed by upstream
     /// `tool_calls[].index` so parallel calls never mix arguments.
     tools: Vec<(ToolKey, PendingTool)>,
+    /// Citations seen so far, attached to the open/closed message item.
+    citations: Vec<Value>,
     items: Vec<Value>,
 }
 
@@ -1459,6 +1779,7 @@ impl ChatToResponsesStream {
             next_index: 0,
             open: None,
             tools: vec![],
+            citations: vec![],
             items: vec![],
         }
     }
@@ -1510,6 +1831,87 @@ impl ChatToResponsesStream {
             text: String::new(),
             signature: None,
         });
+    }
+
+    /// Build Responses `url_citation` annotations for a message item.
+    fn annotations_for(&self, text: &str) -> Vec<Value> {
+        let mut citations = self.citations.clone();
+        server_tool::locate_citations(&mut citations, text);
+        let len = text.chars().count();
+        citations
+            .iter()
+            .map(|c| {
+                json!({
+                    "type": "url_citation",
+                    "url": c.get("url").cloned().unwrap_or(json!("")),
+                    "title": c.get("title").cloned().unwrap_or(json!("")),
+                    "start_index": c.get("start_index").cloned().unwrap_or(json!(0)),
+                    "end_index": c.get("end_index").cloned().unwrap_or(json!(len))
+                })
+            })
+            .collect()
+    }
+
+    /// Buffer citations and, when a message is open, announce them as they
+    /// arrive. The final `content_part.done` carries the complete list.
+    fn emit_citations(&mut self, out: &mut Vec<SseEvent>, citations: &[Value]) {
+        self.citations.extend(citations.iter().cloned());
+        let Some(OpenOut::Message {
+            index,
+            item_id,
+            text,
+        }) = &self.open
+        else {
+            return;
+        };
+        let (index, item_id, text) = (*index, item_id.clone(), text.clone());
+        for a in self.annotations_for(&text) {
+            out.push(SseEvent::data(json!({
+                "type": "response.output_text.annotation.added",
+                "item_id": item_id, "output_index": index, "annotation": a
+            })));
+        }
+    }
+
+    /// Emit a completed server-tool call as a Responses output item.
+    fn emit_server(&mut self, out: &mut Vec<SseEvent>, call: &Value) {
+        self.close_open(out);
+        let index = self.next_index;
+        self.next_index += 1;
+        let id = call
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| gen_id("srv_"));
+        let item = match call.get("type").and_then(|x| x.as_str()) {
+            Some(server_tool::WEB_SEARCH) => json!({
+                "id": id, "type": "web_search_call", "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": call.get("query").cloned().unwrap_or(json!(""))
+                }
+            }),
+            _ => json!({
+                "id": id, "type": "code_interpreter_call", "status": "completed",
+                "container_id": gen_id("cntr_"),
+                "code": call.get("code").cloned().unwrap_or(json!("")),
+                "outputs": [{
+                    "type": "logs",
+                    "logs": call.get("output").cloned().unwrap_or(json!(""))
+                }]
+            }),
+        };
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        out.push(SseEvent::data(json!({
+            "type": "response.output_item.added", "output_index": index,
+            "item": added
+        })));
+        out.push(SseEvent::data(json!({
+            "type": "response.output_item.done", "output_index": index,
+            "item": item.clone()
+        })));
+        self.items.push(item);
     }
 
     fn terminal(&mut self, ty: &str, status: &str, incomplete: Value, out: &mut Vec<SseEvent>) {
@@ -1610,6 +2012,7 @@ impl ChatToResponsesStream {
                 item_id,
                 text,
             } => {
+                let annotations = self.annotations_for(&text);
                 out.push(SseEvent::data(json!({
                     "type": "response.output_text.done",
                     "item_id": item_id, "output_index": index, "content_index": 0,
@@ -1618,19 +2021,19 @@ impl ChatToResponsesStream {
                 out.push(SseEvent::data(json!({
                     "type": "response.content_part.done",
                     "item_id": item_id, "output_index": index, "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []}
+                    "part": {"type": "output_text", "text": text, "annotations": annotations}
                 })));
                 out.push(SseEvent::data(json!({
                     "type": "response.output_item.done", "output_index": index,
                     "item": {
                         "id": item_id, "type": "message", "role": "assistant",
                         "status": "completed",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}]
+                        "content": [{"type": "output_text", "text": text, "annotations": annotations}]
                     }
                 })));
                 self.items.push(json!({
                     "id": item_id, "type": "message", "role": "assistant", "status": "completed",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}]
+                    "content": [{"type": "output_text", "text": text, "annotations": annotations}]
                 }));
             }
             OpenOut::Tool {
@@ -1778,6 +2181,20 @@ impl ChatToResponsesStream {
                         "delta": t, "logprobs": []
                     })));
                 }
+            }
+        }
+
+        // Citations annotate the message text, so they must be recorded
+        // before a server-tool item closes that message.
+        if let Some(citations) = delta.get("citations").and_then(|x| x.as_array()) {
+            self.emit_citations(&mut out, citations);
+        }
+
+        // Server-side tool results become their own output items; the text
+        // that follows keeps its own message item.
+        if let Some(calls) = delta.get("server_tool_calls").and_then(|x| x.as_array()) {
+            for call in calls {
+                self.emit_server(&mut out, call);
             }
         }
 

@@ -9,6 +9,7 @@ pub mod common;
 pub mod google;
 pub mod openai;
 pub mod openai_compatible;
+pub mod server_tool;
 
 #[cfg(test)]
 mod tests;

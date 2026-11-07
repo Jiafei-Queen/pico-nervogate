@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::config::ThinkingMode;
 
 use super::common::*;
+use super::server_tool;
 pub fn openai_image_to_anthropic(p: &Value) -> Option<Value> {
     let url = p.pointer("/image_url/url").and_then(|x| x.as_str())?;
     if let Some(rest) = url.strip_prefix("data:") {
@@ -349,11 +350,30 @@ pub fn openai_to_anthropic_with_max(
         .and_then(|t| t.as_array())
         .map(|tools| {
             // Anthropic rejects a tool with an empty name (400), so a
-            // nameless Chat tool (a built-in the client cannot represent
+            // nameless non-server tool (one the client cannot represent
             // here) is dropped rather than forwarded.
             tools
                 .iter()
                 .filter_map(|t| {
+                    if let Some(kind) = server_tool::kind_of(t) {
+                        return Some(match kind {
+                            server_tool::WEB_SEARCH => {
+                                let mut v = json!({
+                                    "type": "web_search_20250305",
+                                    "name": "web_search"
+                                });
+                                let domains = server_tool::allowed_domains(t);
+                                if !domains.is_empty() {
+                                    v["allowed_domains"] = Value::Array(domains);
+                                }
+                                v
+                            }
+                            _ => json!({
+                                "type": "code_execution_20250522",
+                                "name": "code_execution"
+                            }),
+                        });
+                    }
                     let name = t
                         .pointer("/function/name")
                         .and_then(|x| x.as_str())
@@ -369,18 +389,23 @@ pub fn openai_to_anthropic_with_max(
         .unwrap_or_default();
 
     if !tools.is_empty() {
-        if let Some(tc) = req.get("tool_choice") {
-            match tc.as_str() {
-                Some("auto") => {
-                    out.insert("tool_choice".into(), json!({"type":"auto"}));
-                }
-                Some("required") => {
-                    out.insert("tool_choice".into(), json!({"type":"any"}));
-                }
-                Some("none") => tools.clear(),
-                _ => {
-                    if let Some(name) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
-                        out.insert("tool_choice".into(), json!({"type":"tool","name":name}));
+        // `tool_choice` constrains function tools; with only server tools
+        // there is nothing to choose, and Anthropic may reject it.
+        let has_function_tools = tools.iter().any(|t| t.get("type").is_none());
+        if has_function_tools {
+            if let Some(tc) = req.get("tool_choice") {
+                match tc.as_str() {
+                    Some("auto") => {
+                        out.insert("tool_choice".into(), json!({"type":"auto"}));
+                    }
+                    Some("required") => {
+                        out.insert("tool_choice".into(), json!({"type":"any"}));
+                    }
+                    Some("none") => tools.clear(),
+                    _ => {
+                        if let Some(name) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                            out.insert("tool_choice".into(), json!({"type":"tool","name":name}));
+                        }
                     }
                 }
             }
@@ -497,6 +522,34 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
     let mut reasoning = String::new();
     let mut reasoning_details: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
+    let mut server_calls: Vec<Value> = vec![];
+    let mut citations: Vec<Value> = vec![];
+
+    let web_results = |b: &Value, server_calls: &mut Vec<Value>| {
+        let call_id = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+        let results: Vec<Value> = b
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let url = r.get("url").and_then(|x| x.as_str())?;
+                        Some(json!({
+                            "url": url,
+                            "title": r.get("title").cloned().unwrap_or(json!(""))
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match server_calls.iter_mut().rev().find(|c| {
+            c["type"] == server_tool::WEB_SEARCH
+                && (call_id.is_empty() || c["id"].as_str() == Some(call_id))
+        }) {
+            Some(call) => call["results"] = json!(results),
+            None => server_calls.push(server_tool::web_search("", results)),
+        }
+    };
 
     if let Some(blocks) = resp.get("content").and_then(|c| c.as_array()) {
         for b in blocks {
@@ -504,6 +557,62 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
                 Some("text") => {
                     if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
                         text.push_str(t);
+                    }
+                    for c in b
+                        .get("citations")
+                        .and_then(|x| x.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        let url = c.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                        if url.is_empty() {
+                            continue;
+                        }
+                        citations.push(server_tool::citation(
+                            url,
+                            c.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+                            c.get("cited_text").and_then(|x| x.as_str()).unwrap_or(""),
+                        ));
+                    }
+                }
+                Some("server_tool_use") => {
+                    let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let call_id = b.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                    if name.starts_with("web_search") {
+                        let query = b
+                            .pointer("/input/query")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let mut call = server_tool::web_search(query, vec![]);
+                        if !call_id.is_empty() {
+                            call["id"] = json!(call_id);
+                        }
+                        server_calls.push(call);
+                    } else if name.starts_with("code_execution") {
+                        let code = b
+                            .pointer("/input/code")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let mut call = server_tool::code_execution(code, "");
+                        if !call_id.is_empty() {
+                            call["id"] = json!(call_id);
+                        }
+                        server_calls.push(call);
+                    }
+                }
+                Some("web_search_tool_result") => web_results(b, &mut server_calls),
+                Some("code_execution_tool_result") => {
+                    let call_id = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+                    let output = b
+                        .pointer("/content/stdout")
+                        .or_else(|| b.pointer("/content/output"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    if let Some(call) = server_calls.iter_mut().rev().find(|c| {
+                        c["type"] == server_tool::CODE_EXECUTION
+                            && (call_id.is_empty() || c["id"].as_str() == Some(call_id))
+                    }) {
+                        call["output"] = json!(output);
                     }
                 }
                 Some("thinking") => {
@@ -582,6 +691,19 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         .unwrap_or(0);
     let prompt_total = in_tok + cached + cache_creation;
 
+    server_tool::locate_citations(&mut citations, &text);
+    if !citations.is_empty() {
+        let derived = server_tool::results_from_citations(&citations);
+        for call in &mut server_calls {
+            if call["type"] == server_tool::WEB_SEARCH
+                && call["results"].as_array().is_some_and(|r| r.is_empty())
+                && !derived.is_empty()
+            {
+                call["results"] = json!(derived);
+            }
+        }
+    }
+
     let mut message = json!({"role": "assistant", "content": text});
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
@@ -593,6 +715,12 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         message["tool_calls"] = Value::Array(tool_calls);
         message["content"] = Value::Null;
     }
+    if !server_calls.is_empty() {
+        message["server_tool_calls"] = Value::Array(server_calls);
+    }
+    if !citations.is_empty() {
+        message["citations"] = Value::Array(citations);
+    }
 
     json!({
         "id": id,
@@ -603,6 +731,65 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
         "usage": chat_usage(prompt_total, out_tok, cached, 0),
         "cache_creation_input_tokens": cache_creation
     })
+}
+
+/// Map an Anthropic citation object to the canonical one.
+fn anthropic_citation(c: &Value) -> Option<Value> {
+    let url = c.get("url").and_then(|x| x.as_str())?;
+    if url.is_empty() {
+        return None;
+    }
+    Some(server_tool::citation(
+        url,
+        c.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+        c.get("cited_text").and_then(|x| x.as_str()).unwrap_or(""),
+    ))
+}
+
+/// Build a canonical server-tool call from an Anthropic `server_tool_use`.
+fn anthropic_server_call(name: &str, id: &str, input: &Value) -> Option<Value> {
+    let mut call = if name.starts_with("web_search") {
+        server_tool::web_search(
+            input.get("query").and_then(|x| x.as_str()).unwrap_or(""),
+            vec![],
+        )
+    } else if name.starts_with("code_execution") {
+        server_tool::code_execution(input.get("code").and_then(|x| x.as_str()).unwrap_or(""), "")
+    } else {
+        return None;
+    };
+    if !id.is_empty() {
+        call["id"] = json!(id);
+    }
+    Some(call)
+}
+
+/// Merge a server-tool result block into the call it belongs to.
+fn merge_server_result(call: &mut Value, block_ty: &str, content: &Value) {
+    if block_ty == "web_search_tool_result" {
+        let results: Vec<Value> = content
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let url = r.get("url").and_then(|x| x.as_str())?;
+                        Some(json!({
+                            "url": url,
+                            "title": r.get("title").cloned().unwrap_or(json!(""))
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        call["results"] = json!(results);
+    } else {
+        let output = content
+            .get("stdout")
+            .or_else(|| content.get("output"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        call["output"] = json!(output);
+    }
 }
 
 /// Stateful translator for an Anthropic Messages SSE stream into OpenAI chunks.
@@ -620,6 +807,17 @@ pub struct AnthropicStream {
     /// emitted at stop with the whole block text, not just the signature, so
     /// a Chat client replaying `reasoning_details` has a complete block.
     thinking_text: String,
+    /// `server_tool_use` block being assembled, as `(id, name)`.
+    pending_server: Option<(String, String)>,
+    /// `input_json_delta` fragments for that block.
+    server_json: String,
+    /// Complete `input` carried by `content_block_start`, when the upstream
+    /// sends it whole instead of via deltas.
+    server_input: Option<Value>,
+    /// Completed server-tool call waiting for its result block.
+    pending_server_call: Option<Value>,
+    /// Result block content captured at `content_block_start`.
+    pending_result: Option<(String, Value)>,
     in_tok: i64,
     out_tok: i64,
     cached: i64,
@@ -637,6 +835,11 @@ impl AnthropicStream {
             block_ty: String::new(),
             thinking_sig: String::new(),
             thinking_text: String::new(),
+            pending_server: None,
+            server_json: String::new(),
+            server_input: None,
+            pending_server_call: None,
+            pending_result: None,
             in_tok: 0,
             out_tok: 0,
             cached: 0,
@@ -727,6 +930,30 @@ impl AnthropicStream {
                         None,
                     ));
                 }
+                if bt == "server_tool_use" {
+                    self.server_json.clear();
+                    self.server_input = ev.pointer("/content_block/input").cloned();
+                    let id = ev
+                        .pointer("/content_block/id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let name = ev
+                        .pointer("/content_block/name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    self.pending_server = Some((id.to_string(), name.to_string()));
+                }
+                if bt == "web_search_tool_result" || bt == "code_execution_tool_result" {
+                    let id = ev
+                        .pointer("/content_block/tool_use_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let content = ev
+                        .pointer("/content_block/content")
+                        .cloned()
+                        .unwrap_or(json!([]));
+                    self.pending_result = Some((id.to_string(), content));
+                }
             }
             "content_block_delta" => {
                 self.ensure_role(&mut out);
@@ -758,12 +985,27 @@ impl AnthropicStream {
                     }
                 } else if dt == "input_json_delta" {
                     if let Some(t) = ev.pointer("/delta/partial_json").and_then(|x| x.as_str()) {
-                        out.push(chunk(
-                            &self.id,
-                            &self.model,
-                            json!({"tool_calls":[{"index": self.tool_index, "function": {"arguments": t}}]}),
-                            None,
-                        ));
+                        if self.block_ty == "server_tool_use" {
+                            self.server_json.push_str(t);
+                        } else {
+                            out.push(chunk(
+                                &self.id,
+                                &self.model,
+                                json!({"tool_calls":[{"index": self.tool_index, "function": {"arguments": t}}]}),
+                                None,
+                            ));
+                        }
+                    }
+                } else if dt == "citations_delta" {
+                    if let Some(c) = ev.pointer("/delta/citation") {
+                        if let Some(citation) = anthropic_citation(c) {
+                            out.push(chunk(
+                                &self.id,
+                                &self.model,
+                                json!({"citations": [citation]}),
+                                None,
+                            ));
+                        }
                     }
                 }
             }
@@ -787,6 +1029,43 @@ impl AnthropicStream {
                 if self.block_ty == "tool_use" {
                     self.tool_index += 1;
                 }
+                if self.block_ty == "server_tool_use" {
+                    if let Some((id, name)) = self.pending_server.take() {
+                        let input: Value = serde_json::from_str(&self.server_json)
+                            .ok()
+                            .filter(|v: &Value| v.as_object().is_some_and(|o| !o.is_empty()))
+                            .or_else(|| self.server_input.take())
+                            .unwrap_or(json!({}));
+                        self.pending_server_call = anthropic_server_call(&name, &id, &input);
+                    }
+                    self.server_json.clear();
+                    self.server_input = None;
+                }
+                if self.block_ty == "web_search_tool_result"
+                    || self.block_ty == "code_execution_tool_result"
+                {
+                    let (id, content) = self
+                        .pending_result
+                        .take()
+                        .unwrap_or_else(|| (String::new(), json!([])));
+                    let mut call = self.pending_server_call.take().unwrap_or_else(|| {
+                        if self.block_ty == "web_search_tool_result" {
+                            server_tool::web_search("", vec![])
+                        } else {
+                            server_tool::code_execution("", "")
+                        }
+                    });
+                    if !id.is_empty() {
+                        call["id"] = json!(id);
+                    }
+                    merge_server_result(&mut call, &self.block_ty, &content);
+                    out.push(chunk(
+                        &self.id,
+                        &self.model,
+                        json!({"server_tool_calls": [call]}),
+                        None,
+                    ));
+                }
                 self.block_ty.clear();
                 self.thinking_sig.clear();
                 self.thinking_text.clear();
@@ -801,6 +1080,16 @@ impl AnthropicStream {
             }
             "message_stop" => {
                 self.ensure_role(&mut out);
+                // A server tool without a result block still deserves a call
+                // item; dropping it would hide that the provider ran it.
+                if let Some(call) = self.pending_server_call.take() {
+                    out.push(chunk(
+                        &self.id,
+                        &self.model,
+                        json!({"server_tool_calls": [call]}),
+                        None,
+                    ));
+                }
                 let fr = self.finish.clone().unwrap_or_else(|| "stop".to_string());
                 let mut c = chunk(&self.id, &self.model, json!({}), Some(&fr));
                 // Anthropic's `input_tokens` excludes cache reads; OpenAI's
@@ -1169,8 +1458,21 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
             let ot: Vec<Value> = tools
                 .iter()
                 .map(|t| {
+                    let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                    if ty.starts_with("web_search") {
+                        let domains = t
+                            .get("allowed_domains")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.iter().filter(|d| d.is_string()).cloned().collect())
+                            .unwrap_or_default();
+                        return server_tool::request_entry(server_tool::WEB_SEARCH, domains);
+                    }
+                    if ty.starts_with("code_execution") {
+                        return server_tool::request_entry(server_tool::CODE_EXECUTION, vec![]);
+                    }
+                    let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("");
                     json!({"type":"function","function":{
-                        "name": t.get("name").cloned().unwrap_or(json!("")),
+                        "name": name,
                         "description": t.get("description").cloned().unwrap_or(json!("")),
                         "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type":"object"}))
                     }})
@@ -1262,7 +1564,94 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
             tool_blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
         }
     }
-    let mut blocks = ordered_assistant_blocks(details, text, tool_blocks);
+    let mut blocks: Vec<Value> = vec![];
+    if let Some(calls) = msg.get("server_tool_calls").and_then(|x| x.as_array()) {
+        for call in calls {
+            match call.get("type").and_then(|x| x.as_str()) {
+                Some(server_tool::WEB_SEARCH) => {
+                    let id = call
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| gen_id("srvtoolu_"));
+                    let query = call.get("query").cloned().unwrap_or(json!(""));
+                    blocks.push(json!({
+                        "type": "server_tool_use", "id": id,
+                        "name": "web_search", "input": {"query": query}
+                    }));
+                    let results: Vec<Value> = call
+                        .get("results")
+                        .and_then(|x| x.as_array())
+                        .map(|rs| {
+                            rs.iter()
+                                .map(|r| {
+                                    json!({
+                                        "type": "web_search_result",
+                                        "url": r.get("url").cloned().unwrap_or(json!("")),
+                                        "title": r.get("title").cloned().unwrap_or(json!(""))
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    blocks.push(json!({
+                        "type": "web_search_tool_result", "tool_use_id": id,
+                        "content": results
+                    }));
+                }
+                Some(server_tool::CODE_EXECUTION) => {
+                    let id = call
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| gen_id("srvtoolu_"));
+                    let code = call.get("code").cloned().unwrap_or(json!(""));
+                    blocks.push(json!({
+                        "type": "server_tool_use", "id": id,
+                        "name": "code_execution", "input": {"code": code}
+                    }));
+                    blocks.push(json!({
+                        "type": "code_execution_tool_result", "tool_use_id": id,
+                        "content": {
+                            "type": "code_execution_result",
+                            "stdout": call.get("output").cloned().unwrap_or(json!("")),
+                            "stderr": ""
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    blocks.extend(ordered_assistant_blocks(details, text, tool_blocks));
+
+    // Web-search citations ride on the text block. Anthropic streams them
+    // alongside the text, but a non-streaming reply carries one array.
+    let mut citations = msg
+        .get("citations")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    server_tool::locate_citations(&mut citations, text);
+    if !citations.is_empty() {
+        let citation_blocks: Vec<Value> = citations
+            .iter()
+            .map(|c| {
+                json!({
+                    "type": "web_search_result_location",
+                    "url": c.get("url").cloned().unwrap_or(json!("")),
+                    "title": c.get("title").cloned().unwrap_or(json!("")),
+                    "cited_text": c.get("cited_text").cloned().unwrap_or(json!(""))
+                })
+            })
+            .collect();
+        for b in &mut blocks {
+            if b.get("type").and_then(|x| x.as_str()) == Some("text") {
+                b["citations"] = Value::Array(citation_blocks);
+                break;
+            }
+        }
+    }
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": ""}));
     }
@@ -1315,6 +1704,11 @@ pub struct ChatToAnthropicStream {
     /// Tool calls seen so far, in first-seen order so parallel calls keep
     /// their relative ordering in the Anthropic message.
     tools: Vec<(ToolKey, PendingTool)>,
+    /// Full answer text so far, used to derive `cited_text` for citations
+    /// that only carry offsets.
+    text: String,
+    /// Citations that arrived before the text block they annotate.
+    pending_citations: Vec<Value>,
 }
 
 impl ChatToAnthropicStream {
@@ -1328,6 +1722,8 @@ impl ChatToAnthropicStream {
             open: None,
             pending_thinking: String::new(),
             tools: vec![],
+            text: String::new(),
+            pending_citations: vec![],
         }
     }
 
@@ -1407,7 +1803,132 @@ impl ChatToAnthropicStream {
                 }),
             ));
             self.open = Some(index);
+            self.flush_citations(out);
         }
+    }
+
+    /// Render one canonical citation as an Anthropic location object.
+    fn citation_block(&self, c: &Value) -> Value {
+        let mut cited = c
+            .get("cited_text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if cited.is_empty() {
+            if let (Some(start), Some(end)) = (
+                c.get("start_index").and_then(|x| x.as_u64()),
+                c.get("end_index").and_then(|x| x.as_u64()),
+            ) {
+                cited = self
+                    .text
+                    .chars()
+                    .skip(start as usize)
+                    .take(end.saturating_sub(start) as usize)
+                    .collect();
+            }
+        }
+        json!({
+            "type": "web_search_result_location",
+            "url": c.get("url").cloned().unwrap_or(json!("")),
+            "title": c.get("title").cloned().unwrap_or(json!("")),
+            "cited_text": cited
+        })
+    }
+
+    /// Emit buffered citations, or hold them until a text block opens.
+    fn flush_citations(&mut self, out: &mut Vec<SseEvent>) {
+        let Some(index) = self.open else {
+            return;
+        };
+        for c in std::mem::take(&mut self.pending_citations) {
+            out.push(SseEvent::ev(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "citations_delta", "citation": self.citation_block(&c)}
+                }),
+            ));
+        }
+    }
+
+    fn queue_citations(&mut self, out: &mut Vec<SseEvent>, citations: &[Value]) {
+        self.pending_citations.extend(citations.iter().cloned());
+        self.flush_citations(out);
+    }
+
+    /// Emit a completed server-tool call as its `server_tool_use` block plus
+    /// the matching result block, both fully deltad and stopped.
+    fn emit_server(&mut self, out: &mut Vec<SseEvent>, call: &Value) {
+        self.close_open(out);
+        let id = call
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| gen_id("srvtoolu_"));
+        let is_search = call.get("type").and_then(|x| x.as_str()) == Some(server_tool::WEB_SEARCH);
+        let name = if is_search {
+            "web_search"
+        } else {
+            "code_execution"
+        };
+        let input = if is_search {
+            json!({"query": call.get("query").cloned().unwrap_or(json!(""))})
+        } else {
+            json!({"code": call.get("code").cloned().unwrap_or(json!(""))})
+        };
+
+        let index = self.index;
+        self.index += 1;
+        out.push(SseEvent::ev(
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "server_tool_use", "id": id, "name": name, "input": {}}
+            }),
+        ));
+        out.push(SseEvent::ev(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": input.to_string()}
+            }),
+        ));
+        out.push(SseEvent::ev(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+
+        let index = self.index;
+        self.index += 1;
+        let result = if is_search {
+            json!({
+                "type": "web_search_tool_result", "tool_use_id": id,
+                "content": call.get("results").and_then(|x| x.as_array()).map(|rs| {
+                    rs.iter().map(|r| json!({
+                        "type": "web_search_result",
+                        "url": r.get("url").cloned().unwrap_or(json!("")),
+                        "title": r.get("title").cloned().unwrap_or(json!(""))
+                    })).collect::<Vec<_>>()
+                }).unwrap_or_default()
+            })
+        } else {
+            json!({
+                "type": "code_execution_tool_result", "tool_use_id": id,
+                "content": {
+                    "type": "code_execution_result",
+                    "stdout": call.get("output").cloned().unwrap_or(json!("")),
+                    "stderr": ""
+                }
+            })
+        };
+        out.push(SseEvent::ev(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": index, "content_block": result}),
+        ));
+        out.push(SseEvent::ev(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
     }
 
     fn close_open(&mut self, out: &mut Vec<SseEvent>) {
@@ -1585,9 +2106,11 @@ impl ChatToAnthropicStream {
                             }),
                         ));
                         self.open = Some(ci);
+                        self.flush_citations(&mut out);
                         ci
                     }
                 };
+                self.text.push_str(t);
                 out.push(SseEvent::ev(
                     "content_block_delta",
                     json!({
@@ -1595,6 +2118,18 @@ impl ChatToAnthropicStream {
                         "delta": {"type": "text_delta", "text": t}
                     }),
                 ));
+            }
+        }
+
+        // Citations annotate the text that precedes them, so they must be
+        // flushed while that block is still open.
+        if let Some(citations) = delta.get("citations").and_then(|x| x.as_array()) {
+            self.queue_citations(&mut out, citations);
+        }
+
+        if let Some(calls) = delta.get("server_tool_calls").and_then(|x| x.as_array()) {
+            for call in calls {
+                self.emit_server(&mut out, call);
             }
         }
 

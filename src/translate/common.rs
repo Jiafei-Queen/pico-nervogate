@@ -62,15 +62,16 @@ pub fn chat_message_text(msg: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// True when the canonical request carries a tool entry that translation must
-/// drop because it has no function name (Responses/Anthropic built-ins).
+/// drop because it is neither a server tool nor a named function.
 pub fn has_nameless_tools(chat: &Value) -> bool {
     chat.get("tools")
         .and_then(|t| t.as_array())
         .is_some_and(|tools| {
             tools.iter().any(|t| {
-                t.pointer("/function/name")
-                    .and_then(|x| x.as_str())
-                    .is_none_or(str::is_empty)
+                super::server_tool::kind_of(t).is_none()
+                    && t.pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .is_none_or(str::is_empty)
             })
         })
 }

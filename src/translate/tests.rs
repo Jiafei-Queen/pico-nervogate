@@ -1619,22 +1619,25 @@ fn responses_stream_egress_keeps_a_signature_with_no_visible_text() {
 // ---- tools the wire format cannot name --------------------------------
 
 #[test]
-fn responses_nameless_tools_are_dropped() {
-    // Codex sends `{"type":"web_search"}` alongside its function tools. Chat
-    // has no equivalent, and an empty function name is a hard 400 upstream.
+fn responses_server_tools_survive_alongside_functions() {
+    // Codex sends `{"type":"web_search"}` alongside its function tools. The
+    // server tool is now carried instead of dropped; a built-in the hub
+    // cannot represent (file_search) is still dropped.
     let req = json!({
         "model": "m",
         "input": "hi",
         "tools": [
             {"type": "function", "name": "exec_command", "description": "run",
              "parameters": {"type": "object", "properties": {}}},
-            {"type": "web_search"}
+            {"type": "web_search"},
+            {"type": "file_search"}
         ]
     });
     let out = responses_to_chat_request(&req);
     let tools = out["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2, "{out}");
     assert_eq!(tools[0]["function"]["name"], "exec_command");
+    assert_eq!(tools[1], json!({"type": "web_search"}));
 }
 
 #[test]
@@ -1701,7 +1704,7 @@ fn named_tool_choice_must_survive_translation() {
 #[test]
 fn auto_and_none_choices_survive_dropped_tools() {
     let mut chat = json!({
-        "tools": [{"type": "code_interpreter"}],
+        "tools": [{"type": "file_search"}],
         "tool_choice": "auto"
     });
     assert!(unsatisfiable_tool_choice(&chat, "google").is_none());
@@ -1715,7 +1718,7 @@ fn auto_and_none_choices_survive_dropped_tools() {
 fn empty_tool_list_never_carries_a_tool_config() {
     let req = json!({
         "model": "m", "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "code_interpreter"}],
+        "tools": [{"type": "file_search"}],
         "tool_choice": "auto"
     });
     let out = super::google::chat_to_google_request(&req);
@@ -1727,24 +1730,32 @@ fn empty_tool_list_never_carries_a_tool_config() {
 fn dropped_tools_are_reported_for_every_translated_path() {
     let chat = json!({
         "model": "m", "messages": [],
-        "tools": [{"type": "code_interpreter"}]
+        "tools": [{"type": "file_search"}]
     });
     let msg = "nameless tools (dropped: not function tools)";
     assert!(chat_to_anthropic_loss(&chat).contains(&msg));
     assert!(chat_to_responses_loss(&chat).contains(&msg));
 
-    let responses = json!({"tools": [{"type": "web_search"}]});
+    let responses = json!({"tools": [{"type": "file_search"}]});
     assert!(!responses_to_chat_loss(&responses).is_empty());
+    // Server tools are carried, not dropped.
+    assert!(responses_to_chat_loss(&json!({"tools": [{"type": "web_search"}]})).is_empty());
     assert!(
         responses_to_chat_loss(&json!({"tools": [{"type": "function", "name": "f"}]})).is_empty()
     );
 
-    let google = json!({"tools": [{"googleSearch": {}}]});
+    let google = json!({"tools": [{"urlContext": {}}]});
     assert!(!super::google::google_to_chat_loss(&google).is_empty());
     assert!(super::google::google_to_chat_loss(
         &json!({"tools": [{"functionDeclarations": [{"name": "f"}]}]})
     )
     .is_empty());
+    assert!(
+        super::google::google_to_chat_loss(&json!({"tools": [{"googleSearch": {}}]})).is_empty()
+    );
+    assert!(
+        super::google::google_to_chat_loss(&json!({"tools": [{"codeExecution": {}}]})).is_empty()
+    );
 }
 
 #[test]
@@ -1754,7 +1765,7 @@ fn responses_nameless_tools_are_dropped_between_chat_and_responses() {
         "model": "m", "messages": [{"role": "user", "content": "hi"}],
         "tools": [
             {"type": "function", "function": {"name": "f"}},
-            {"type": "code_interpreter"}
+            {"type": "file_search"}
         ],
         "tool_choice": "auto"
     });
@@ -1765,10 +1776,434 @@ fn responses_nameless_tools_are_dropped_between_chat_and_responses() {
     assert_eq!(out["tool_choice"], json!("auto"));
 
     let mut req = req;
-    req["tools"] = json!([{"type": "code_interpreter"}]);
+    req["tools"] = json!([{"type": "file_search"}]);
     let out = chat_to_responses_request(&req);
     assert!(out.get("tools").is_none());
     assert!(out.get("tool_choice").is_none());
+}
+
+// ---- server tools (web search, code execution) -----------------------
+
+#[test]
+fn server_tools_map_to_every_request_shape() {
+    let chat = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "web_search", "allowed_domains": ["example.com"]},
+            {"type": "code_execution"}
+        ]
+    });
+
+    let g = super::google::chat_to_google_request(&chat);
+    let tools = g["tools"].as_array().expect("google tools");
+    assert_eq!(tools[0], json!({"googleSearch": {}}));
+    assert_eq!(tools[1], json!({"codeExecution": {}}));
+
+    let r = chat_to_responses_request(&chat);
+    let tools = r["tools"].as_array().expect("responses tools");
+    assert_eq!(
+        tools[0],
+        json!({"type": "web_search", "filters": {"allowed_domains": ["example.com"]}})
+    );
+    assert_eq!(tools[1]["type"], json!("code_interpreter"));
+    assert_eq!(tools[1]["container"]["type"], json!("auto"));
+
+    let a = openai_to_anthropic(&chat, ThinkingMode::Adaptive);
+    let tools = a["tools"].as_array().expect("anthropic tools");
+    assert_eq!(tools[0]["type"], json!("web_search_20250305"));
+    assert_eq!(tools[0]["name"], json!("web_search"));
+    assert_eq!(tools[0]["allowed_domains"], json!(["example.com"]));
+    assert_eq!(tools[1]["type"], json!("code_execution_20250522"));
+    assert_eq!(tools[1]["name"], json!("code_execution"));
+}
+
+#[test]
+fn server_tools_map_from_every_ingress_shape() {
+    let responses = json!({
+        "model": "m", "input": "hi",
+        "tools": [
+            {"type": "web_search", "filters": {"allowed_domains": ["a.com"]}},
+            {"type": "code_interpreter"}
+        ]
+    });
+    let chat = responses_to_chat_request(&responses);
+    assert_eq!(
+        chat["tools"][0],
+        json!({"type": "web_search", "allowed_domains": ["a.com"]})
+    );
+    assert_eq!(chat["tools"][1], json!({"type": "code_execution"}));
+
+    let anthropic = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search",
+             "allowed_domains": ["b.com"]},
+            {"type": "code_execution_20250522", "name": "code_execution"}
+        ]
+    });
+    let chat = anthropic_to_chat_request(&anthropic);
+    assert_eq!(
+        chat["tools"][0],
+        json!({"type": "web_search", "allowed_domains": ["b.com"]})
+    );
+    assert_eq!(chat["tools"][1], json!({"type": "code_execution"}));
+
+    let google = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{"googleSearch": {}}, {"codeExecution": {}}]
+    });
+    let chat = super::google::google_to_chat_request(&google, "m");
+    assert_eq!(chat["tools"][0], json!({"type": "web_search"}));
+    assert_eq!(chat["tools"][1], json!({"type": "code_execution"}));
+}
+
+#[test]
+fn anthropic_web_search_round_trips_through_chat() {
+    let resp = json!({
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+             "input": {"query": "weather"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+             "content": [{"type": "web_search_result",
+                          "url": "https://e.com/a", "title": "A"}]},
+            {"type": "text", "text": "Sunny in Paris.", "citations": [
+                {"type": "web_search_result_location", "url": "https://e.com/a",
+                 "title": "A", "cited_text": "Sunny"}]}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 2}
+    });
+    let chat = anthropic_to_openai(&resp, "m");
+    let msg = &chat["choices"][0]["message"];
+    assert_eq!(msg["server_tool_calls"][0]["type"], json!("web_search"));
+    assert_eq!(msg["server_tool_calls"][0]["query"], json!("weather"));
+    assert_eq!(
+        msg["server_tool_calls"][0]["results"][0]["url"],
+        json!("https://e.com/a")
+    );
+    assert_eq!(msg["citations"][0]["cited_text"], json!("Sunny"));
+
+    let back = chat_to_anthropic_response(&chat, "m");
+    let kinds: Vec<&str> = back["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["server_tool_use", "web_search_tool_result", "text"]
+    );
+    assert_eq!(
+        back["content"][2]["citations"][0]["url"],
+        json!("https://e.com/a")
+    );
+
+    let r = chat_to_responses_response(&chat, "m");
+    assert_eq!(r["output"][0]["type"], json!("web_search_call"));
+    assert_eq!(r["output"][0]["action"]["query"], json!("weather"));
+    assert_eq!(
+        r["output"][1]["content"][0]["annotations"][0]["url"],
+        json!("https://e.com/a")
+    );
+
+    let g = super::google::chat_to_google_response(&chat, "m");
+    let gm = &g["candidates"][0]["groundingMetadata"];
+    assert_eq!(gm["webSearchQueries"][0], json!("weather"));
+    assert_eq!(
+        gm["groundingChunks"][0]["web"]["uri"],
+        json!("https://e.com/a")
+    );
+}
+
+#[test]
+fn google_code_execution_round_trips_through_chat() {
+    let resp = json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [
+                {"executableCode": {"language": "PYTHON", "code": "print(1)"}},
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1"}},
+                {"text": "The answer is 1."}
+            ]},
+            "finishReason": "STOP", "index": 0
+        }],
+        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1,
+                          "totalTokenCount": 2}
+    });
+    let chat = super::google::google_to_chat(&resp, "m");
+    let msg = &chat["choices"][0]["message"];
+    assert_eq!(msg["server_tool_calls"][0]["type"], json!("code_execution"));
+    assert_eq!(msg["server_tool_calls"][0]["code"], json!("print(1)"));
+    assert_eq!(msg["server_tool_calls"][0]["output"], json!("1"));
+
+    let a = chat_to_anthropic_response(&chat, "m");
+    let kinds: Vec<&str> = a["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["server_tool_use", "code_execution_tool_result", "text"]
+    );
+    assert_eq!(a["content"][1]["content"]["stdout"], json!("1"));
+
+    let g = super::google::chat_to_google_response(&chat, "m");
+    let parts = g["candidates"][0]["content"]["parts"].as_array().unwrap();
+    assert_eq!(parts[0]["executableCode"]["code"], json!("print(1)"));
+    assert_eq!(parts[1]["codeExecutionResult"]["output"], json!("1"));
+}
+
+#[test]
+fn chat_builtin_aliases_map_to_server_tools() {
+    let req = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "code_interpreter"}, {"type": "web_search_preview"}]
+    });
+    let g = super::google::chat_to_google_request(&req);
+    let tools = g["tools"].as_array().expect("google tools");
+    assert_eq!(tools[0], json!({"codeExecution": {}}));
+    assert_eq!(tools[1], json!({"googleSearch": {}}));
+}
+
+#[test]
+fn responses_web_search_round_trips_through_chat() {
+    let resp = json!({
+        "status": "completed",
+        "output": [
+            {"id": "ws_1", "type": "web_search_call", "status": "completed",
+             "action": {"type": "search", "query": "capital"}},
+            {"id": "msg_1", "type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Paris.", "annotations": [
+                    {"type": "url_citation", "url": "https://e.com/p",
+                     "title": "P", "start_index": 0, "end_index": 5}]}
+            ]}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let chat = responses_to_openai(&resp, "m");
+    let msg = &chat["choices"][0]["message"];
+    assert_eq!(msg["server_tool_calls"][0]["id"], json!("ws_1"));
+    assert_eq!(msg["server_tool_calls"][0]["query"], json!("capital"));
+    // Results are derived from the annotations.
+    assert_eq!(
+        msg["server_tool_calls"][0]["results"][0]["url"],
+        json!("https://e.com/p")
+    );
+    assert_eq!(msg["citations"][0]["cited_text"], json!("Paris"));
+
+    let g = super::google::chat_to_google_response(&chat, "m");
+    assert_eq!(
+        g["candidates"][0]["groundingMetadata"]["groundingChunks"][0]["web"]["uri"],
+        json!("https://e.com/p")
+    );
+}
+
+#[test]
+fn anthropic_stream_forwards_server_tools_and_citations() {
+    let mut s = AnthropicStream::new("m");
+    let mut chunks = vec![];
+    chunks.extend(s.handle(&json!({
+        "type": "message_start", "message": {"usage": {"input_tokens": 1}}
+    })));
+    chunks.extend(s.handle(&json!({
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "server_tool_use", "id": "srvtoolu_1",
+                          "name": "web_search", "input": {}}
+    })));
+    chunks.extend(s.handle(&json!({
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"q\"}"}
+    })));
+    chunks.extend(s.handle(&json!({"type": "content_block_stop", "index": 0})));
+    chunks.extend(s.handle(&json!({
+        "type": "content_block_start", "index": 1,
+        "content_block": {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                          "content": [{"type": "web_search_result",
+                                       "url": "https://e.com", "title": "E"}]}
+    })));
+    chunks.extend(s.handle(&json!({"type": "content_block_stop", "index": 1})));
+
+    let call = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/server_tool_calls/0"))
+        .expect("server tool call");
+    assert_eq!(call["id"], json!("srvtoolu_1"));
+    assert_eq!(call["query"], json!("q"));
+    assert_eq!(call["results"][0]["url"], json!("https://e.com"));
+}
+
+#[test]
+fn chat_to_anthropic_stream_emits_server_blocks_and_citations() {
+    let mut s = ChatToAnthropicStream::new("m");
+    let mut events = s.handle(&json!({"choices": [{"delta": {"content": "Paris is nice."}}]}));
+    events.extend(s.handle(&json!({"choices": [{"delta": {
+        "server_tool_calls": [{
+            "id": "srv_1", "type": "web_search", "query": "q",
+            "results": [{"url": "https://e.com", "title": "E"}]
+        }],
+        "citations": [{"url": "https://e.com", "title": "E",
+                       "start_index": 0, "end_index": 5}]
+    }}]})));
+
+    let blocks: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event.as_deref() == Some("content_block_start"))
+        .map(|e| e.data["content_block"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        blocks,
+        vec!["text", "server_tool_use", "web_search_tool_result"]
+    );
+
+    let citation = events
+        .iter()
+        .find(|e| e.data.pointer("/delta/type").and_then(|x| x.as_str()) == Some("citations_delta"))
+        .expect("citations delta");
+    assert_eq!(
+        citation.data["delta"]["citation"]["cited_text"],
+        json!("Paris")
+    );
+}
+
+#[test]
+fn google_stream_forwards_code_execution_and_grounding() {
+    let mut s = super::google::GoogleStream::new("m");
+    let mut chunks = s.handle(&json!({"candidates": [{
+        "content": {"role": "model", "parts": [
+            {"executableCode": {"language": "PYTHON", "code": "print(1)"}},
+            {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1"}},
+            {"text": "One."}
+        ]},
+        "index": 0
+    }]}));
+    chunks.extend(s.handle(&json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": []},
+            "finishReason": "STOP", "index": 0,
+            "groundingMetadata": {
+                "webSearchQueries": ["q"],
+                "groundingChunks": [{"web": {"uri": "https://e.com", "title": "E"}}],
+                "groundingSupports": [{
+                    "segment": {"startIndex": 0, "endIndex": 3, "text": "One"},
+                    "groundingChunkIndices": [0]
+                }]
+            }
+        }],
+        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1,
+                          "totalTokenCount": 2}
+    })));
+
+    let call = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/server_tool_calls/0"))
+        .expect("code execution call");
+    assert_eq!(call["code"], json!("print(1)"));
+    assert_eq!(call["output"], json!("1"));
+    let citation = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/citations/0"))
+        .expect("citation");
+    assert_eq!(citation["url"], json!("https://e.com"));
+    assert_eq!(citation["cited_text"], json!("One"));
+}
+
+#[test]
+fn chat_to_google_stream_emits_code_parts_and_grounding() {
+    let mut s = super::google::ChatToGoogleStream::new("m");
+    let mut events = s.handle(&json!({"choices": [{"delta": {"content": "One."}}]}));
+    events.extend(s.handle(&json!({"choices": [{"delta": {
+        "server_tool_calls": [
+            {"id": "srv_1", "type": "web_search", "query": "q",
+             "results": [{"url": "https://e.com", "title": "E"}]},
+            {"id": "srv_2", "type": "code_execution", "code": "print(1)", "output": "1"}
+        ],
+        "citations": [{"url": "https://e.com", "title": "E",
+                       "start_index": 0, "end_index": 3}]
+    }}]})));
+    events.extend(s.handle(&json!({
+        "choices": [{"delta": {}, "finish_reason": "stop"}]
+    })));
+
+    let code = events
+        .iter()
+        .find_map(|e| {
+            e.data
+                .pointer("/candidates/0/content/parts/0/executableCode")
+        })
+        .expect("executableCode part");
+    assert_eq!(code["code"], json!("print(1)"));
+
+    let gm = events
+        .iter()
+        .find_map(|e| e.data.pointer("/candidates/0/groundingMetadata"))
+        .expect("grounding metadata");
+    assert_eq!(gm["webSearchQueries"][0], json!("q"));
+    assert_eq!(
+        gm["groundingChunks"][0]["web"]["uri"],
+        json!("https://e.com")
+    );
+}
+
+#[test]
+fn responses_stream_forwards_server_tools_and_annotations() {
+    let mut s = ResponsesStream::new("m");
+    let mut chunks = s.handle(&json!({
+        "type": "response.output_item.done",
+        "item": {"id": "ws_1", "type": "web_search_call", "status": "completed",
+                 "action": {"type": "search", "query": "q"}}
+    }));
+    chunks.extend(s.handle(&json!({
+        "type": "response.output_text.annotation.added",
+        "annotation": {"type": "url_citation", "url": "https://e.com",
+                       "title": "E", "start_index": 0, "end_index": 3}
+    })));
+    let call = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/server_tool_calls/0"))
+        .expect("server call");
+    assert_eq!(call["id"], json!("ws_1"));
+    let citation = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/citations/0"))
+        .expect("citation");
+    assert_eq!(citation["url"], json!("https://e.com"));
+}
+
+#[test]
+fn chat_to_responses_stream_emits_server_items_and_annotations() {
+    let mut s = ChatToResponsesStream::new("m");
+    let mut events = s.handle(&json!({"choices": [{"delta": {"content": "Paris is nice."}}]}));
+    events.extend(s.handle(&json!({"choices": [{"delta": {
+        "server_tool_calls": [{
+            "id": "srv_1", "type": "web_search", "query": "q",
+            "results": [{"url": "https://e.com", "title": "E"}]
+        }],
+        "citations": [{"url": "https://e.com", "title": "E",
+                       "start_index": 0, "end_index": 5}]
+    }}]})));
+    events.extend(s.handle(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})));
+
+    let done = events
+        .iter()
+        .find(|e| {
+            e.data["type"] == "response.output_item.done"
+                && e.data["item"]["type"] == "web_search_call"
+        })
+        .expect("web_search_call item");
+    assert_eq!(done.data["item"]["action"]["query"], json!("q"));
+
+    let msg = events
+        .iter()
+        .find(|e| {
+            e.data["type"] == "response.output_item.done" && e.data["item"]["type"] == "message"
+        })
+        .expect("message item");
+    assert_eq!(
+        msg.data["item"]["content"][0]["annotations"][0]["url"],
+        json!("https://e.com")
+    );
 }
 
 // ---- reasoning ordering, ids and alternate schemas -------------------

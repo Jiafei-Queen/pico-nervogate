@@ -12,13 +12,28 @@ Translation details worth knowing:
   including multi-call turns and tool results. Gemini has no call ids, so the
   gateway synthesizes `call_*` ids on the way to Chat and matches
   `functionResponse` back by function name; tool output text that is not a
-  JSON object is wrapped as `{"result": ...}`. A nameless tool (Responses
-  built-ins such as `web_search`) has no equivalent on the translated
-  protocols and is dropped rather than forwarded with an empty name, which
-  they all reject; every drop is logged. A forced `tool_choice`
+  JSON object is wrapped as `{"result": ...}`. A built-in tool the hub cannot
+  carry (`file_search`, `mcp`, `image_generation`, ...) has no equivalent on
+  the translated protocols and is dropped rather than forwarded with an empty
+  name, which they all reject; every drop is logged. A forced `tool_choice`
   (`required`/`any` or a named tool) that the remaining function tools cannot
   satisfy is rejected with HTTP 400 instead of forwarding a contradictory
   body — `auto`/`none` still work without tools.
+- **Server tools**: `web_search` and `code_execution` run at the provider and
+  round-trip across Responses (`web_search` / `code_interpreter`), Anthropic
+  (`web_search_20250305` / `code_execution_20250522`) and Google
+  (`google_search` / `code_execution`). The canonical message reports
+  `server_tool_calls` (query + results, or code + output) and `citations`
+  (url, title, cited text, character span); streams carry the same objects in
+  `delta.server_tool_calls` / `delta.citations`. Results and citations are
+  synthesized from whatever the provider reports (Responses annotations,
+  Anthropic result blocks, Gemini `groundingMetadata`), so they are only as
+  complete as the source. `tool_choice` still applies to function tools only:
+  with server tools alone, forcing a call is the HTTP 400 above. The
+  Chat-shaped aliases `web_search_preview` and `code_interpreter` are
+  accepted. An OpenAI Chat upstream has no server-tool equivalent, so
+  `web_search` / `code_execution` entries are forwarded verbatim there and
+  the upstream decides.
 - **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
   Chat shape, plus a per-block `reasoning_details` array carrying the opaque
   replay token. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
@@ -69,7 +84,8 @@ Translation details worth knowing:
   `MALFORMED_FUNCTION_CALL` surfaces as a gateway error, never a normal tool
   turn; `usageMetadata` maps onto the canonical usage including
   `thoughtsTokenCount` → `reasoning_tokens`; tools without a function name
-  (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped, and
+  that are not server tools are dropped, `google_search` /
+  `code_execution` map to the canonical server tools, and
   `toolConfig` is only emitted when at least one declaration survives;
   `additionalProperties`, `$schema`, `$id`, `$defs`, `$ref` and `strict`
   are stripped from tool schemas at every depth —

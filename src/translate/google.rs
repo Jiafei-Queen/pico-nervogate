@@ -15,6 +15,7 @@
 use serde_json::{json, Value};
 
 use super::common::*;
+use super::server_tool;
 
 // ---------------------------------------------------------------------------
 // Action parsing (ingress path)
@@ -344,11 +345,11 @@ pub fn chat_to_google_request(req: &Value) -> Value {
     }
     out.insert("contents".into(), Value::Array(contents));
 
-    // Tools. Entries without a function name (e.g. OpenAI's
-    // `{"type": "code_interpreter"}`, which has no Google equivalent) are
-    // dropped: Gemini rejects empty declaration names with a 400.
-    // Parameter schemas are sanitized for Google's restricted subset
-    // (unknown keys are rejected with a 400, empty on streaming).
+    // Tools. Function entries without a name are dropped: Gemini rejects
+    // empty declaration names with a 400. Server tools become their own Tool
+    // entries. Parameter schemas are sanitized for Google's restricted
+    // subset (unknown keys are rejected with a 400, empty on streaming).
+    let mut tool_entries: Vec<Value> = vec![];
     let mut has_decls = false;
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let decls: Vec<Value> = tools
@@ -372,8 +373,18 @@ pub fn chat_to_google_request(req: &Value) -> Value {
             .collect();
         if !decls.is_empty() {
             has_decls = true;
-            out.insert("tools".into(), json!([{"functionDeclarations": decls}]));
+            tool_entries.push(json!({"functionDeclarations": decls}));
         }
+        for t in tools {
+            match server_tool::kind_of(t) {
+                Some(server_tool::WEB_SEARCH) => tool_entries.push(json!({"googleSearch": {}})),
+                Some(_) => tool_entries.push(json!({"codeExecution": {}})),
+                None => {}
+            }
+        }
+    }
+    if !tool_entries.is_empty() {
+        out.insert("tools".into(), Value::Array(tool_entries));
     }
     // A toolConfig with no declarations has nothing to constrain, so it is
     // omitted. That also keeps `auto` / `none` from becoming a contradictory
@@ -586,10 +597,23 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
         .copied()
         .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
         .collect();
-    // Non-function tools (e.g. `{"type": "code_interpreter"}`) have no
-    // Google equivalent and are dropped from the request.
+    // Nameless non-server tools (e.g. `{"type": "code_interpreter"}` shaped
+    // without a name) have no Google equivalent and are dropped.
     if has_nameless_tools(req) {
         out.push("nameless tools (dropped: not function tools)");
+    }
+    // Gemini has no domain filter for Google Search grounding.
+    if req
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|ts| {
+            ts.iter().any(|t| {
+                server_tool::kind_of(t) == Some(server_tool::WEB_SEARCH)
+                    && !server_tool::allowed_domains(t).is_empty()
+            })
+        })
+    {
+        out.push("web search allowed_domains (unsupported by Google)");
     }
     // Unsupported schema keys are stripped from tool schemas (see above).
     if req
@@ -607,23 +631,29 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
     out
 }
 
-/// Google tools that are not `functionDeclarations` (`googleSearch`,
-/// `codeExecution`, `urlContext`, ...) have no Chat equivalent, so the
-/// ingress normalizer drops them.
+/// Google tools that are neither `functionDeclarations` nor the supported
+/// server tools (`googleSearch`, `codeExecution`) have no Chat equivalent, so
+/// the ingress normalizer drops them.
 pub fn google_to_chat_loss(req: &Value) -> Vec<&'static str> {
     let dropped = req
         .get("tools")
         .and_then(|t| t.as_array())
         .is_some_and(|tools| {
             tools.iter().any(|t| {
-                t.get("functionDeclarations")
+                let is_server = t.get("googleSearch").is_some()
+                    || t.get("google_search").is_some()
+                    || t.get("codeExecution").is_some()
+                    || t.get("code_execution").is_some();
+                let has_decls = t
+                    .get("functionDeclarations")
                     .or_else(|| t.get("function_declarations"))
                     .and_then(|d| d.as_array())
-                    .is_none_or(|d| d.is_empty())
+                    .is_some_and(|d| !d.is_empty());
+                !is_server && !has_decls
             })
         });
     dropped
-        .then_some("non-function tools (dropped: only functionDeclarations translate)")
+        .then_some("non-function tools (dropped: only declarations and server tools translate)")
         .into_iter()
         .collect()
 }
@@ -677,6 +707,77 @@ fn candidate_parts(cand: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Web-search calls and citations carried by Gemini's `groundingMetadata`.
+fn grounding_tools(cand: &Value) -> (Vec<Value>, Vec<Value>) {
+    let Some(gm) = cand
+        .get("groundingMetadata")
+        .or_else(|| cand.get("grounding_metadata"))
+    else {
+        return (vec![], vec![]);
+    };
+    let queries: Vec<&str> = gm
+        .get("webSearchQueries")
+        .or_else(|| gm.get("web_search_queries"))
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|q| q.as_str()).collect())
+        .unwrap_or_default();
+    let chunks: Vec<Value> = gm
+        .get("groundingChunks")
+        .or_else(|| gm.get("grounding_chunks"))
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let web = c.get("web")?;
+                    let url = web.get("uri").or_else(|| web.get("url"))?.as_str()?;
+                    Some(json!({
+                        "url": url,
+                        "title": web.get("title").cloned().unwrap_or(json!(""))
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut citations: Vec<Value> = vec![];
+    if let Some(supports) = gm
+        .get("groundingSupports")
+        .or_else(|| gm.get("grounding_supports"))
+        .and_then(|x| x.as_array())
+    {
+        for s in supports {
+            let Some(seg) = s.get("segment") else {
+                continue;
+            };
+            let cited = seg.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            let Some(indices) = s
+                .get("groundingChunkIndices")
+                .or_else(|| s.get("grounding_chunk_indices"))
+                .and_then(|x| x.as_array())
+            else {
+                continue;
+            };
+            for i in indices {
+                let Some(chunk) = i.as_u64().and_then(|i| chunks.get(i as usize)) else {
+                    continue;
+                };
+                citations.push(server_tool::citation(
+                    chunk.get("url").and_then(|x| x.as_str()).unwrap_or(""),
+                    chunk.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+                    cited,
+                ));
+            }
+        }
+    }
+    let mut calls: Vec<Value> = vec![];
+    if !chunks.is_empty() || !queries.is_empty() {
+        calls.push(server_tool::web_search(
+            queries.first().copied().unwrap_or(""),
+            chunks,
+        ));
+    }
+    (calls, citations)
+}
+
 /// Gemini `GenerateContentResponse` -> canonical chat completion.
 pub fn google_to_chat(resp: &Value, model: &str) -> Value {
     let cand = first_candidate(resp);
@@ -689,9 +790,25 @@ pub fn google_to_chat(resp: &Value, model: &str) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = vec![];
+    let mut server_calls: Vec<Value> = vec![];
+    let mut pending_code: Option<String> = None;
 
     for p in candidate_parts(&cand) {
-        if let Some((name, args)) = get_function_call(&p) {
+        if let Some(ec) = p.get("executableCode").or_else(|| p.get("executable_code")) {
+            pending_code = Some(
+                ec.get("code")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        } else if let Some(cer) = p
+            .get("codeExecutionResult")
+            .or_else(|| p.get("code_execution_result"))
+        {
+            let output = cer.get("output").and_then(|x| x.as_str()).unwrap_or("");
+            let code = pending_code.take().unwrap_or_default();
+            server_calls.push(server_tool::code_execution(&code, output));
+        } else if let Some((name, args)) = get_function_call(&p) {
             let args_str = match &args {
                 Value::String(s) => s.clone(),
                 _ => serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
@@ -721,6 +838,10 @@ pub fn google_to_chat(resp: &Value, model: &str) -> Value {
     let finish = google_finish(finish_raw, !tool_calls.is_empty());
     let (p_tok, c_tok, cached, reasoning_tok) = google_usage_parts(resp);
 
+    let (ground_calls, mut citations) = grounding_tools(&cand);
+    server_calls.extend(ground_calls);
+    server_tool::locate_citations(&mut citations, &text);
+
     let mut message = json!({"role": "assistant", "content": text});
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
@@ -728,6 +849,12 @@ pub fn google_to_chat(resp: &Value, model: &str) -> Value {
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
         message["content"] = Value::Null;
+    }
+    if !server_calls.is_empty() {
+        message["server_tool_calls"] = Value::Array(server_calls);
+    }
+    if !citations.is_empty() {
+        message["citations"] = Value::Array(citations);
     }
 
     let mut out = json!({
@@ -970,6 +1097,23 @@ pub fn google_to_chat_request(req: &Value, model: &str) -> Value {
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let mut ot: Vec<Value> = vec![];
         for t in tools {
+            if t.get("googleSearch")
+                .or_else(|| t.get("google_search"))
+                .is_some()
+            {
+                ot.push(server_tool::request_entry(server_tool::WEB_SEARCH, vec![]));
+                continue;
+            }
+            if t.get("codeExecution")
+                .or_else(|| t.get("code_execution"))
+                .is_some()
+            {
+                ot.push(server_tool::request_entry(
+                    server_tool::CODE_EXECUTION,
+                    vec![],
+                ));
+                continue;
+            }
             let decls = t
                 .get("functionDeclarations")
                 .or_else(|| t.get("function_declarations"))
@@ -1051,6 +1195,93 @@ fn lowercase_schema(v: Value) -> Value {
 // Chat -> Google response (ingress Google)
 // ---------------------------------------------------------------------------
 
+/// Build Gemini `groundingMetadata` from the canonical web-search calls and
+/// citations. Used by the non-stream and stream egress paths.
+fn chat_grounding(msg: &Value, text: &str) -> Option<Value> {
+    let mut citations = msg
+        .get("citations")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    server_tool::locate_citations(&mut citations, text);
+    let mut queries: Vec<Value> = vec![];
+    let mut chunks: Vec<Value> = vec![];
+    if let Some(calls) = msg.get("server_tool_calls").and_then(|x| x.as_array()) {
+        for call in calls {
+            if call.get("type").and_then(|x| x.as_str()) != Some(server_tool::WEB_SEARCH) {
+                continue;
+            }
+            if let Some(q) = call
+                .get("query")
+                .and_then(|x| x.as_str())
+                .filter(|q| !q.is_empty())
+            {
+                if !queries.iter().any(|x| x == &json!(q)) {
+                    queries.push(json!(q));
+                }
+            }
+            for r in call
+                .get("results")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let url = r.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                if url.is_empty()
+                    || chunks
+                        .iter()
+                        .any(|c| c.pointer("/web/uri").and_then(|x| x.as_str()) == Some(url))
+                {
+                    continue;
+                }
+                chunks.push(json!({"web": {
+                    "uri": url,
+                    "title": r.get("title").cloned().unwrap_or(json!(""))
+                }}));
+            }
+        }
+    }
+    if citations.is_empty() && queries.is_empty() && chunks.is_empty() {
+        return None;
+    }
+    let mut supports: Vec<Value> = vec![];
+    for c in &citations {
+        let url = c.get("url").and_then(|x| x.as_str()).unwrap_or("");
+        let idx = match chunks
+            .iter()
+            .position(|ch| ch.pointer("/web/uri").and_then(|x| x.as_str()) == Some(url))
+        {
+            Some(i) => i,
+            None => {
+                chunks.push(json!({"web": {
+                    "uri": url,
+                    "title": c.get("title").cloned().unwrap_or(json!(""))
+                }}));
+                chunks.len() - 1
+            }
+        };
+        supports.push(json!({
+            "segment": {
+                "startIndex": c.get("start_index").cloned().unwrap_or(json!(0)),
+                "endIndex": c
+                    .get("end_index")
+                    .cloned()
+                    .unwrap_or(json!(text.chars().count())),
+                "text": c.get("cited_text").cloned().unwrap_or(json!(""))
+            },
+            "groundingChunkIndices": [idx]
+        }));
+    }
+    let mut gm = json!({"groundingChunks": chunks});
+    if !queries.is_empty() {
+        gm["webSearchQueries"] = Value::Array(queries);
+    }
+    if !supports.is_empty() {
+        gm["groundingSupports"] = Value::Array(supports);
+    }
+    Some(gm)
+}
+
 /// Canonical chat completion -> Gemini `generateContent` response.
 pub fn chat_to_google_response(chat: &Value, model: &str) -> Value {
     let msg = chat
@@ -1062,6 +1293,21 @@ pub fn chat_to_google_response(chat: &Value, model: &str) -> Value {
     if let Some(r) = msg.get("reasoning_content").and_then(|x| x.as_str()) {
         if !r.is_empty() {
             parts.push(json!({"thought": true, "text": r}));
+        }
+    }
+    if let Some(calls) = msg.get("server_tool_calls").and_then(|x| x.as_array()) {
+        for call in calls {
+            if call.get("type").and_then(|x| x.as_str()) != Some(server_tool::CODE_EXECUTION) {
+                continue;
+            }
+            parts.push(json!({"executableCode": {
+                "language": "PYTHON",
+                "code": call.get("code").cloned().unwrap_or(json!(""))
+            }}));
+            parts.push(json!({"codeExecutionResult": {
+                "outcome": "OUTCOME_OK",
+                "output": call.get("output").cloned().unwrap_or(json!(""))
+            }}));
         }
     }
     match msg.get("content") {
@@ -1117,12 +1363,18 @@ pub fn chat_to_google_response(chat: &Value, model: &str) -> Value {
     };
     let (p, c, cached, reasoning_tok) = crate::translate::chat_usage_parts(chat.get("usage"));
 
+    let text = crate::translate::chat_message_text(&msg);
+    let mut cand = json!({
+        "content": {"role": "model", "parts": parts},
+        "finishReason": finish_reason,
+        "index": 0
+    });
+    if let Some(gm) = chat_grounding(&msg, &text) {
+        cand["groundingMetadata"] = gm;
+    }
+
     json!({
-        "candidates": [{
-            "content": {"role": "model", "parts": parts},
-            "finishReason": finish_reason,
-            "index": 0
-        }],
+        "candidates": [cand],
         "modelVersion": model,
         "usageMetadata": {
             "promptTokenCount": p,
@@ -1146,6 +1398,11 @@ pub struct GoogleStream {
     model: String,
     role_sent: bool,
     tool_index: i64,
+    /// `executableCode` part waiting for its `codeExecutionResult`.
+    pending_code: Option<String>,
+    /// Answer text so far, for citation offsets.
+    text: String,
+    grounding_done: bool,
     in_tok: i64,
     out_tok: i64,
     cached: i64,
@@ -1160,6 +1417,9 @@ impl GoogleStream {
             model: model.to_string(),
             role_sent: false,
             tool_index: 0,
+            pending_code: None,
+            text: String::new(),
+            grounding_done: false,
             in_tok: 0,
             out_tok: 0,
             cached: 0,
@@ -1173,6 +1433,14 @@ impl GoogleStream {
             self.role_sent = true;
             out.push(role_chunk(&self.id, &self.model));
         }
+    }
+
+    fn delta_chunk(&self, delta: Value) -> Value {
+        json!({
+            "id": self.id, "object": "chat.completion.chunk",
+            "created": crate::translate::now_ts(), "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]
+        })
     }
 
     pub fn handle(&mut self, ev: &Value) -> Vec<Value> {
@@ -1191,7 +1459,22 @@ impl GoogleStream {
         }
         self.ensure_role(&mut out);
         for p in candidate_parts(&cand) {
-            if let Some((name, args)) = get_function_call(&p) {
+            if let Some(ec) = p.get("executableCode").or_else(|| p.get("executable_code")) {
+                self.pending_code = Some(
+                    ec.get("code")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if let Some(cer) = p
+                .get("codeExecutionResult")
+                .or_else(|| p.get("code_execution_result"))
+            {
+                let output = cer.get("output").and_then(|x| x.as_str()).unwrap_or("");
+                let code = self.pending_code.take().unwrap_or_default();
+                let call = server_tool::code_execution(&code, output);
+                out.push(self.delta_chunk(json!({"server_tool_calls": [call]})));
+            } else if let Some((name, args)) = get_function_call(&p) {
                 let args_str = match &args {
                     Value::String(s) => s.clone(),
                     _ => serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
@@ -1233,14 +1516,26 @@ impl GoogleStream {
                 }
             } else if let Some(t) = part_text(&p) {
                 if !t.is_empty() {
-                    out.push(json!({
-                        "id": self.id, "object": "chat.completion.chunk",
-                        "created": crate::translate::now_ts(), "model": self.model,
-                        "choices": [{"index": 0,
-                            "delta": {"content": t},
-                            "finish_reason": Value::Null}]
-                    }));
+                    self.text.push_str(t);
+                    out.push(self.delta_chunk(json!({"content": t})));
                 }
+            }
+        }
+        // Grounding metadata usually rides the final candidate, after the
+        // text it cites. Emit it once.
+        if !self.grounding_done {
+            let (calls, mut citations) = grounding_tools(&cand);
+            if !calls.is_empty() || !citations.is_empty() {
+                self.grounding_done = true;
+                server_tool::locate_citations(&mut citations, &self.text);
+                let mut delta = json!({});
+                if !calls.is_empty() {
+                    delta["server_tool_calls"] = json!(calls);
+                }
+                if !citations.is_empty() {
+                    delta["citations"] = json!(citations);
+                }
+                out.push(self.delta_chunk(delta));
             }
         }
         if let Some(fr) = cand
@@ -1295,6 +1590,11 @@ impl GoogleStream {
 pub struct ChatToGoogleStream {
     model: String,
     tools: Vec<PendingEgressTool>,
+    /// Web-search calls awaiting the terminal candidate, where grounding is
+    /// attached.
+    server_calls: Vec<Value>,
+    citations: Vec<Value>,
+    text: String,
     terminated: bool,
 }
 
@@ -1303,6 +1603,9 @@ impl ChatToGoogleStream {
         Self {
             model: model.to_string(),
             tools: vec![],
+            server_calls: vec![],
+            citations: vec![],
+            text: String::new(),
             terminated: false,
         }
     }
@@ -1330,8 +1633,33 @@ impl ChatToGoogleStream {
         }
         if let Some(t) = delta.get("content").and_then(|x| x.as_str()) {
             if !t.is_empty() {
+                self.text.push_str(t);
                 out.push(self.response(vec![json!({"text": t})], None));
             }
+        }
+        if let Some(calls) = delta.get("server_tool_calls").and_then(|x| x.as_array()) {
+            for call in calls {
+                if call.get("type").and_then(|x| x.as_str()) == Some(server_tool::CODE_EXECUTION) {
+                    out.push(self.response(
+                        vec![
+                            json!({"executableCode": {
+                                "language": "PYTHON",
+                                "code": call.get("code").cloned().unwrap_or(json!(""))
+                            }}),
+                            json!({"codeExecutionResult": {
+                                "outcome": "OUTCOME_OK",
+                                "output": call.get("output").cloned().unwrap_or(json!(""))
+                            }}),
+                        ],
+                        None,
+                    ));
+                } else {
+                    self.server_calls.push(call.clone());
+                }
+            }
+        }
+        if let Some(citations) = delta.get("citations").and_then(|x| x.as_array()) {
+            self.citations.extend(citations.iter().cloned());
         }
         if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in tcs {
@@ -1352,19 +1680,31 @@ impl ChatToGoogleStream {
                 "error" => "MALFORMED_FUNCTION_CALL",
                 _ => "STOP",
             };
-            if parts.is_empty() {
-                // Terminal carries usage; empty parts keep the shape valid.
-                let mut ev = self.response(vec![], Some(finish_reason));
-                attach_usage(&mut ev, ch);
-                out.push(ev);
-            } else {
-                let mut ev = self.response(parts, Some(finish_reason));
-                attach_usage(&mut ev, ch);
-                out.push(ev);
-            }
+            let mut ev = self.response(parts, Some(finish_reason));
+            attach_usage(&mut ev, ch);
+            self.attach_grounding(&mut ev);
+            out.push(ev);
             self.terminated = true;
         }
         out
+    }
+
+    fn attach_grounding(&mut self, ev: &mut SseEvent) {
+        let msg = json!({
+            "server_tool_calls": self.server_calls.clone(),
+            "citations": self.citations.clone()
+        });
+        let Some(gm) = chat_grounding(&msg, &self.text) else {
+            return;
+        };
+        if let Some(cand) = ev
+            .data
+            .get_mut("candidates")
+            .and_then(|c| c.as_array_mut())
+            .and_then(|a| a.first_mut())
+        {
+            cand["groundingMetadata"] = gm;
+        }
     }
 
     pub fn finish(&mut self) -> Option<Vec<SseEvent>> {
@@ -1378,8 +1718,10 @@ impl ChatToGoogleStream {
             let args: Value = serde_json::from_str(&t.args).unwrap_or(json!({}));
             parts.push(json!({"functionCall": {"name": t.name, "args": args}}));
         }
+        let mut ev = self.response(parts, Some("STOP"));
+        self.attach_grounding(&mut ev);
         self.terminated = true;
-        out.push(self.response(parts, Some("STOP")));
+        out.push(ev);
         Some(out)
     }
 
@@ -1594,12 +1936,23 @@ mod tests {
     #[test]
     fn nameless_tools_are_dropped_not_emptied() {
         // Open WebUI's code interpreter arrives as a bare non-function
-        // tool; translating it to an empty-name declaration makes the
-        // upstream reject the request with a 400.
+        // tool. It maps onto the provider-side `codeExecution` tool now;
+        // an unsupported built-in is dropped rather than translated into an
+        // empty-name declaration (which Gemini rejects with a 400).
         let req = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "say hi"}],
             "tools": [{"type": "code_interpreter"}]
+        });
+        let out = chat_to_google_request(&req);
+        assert_eq!(out["tools"], json!([{"codeExecution": {}}]));
+        assert!(!chat_to_google_loss(&req)
+            .contains(&"nameless tools (dropped: not function tools)"));
+
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "say hi"}],
+            "tools": [{"type": "file_search"}]
         });
         let out = chat_to_google_request(&req);
         assert!(out.get("tools").is_none());
@@ -1608,7 +1961,8 @@ mod tests {
                 .contains(&"nameless tools (dropped: not function tools)")
         );
 
-        // ... while real function tools alongside it still pass through.
+        // ... while real function tools alongside a built-in still pass
+        // through in their own entry.
         let req = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "say hi"}],
@@ -1621,6 +1975,7 @@ mod tests {
         let decls = out["tools"][0]["functionDeclarations"].as_array().unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0]["name"], json!("get_time"));
+        assert_eq!(out["tools"][1], json!({"codeExecution": {}}));
     }
 
     #[test]
