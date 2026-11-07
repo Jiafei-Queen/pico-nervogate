@@ -10,8 +10,8 @@ use axum::extract::Request;
 use axum::response::Response;
 use serde_json::{json, Value};
 use crate::config::{Config, ModelCfg, Protocol};
-use crate::translate::{AnthropicStream, ChatReasoningEgress, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, anthropic_to_chat_request, anthropic_to_openai, apply_reasoning_output_to_message, chat_failure, chat_to_anthropic_fatal, chat_to_anthropic_loss, chat_to_anthropic_response, chat_to_anthropic_thinking_conflict, chat_to_responses_fatal, chat_to_responses_loss, chat_to_responses_response, responses_stateful_error, responses_to_chat_request, responses_to_openai};
-use crate::translate::google::{ChatToGoogleStream, GoogleStream, chat_to_google_fatal, chat_to_google_loss, chat_to_google_response, google_to_chat, google_to_chat_request};
+use crate::translate::{AnthropicStream, ChatReasoningEgress, ChatToAnthropicStream, ChatToResponsesStream, ResponsesStream, anthropic_to_chat_request, anthropic_to_openai, apply_reasoning_output_to_message, chat_failure, chat_to_anthropic_fatal, chat_to_anthropic_loss, chat_to_anthropic_response, chat_to_anthropic_thinking_conflict, chat_to_responses_fatal, chat_to_responses_loss, chat_to_responses_response, responses_stateful_error, responses_to_chat_loss, responses_to_chat_request, responses_to_openai, unsatisfiable_tool_choice};
+use crate::translate::google::{ChatToGoogleStream, GoogleStream, chat_to_google_fatal, chat_to_google_loss, chat_to_google_response, google_to_chat, google_to_chat_loss, google_to_chat_request};
 
 /// Byte ceiling for a client body. 0 means unlimited, which `to_bytes` would
 /// otherwise read as "reject everything".
@@ -140,6 +140,24 @@ pub(crate) async fn serve_normalized(
     let strict = st.cfg.read().unwrap().strict_params;
 
     if !native {
+        // A forced `tool_choice` that the translated tool list cannot satisfy
+        // would reach the upstream as a contradictory body (or silently lose
+        // the caller's intent). Reject it with an actionable message.
+        if let Some(msg) = unsatisfiable_tool_choice(&chat_req, m.protocol.as_str()) {
+            return ingress_error(ingress, StatusCode::BAD_REQUEST, &msg);
+        }
+        let ingress_lost = match ingress {
+            Ingress::OpenAi => responses_to_chat_loss(&req),
+            Ingress::Google => google_to_chat_loss(&req),
+            _ => Vec::new(),
+        };
+        if !ingress_lost.is_empty() {
+            eprintln!(
+                "[gw] req model={name} ingress={}: dropped unsupported tools: {}",
+                ingress.protocol().as_str(),
+                ingress_lost.join(", ")
+            );
+        }
         let (lost, fatal) = match m.protocol {
             Protocol::Anthropic => (
                 chat_to_anthropic_loss(&chat_req),

@@ -349,6 +349,7 @@ pub fn chat_to_google_request(req: &Value) -> Value {
     // dropped: Gemini rejects empty declaration names with a 400.
     // Parameter schemas are sanitized for Google's restricted subset
     // (unknown keys are rejected with a 400, empty on streaming).
+    let mut has_decls = false;
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let decls: Vec<Value> = tools
             .iter()
@@ -370,32 +371,32 @@ pub fn chat_to_google_request(req: &Value) -> Value {
             })
             .collect();
         if !decls.is_empty() {
-            out.insert(
-                "tools".into(),
-                json!([{"functionDeclarations": decls}]),
-            );
+            has_decls = true;
+            out.insert("tools".into(), json!([{"functionDeclarations": decls}]));
         }
     }
-    if let Some(tc) = req.get("tool_choice") {
-        let (mode, names): (&str, Option<Vec<Value>>) = match tc.as_str() {
-            Some("auto") => ("AUTO", None),
-            Some("required") => ("ANY", None),
-            Some("none") => ("NONE", None),
-            _ => tc
-                .pointer("/function/name")
-                .and_then(|x| x.as_str())
-                .map(|n| ("ANY", Some(vec![json!(n)])))
-                .unwrap_or(("AUTO", None)),
-        };
-        let mut fcc = serde_json::Map::new();
-        fcc.insert("mode".into(), json!(mode));
-        if let Some(n) = names {
-            fcc.insert("allowedFunctionNames".into(), Value::Array(n));
+    // A toolConfig with no declarations has nothing to constrain, so it is
+    // omitted. That also keeps `auto` / `none` from becoming a contradictory
+    // request after every tool was filtered out.
+    if has_decls {
+        if let Some(tc) = req.get("tool_choice") {
+            let (mode, names): (&str, Option<Vec<Value>>) = match tc.as_str() {
+                Some("auto") => ("AUTO", None),
+                Some("required") => ("ANY", None),
+                Some("none") => ("NONE", None),
+                _ => tc
+                    .pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .map(|n| ("ANY", Some(vec![json!(n)])))
+                    .unwrap_or(("AUTO", None)),
+            };
+            let mut fcc = serde_json::Map::new();
+            fcc.insert("mode".into(), json!(mode));
+            if let Some(n) = names {
+                fcc.insert("allowedFunctionNames".into(), Value::Array(n));
+            }
+            out.insert("toolConfig".into(), json!({"functionCallingConfig": fcc}));
         }
-        out.insert(
-            "toolConfig".into(),
-            json!({"functionCallingConfig": fcc}),
-        );
     }
 
     // Sampling / limits.
@@ -587,17 +588,7 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
         .collect();
     // Non-function tools (e.g. `{"type": "code_interpreter"}`) have no
     // Google equivalent and are dropped from the request.
-    if req
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .is_some_and(|ts| {
-            ts.iter().any(|t| {
-                t.pointer("/function/name")
-                    .and_then(|x| x.as_str())
-                    .map_or(true, str::is_empty)
-            })
-        })
-    {
+    if has_nameless_tools(req) {
         out.push("nameless tools (dropped: not function tools)");
     }
     // Unsupported schema keys are stripped from tool schemas (see above).
@@ -614,6 +605,27 @@ pub fn chat_to_google_loss(req: &Value) -> Vec<&'static str> {
         out.push("tool schema keys stripped (unsupported by Google)");
     }
     out
+}
+
+/// Google tools that are not `functionDeclarations` (`googleSearch`,
+/// `codeExecution`, `urlContext`, ...) have no Chat equivalent, so the
+/// ingress normalizer drops them.
+pub fn google_to_chat_loss(req: &Value) -> Vec<&'static str> {
+    let dropped = req
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.get("functionDeclarations")
+                    .or_else(|| t.get("function_declarations"))
+                    .and_then(|d| d.as_array())
+                    .is_none_or(|d| d.is_empty())
+            })
+        });
+    dropped
+        .then_some("non-function tools (dropped: only functionDeclarations translate)")
+        .into_iter()
+        .collect()
 }
 
 /// `n > 1` would silently collapse to a single candidate.

@@ -58,6 +58,76 @@ pub fn chat_message_text(msg: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool-choice consistency
+// ---------------------------------------------------------------------------
+
+/// True when the canonical request carries a tool entry that translation must
+/// drop because it has no function name (Responses/Anthropic built-ins).
+pub fn has_nameless_tools(chat: &Value) -> bool {
+    chat.get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .is_none_or(str::is_empty)
+            })
+        })
+}
+
+/// Function-tool names a translated request will actually put on the wire.
+///
+/// Every egress translator drops an entry whose `function.name` is missing or
+/// empty (Anthropic, Google and Responses all reject empty declaration names),
+/// so such an entry cannot satisfy a forced `tool_choice`.
+pub fn forwardable_tool_names(chat: &Value) -> Vec<&str> {
+    chat.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `Some(message)` when a forced `tool_choice` cannot be satisfied once tools
+/// without a function name have been dropped.
+///
+/// `auto` / `none` always pass: they do not name a function, so an empty tool
+/// list is still a meaningful request (just without tool use). A forced choice
+/// reaching the upstream without a matching declaration is rejected there with
+/// an opaque 400 — or, worse, silently ignored — so reject it here instead.
+pub fn unsatisfiable_tool_choice(chat: &Value, protocol: &str) -> Option<String> {
+    let choice = chat.get("tool_choice")?;
+    let names = forwardable_tool_names(chat);
+    match choice.as_str() {
+        Some("required") => names.is_empty().then(|| {
+            format!(
+                "`tool_choice` is \"required\", but no function tools survive translation \
+                 to the {protocol} upstream (nameless/built-in tools are dropped)"
+            )
+        }),
+        Some(_) => None,
+        None => {
+            let name = choice.pointer("/function/name").and_then(|x| x.as_str())?;
+            (!names.contains(&name)).then(|| {
+                format!(
+                    "`tool_choice` selects the tool `{name}`, but it was dropped during \
+                     translation to the {protocol} upstream (only named function tools \
+                     can be forwarded)"
+                )
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SSE framing
 // ---------------------------------------------------------------------------
 

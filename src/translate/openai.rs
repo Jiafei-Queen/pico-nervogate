@@ -243,34 +243,45 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
             _ => {}
         }
     }
+    let mut has_tools = false;
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
-        if !tools.is_empty() {
-            let rt: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "name": t.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or(""),
-                        "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
-                        "parameters": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type":"object"}))
-                    })
-                })
-                .collect();
+        // Responses rejects an empty function name, so a nameless Chat tool
+        // (a built-in the client cannot represent here) is dropped instead.
+        let rt: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t
+                    .pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())?;
+                Some(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
+                    "parameters": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type":"object"}))
+                }))
+            })
+            .collect();
+        if !rt.is_empty() {
+            has_tools = true;
             out.insert("tools".into(), Value::Array(rt));
         }
     }
-    if let Some(tc) = req.get("tool_choice") {
-        let mapped = match tc.as_str() {
-            Some("auto") => Some(json!("auto")),
-            Some("none") => Some(json!("none")),
-            Some("required") => Some(json!("required")),
-            _ => tc
-                .pointer("/function/name")
-                .and_then(|x| x.as_str())
-                .map(|name| json!({"type": "function", "name": name})),
-        };
-        if let Some(m) = mapped {
-            out.insert("tool_choice".into(), m);
+    // Never force a choice the translated request cannot satisfy.
+    if has_tools {
+        if let Some(tc) = req.get("tool_choice") {
+            let mapped = match tc.as_str() {
+                Some("auto") => Some(json!("auto")),
+                Some("none") => Some(json!("none")),
+                Some("required") => Some(json!("required")),
+                _ => tc
+                    .pointer("/function/name")
+                    .and_then(|x| x.as_str())
+                    .map(|name| json!({"type": "function", "name": name})),
+            };
+            if let Some(m) = mapped {
+                out.insert("tool_choice".into(), m);
+            }
         }
     }
     if let Some(p) = req.get("parallel_tool_calls") {
@@ -315,6 +326,28 @@ pub fn chat_to_responses_loss(req: &Value) -> Vec<&'static str> {
     LOST.iter()
         .copied()
         .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
+        .chain(has_nameless_tools(req).then_some("nameless tools (dropped: not function tools)"))
+        .collect()
+}
+
+/// Tools a Responses request cannot carry into the canonical Chat shape:
+/// built-ins such as `web_search` have no `name` field, so the ingress
+/// normalizer drops them.
+pub fn responses_to_chat_loss(req: &Value) -> Vec<&'static str> {
+    let dropped = req
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.get("name")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+            })
+        });
+    dropped
+        .then_some("nameless tools (dropped: not function tools)")
+        .into_iter()
         .collect()
 }
 

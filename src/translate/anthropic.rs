@@ -368,18 +368,20 @@ pub fn openai_to_anthropic_with_max(
         })
         .unwrap_or_default();
 
-    if let Some(tc) = req.get("tool_choice") {
-        match tc.as_str() {
-            Some("auto") => {
-                out.insert("tool_choice".into(), json!({"type":"auto"}));
-            }
-            Some("required") => {
-                out.insert("tool_choice".into(), json!({"type":"any"}));
-            }
-            Some("none") => tools.clear(),
-            _ => {
-                if let Some(name) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
-                    out.insert("tool_choice".into(), json!({"type":"tool","name":name}));
+    if !tools.is_empty() {
+        if let Some(tc) = req.get("tool_choice") {
+            match tc.as_str() {
+                Some("auto") => {
+                    out.insert("tool_choice".into(), json!({"type":"auto"}));
+                }
+                Some("required") => {
+                    out.insert("tool_choice".into(), json!({"type":"any"}));
+                }
+                Some("none") => tools.clear(),
+                _ => {
+                    if let Some(name) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                        out.insert("tool_choice".into(), json!({"type":"tool","name":name}));
+                    }
                 }
             }
         }
@@ -470,6 +472,7 @@ pub fn chat_to_anthropic_loss(req: &Value) -> Vec<&'static str> {
     LOST.iter()
         .copied()
         .filter(|k| req.get(*k).is_some_and(|v| !v.is_null()))
+        .chain(has_nameless_tools(req).then_some("nameless tools (dropped: not function tools)"))
         .collect()
 }
 

@@ -13,8 +13,12 @@ Translation details worth knowing:
   gateway synthesizes `call_*` ids on the way to Chat and matches
   `functionResponse` back by function name; tool output text that is not a
   JSON object is wrapped as `{"result": ...}`. A nameless tool (Responses
-  built-ins such as `web_search`) has no Chat or Anthropic equivalent and is
-  dropped rather than forwarded with an empty name, which both reject.
+  built-ins such as `web_search`) has no equivalent on the translated
+  protocols and is dropped rather than forwarded with an empty name, which
+  they all reject; every drop is logged. A forced `tool_choice`
+  (`required`/`any` or a named tool) that the remaining function tools cannot
+  satisfy is rejected with HTTP 400 instead of forwarding a contradictory
+  body — `auto`/`none` still work without tools.
 - **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
   Chat shape, plus a per-block `reasoning_details` array carrying the opaque
   replay token. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
@@ -65,7 +69,8 @@ Translation details worth knowing:
   `MALFORMED_FUNCTION_CALL` surfaces as a gateway error, never a normal tool
   turn; `usageMetadata` maps onto the canonical usage including
   `thoughtsTokenCount` → `reasoning_tokens`; tools without a function name
-  (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped and
+  (e.g. OpenAI's `{"type": "code_interpreter"}`) are dropped, and
+  `toolConfig` is only emitted when at least one declaration survives;
   `additionalProperties`, `$schema`, `$id`, `$defs`, `$ref` and `strict`
   are stripped from tool schemas at every depth —
   Gemini rejects them with a 400 (empty body on streaming); thinking-model `thoughtSignature`

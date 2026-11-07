@@ -2075,6 +2075,124 @@ async fn google_drops_nameless_tools_like_code_interpreter() {
     );
 }
 
+/// A forced tool choice that the translated tool list cannot honor is a clear
+/// 400, not a contradictory upstream body (or a silent capability change).
+#[tokio::test]
+async fn forced_tool_choice_with_only_builtin_tools_is_rejected() {
+    // Responses ingress: `web_search` carries no function name and is dropped.
+    let body = json!({
+        "model": "m",
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required"
+    });
+    for proto in [
+        Protocol::Anthropic,
+        Protocol::Google,
+        Protocol::OpenAiCompatible,
+    ] {
+        let (resp, seen) = captured_post(proto, "/v1/responses", &body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{proto:?}");
+        let v = parse_json("/v1/responses", &text(resp).await);
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(msg.contains("tool_choice"), "{proto:?}: {v}");
+        assert!(seen.is_null(), "{proto:?} upstream must not be called");
+    }
+
+    // Chat ingress: a built-in the Chat wire cannot name.
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "code_interpreter"}],
+        "tool_choice": "required"
+    });
+    for proto in [Protocol::Anthropic, Protocol::Google, Protocol::OpenAi] {
+        let (resp, _) = captured_post(proto, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{proto:?}");
+        let v = parse_json("/v1/chat/completions", &text(resp).await);
+        assert!(
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.contains("tool_choice")),
+            "{proto:?}: {v}"
+        );
+    }
+
+    // Google ingress: `googleSearch` is not a function declaration, so
+    // `mode: ANY` becomes a forced choice with nothing to call.
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{"googleSearch": {}}],
+        "toolConfig": {"functionCallingConfig": {"mode": "ANY"}}
+    });
+    let (resp, seen) = captured_post(Protocol::Anthropic, GOOGLE_NONSTREAM, &body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(seen.is_null(), "anthropic upstream must not be called");
+}
+
+/// The forced choice may name a dropped built-in while other function tools
+/// survive: forwarding it would reference a declaration the upstream lacks.
+#[tokio::test]
+async fn named_tool_choice_for_a_dropped_tool_is_rejected() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {
+                "name": "get_weather", "parameters": {"type": "object"}}},
+            {"type": "code_interpreter"}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "code_interpreter"}}
+    });
+    for proto in [Protocol::Anthropic, Protocol::Google, Protocol::OpenAi] {
+        let (resp, seen) = captured_post(proto, "/v1/chat/completions", &body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{proto:?}");
+        assert!(seen.is_null(), "{proto:?} upstream must not be called");
+    }
+
+    // A named choice that does survive keeps working, and mixed nameless
+    // entries next to it do not trigger the rejection.
+    let mut body = body;
+    body["tool_choice"] = json!({"type": "function", "function": {"name": "get_weather"}});
+    let (resp, seen) = captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_ptr(
+        &seen,
+        "/toolConfig/functionCallingConfig/allowedFunctionNames/0",
+        &json!("get_weather"),
+        "google named choice",
+    );
+    assert_eq!(
+        seen.pointer("/tools/0/functionDeclarations/0/name"),
+        Some(&json!("get_weather")),
+        "only the named function tool is forwarded: {seen}"
+    );
+}
+
+/// Dropping every tool under `auto` stays a valid request, but the egress
+/// body must not carry a choice that references nothing.
+#[tokio::test]
+async fn auto_with_only_dropped_tools_leaves_no_contradictory_choice() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "code_interpreter"}],
+        "tool_choice": "auto"
+    });
+    let (resp, seen) = captured_post(Protocol::Google, "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(seen.get("tools").is_none(), "{seen}");
+    assert!(seen.get("toolConfig").is_none(), "{seen}");
+
+    let (resp, seen) = captured_post(Protocol::Anthropic, "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(seen.get("tools").is_none(), "{seen}");
+    assert!(seen.get("tool_choice").is_none(), "{seen}");
+}
+
 #[tokio::test]
 async fn google_strips_additional_properties_at_every_depth() {
     // Three poison schemas mirroring the OpenWebUI report: nested

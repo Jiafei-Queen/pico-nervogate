@@ -1249,6 +1249,7 @@ fn chat_to_responses_request_maps_params_and_passthrough() {
         "top_p": 0.8,
         "reasoning_effort": "low",
         "response_format": {"type": "json_object"},
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         "tool_choice": {"type": "function", "function": {"name": "f"}},
         "x_nervogate": {"include": ["reasoning.encrypted_content"]}
     });
@@ -1659,6 +1660,115 @@ fn all_nameless_tools_leave_no_tools_key() {
     });
     let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
     assert!(out.get("tools").is_none());
+}
+
+#[test]
+fn forced_tool_choice_without_function_tools_is_rejected() {
+    let chat = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required"
+    });
+    let msg = unsatisfiable_tool_choice(&chat, "google").expect("conflict");
+    assert!(msg.contains("required"));
+    assert!(msg.contains("google"));
+
+    // No tools at all is just as unsatisfiable.
+    assert!(unsatisfiable_tool_choice(&json!({"tool_choice": "required"}), "anthropic").is_some());
+    // One surviving function tool satisfies it.
+    let ok = json!({
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+        "tool_choice": "required"
+    });
+    assert!(unsatisfiable_tool_choice(&ok, "google").is_none());
+}
+
+#[test]
+fn named_tool_choice_must_survive_translation() {
+    let mut chat = json!({
+        "tools": [
+            {"type": "code_interpreter"},
+            {"type": "function", "function": {"name": "f"}}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "f"}}
+    });
+    assert!(unsatisfiable_tool_choice(&chat, "google").is_none());
+    chat["tool_choice"] = json!({"type": "function", "function": {"name": "web_search"}});
+    let msg = unsatisfiable_tool_choice(&chat, "google").expect("conflict");
+    assert!(msg.contains("web_search"));
+}
+
+#[test]
+fn auto_and_none_choices_survive_dropped_tools() {
+    let mut chat = json!({
+        "tools": [{"type": "code_interpreter"}],
+        "tool_choice": "auto"
+    });
+    assert!(unsatisfiable_tool_choice(&chat, "google").is_none());
+    chat["tool_choice"] = json!("none");
+    assert!(unsatisfiable_tool_choice(&chat, "google").is_none());
+    chat.as_object_mut().unwrap().remove("tool_choice");
+    assert!(unsatisfiable_tool_choice(&chat, "google").is_none());
+}
+
+#[test]
+fn empty_tool_list_never_carries_a_tool_config() {
+    let req = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "code_interpreter"}],
+        "tool_choice": "auto"
+    });
+    let out = super::google::chat_to_google_request(&req);
+    assert!(out.get("tools").is_none());
+    assert!(out.get("toolConfig").is_none());
+}
+
+#[test]
+fn dropped_tools_are_reported_for_every_translated_path() {
+    let chat = json!({
+        "model": "m", "messages": [],
+        "tools": [{"type": "code_interpreter"}]
+    });
+    let msg = "nameless tools (dropped: not function tools)";
+    assert!(chat_to_anthropic_loss(&chat).contains(&msg));
+    assert!(chat_to_responses_loss(&chat).contains(&msg));
+
+    let responses = json!({"tools": [{"type": "web_search"}]});
+    assert!(!responses_to_chat_loss(&responses).is_empty());
+    assert!(
+        responses_to_chat_loss(&json!({"tools": [{"type": "function", "name": "f"}]})).is_empty()
+    );
+
+    let google = json!({"tools": [{"googleSearch": {}}]});
+    assert!(!super::google::google_to_chat_loss(&google).is_empty());
+    assert!(super::google::google_to_chat_loss(
+        &json!({"tools": [{"functionDeclarations": [{"name": "f"}]}]})
+    )
+    .is_empty());
+}
+
+#[test]
+fn responses_nameless_tools_are_dropped_between_chat_and_responses() {
+    // The Chat -> Responses egress used to forward an empty function name.
+    let req = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "f"}},
+            {"type": "code_interpreter"}
+        ],
+        "tool_choice": "auto"
+    });
+    let out = chat_to_responses_request(&req);
+    let tools = out["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], json!("f"));
+    assert_eq!(out["tool_choice"], json!("auto"));
+
+    let mut req = req;
+    req["tools"] = json!([{"type": "code_interpreter"}]);
+    let out = chat_to_responses_request(&req);
+    assert!(out.get("tools").is_none());
+    assert!(out.get("tool_choice").is_none());
 }
 
 // ---- reasoning ordering, ids and alternate schemas -------------------
