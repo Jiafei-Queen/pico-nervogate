@@ -129,6 +129,23 @@ stateless Responses policy, usage mapping, parameter handling, streaming
 failures, parallel tool calls — are documented in
 [docs/design.md](docs/design.md).
 
+## Protocol limits
+
+Translation carries the common subset of each protocol and drops what cannot
+be represented. Two focused notes state the exact boundaries:
+
+- [Tool calls](docs/protocol/tool-calls.md) lists the tool kinds and fields
+  that are dropped when a request crosses protocols, including built-in tools,
+  `strict`, Gemini schema keys, result media and `thoughtSignature`.
+- [Thinking replay](docs/protocol/thinking-replay.md) explains how Anthropic
+  `signature` and Responses `encrypted_content` round-trip as opaque,
+  provenance-tagged tokens, what that buys on long agent loops, and which
+  guarantees the gateway cannot make.
+
+Same-protocol passthrough is exempt: the client body is forwarded, so
+`cache_control`, `tool_result.is_error`, `strict`, built-in tools and native
+reasoning tokens survive untouched.
+
 ## Tests
 
 ```sh
