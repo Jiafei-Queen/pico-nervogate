@@ -69,7 +69,16 @@ means the endpoint is real. Set `protocol` explicitly to skip probing.
 `name` (public id), `protocol` (`openai-compatible` | `anthropic` |
 `openai` | `google`), optional `upstream`, `base_url`, `vision`, `extra_headers`,
 `thinking_type` (`adaptive` | `enabled`, default `adaptive`), `google_auth`
-(`auto` | `api_key` | `bearer`, default `auto`).
+(`auto` | `api_key` | `bearer`, default `auto`),
+`forward_reasoning_details` (default `false`).
+
+`forward_reasoning_details` only affects `openai-compatible` upstreams. On
+translated paths the canonical `reasoning_details` extension is stripped by
+default, because vanilla Chat APIs may reject unknown message fields; a
+same-protocol Chat passthrough remains verbatim. Enable it for providers that
+understand the field (for example OpenRouter); canonical entries are then
+converted to OpenRouter's `reasoning.text` / `reasoning.summary` /
+`reasoning.encrypted` schema.
 
 `thinking_type` controls how `reasoning_effort` renders as `thinking` for
 `anthropic` upstreams: `adaptive` sends `thinking: {"type":"adaptive"}` +

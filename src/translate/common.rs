@@ -171,6 +171,272 @@ pub fn chat_usage_parts(u: Option<&Value>) -> (i64, i64, i64, i64) {
 }
 
 // ---------------------------------------------------------------------------
+// Reasoning provenance envelopes
+// ---------------------------------------------------------------------------
+
+/// Prefix for an Anthropic `thinking.signature` carried through the canonical
+/// Chat shape.
+///
+/// The envelope is a provenance marker, not encryption: the gateway must be
+/// able to tell an Anthropic signature from a Responses `encrypted_content`
+/// blob before replaying either to an upstream that would reject it. It is
+/// deterministic so the same history always produces the same bytes, which
+/// Anthropic's prefix-binding check relies on.
+pub const SIG_ANTHROPIC: &str = "nv1:a:";
+
+/// Prefix for a Responses `encrypted_content` blob carried through the
+/// canonical Chat shape.
+pub const SIG_OPENAI: &str = "nv1:o:";
+
+/// Prefix for an Anthropic `redacted_thinking` payload.
+pub const SIG_REDACTED: &str = "nv1:r:";
+
+pub fn wrap_anthropic_signature(sig: &str) -> String {
+    if sig.starts_with("nv1:") {
+        sig.to_string()
+    } else {
+        format!("{SIG_ANTHROPIC}{sig}")
+    }
+}
+
+/// Wrap a Responses blob. Any existing `nv1:` prefix is kept so a client
+/// echoing a gateway envelope does not get it double-wrapped.
+pub fn wrap_openai_blob(blob: &str) -> String {
+    if blob.starts_with("nv1:") {
+        blob.to_string()
+    } else {
+        format!("{SIG_OPENAI}{blob}")
+    }
+}
+
+pub fn wrap_redacted(data: &str) -> String {
+    if data.starts_with(SIG_REDACTED) {
+        data.to_string()
+    } else {
+        format!("{SIG_REDACTED}{data}")
+    }
+}
+
+pub fn unwrap_anthropic_signature(sig: &str) -> Option<&str> {
+    sig.strip_prefix(SIG_ANTHROPIC).filter(|s| !s.is_empty())
+}
+
+pub fn unwrap_openai_blob(blob: &str) -> Option<&str> {
+    blob.strip_prefix(SIG_OPENAI).filter(|s| !s.is_empty())
+}
+
+pub fn unwrap_redacted(data: &str) -> Option<&str> {
+    data.strip_prefix(SIG_REDACTED).filter(|s| !s.is_empty())
+}
+
+/// The value an Anthropic client should see in `thinking.signature`.
+///
+/// An `nv1:a:` envelope is stripped back to the upstream's raw signature.
+/// An `nv1:o:` blob has no Anthropic equivalent, so it is passed through
+/// verbatim as an opaque marker; replaying it to an Anthropic upstream is
+/// prevented by the provenance check there.
+pub fn anthropic_signature_for_wire(sig: &str) -> Option<&str> {
+    if let Some(raw) = unwrap_anthropic_signature(sig) {
+        return Some(raw);
+    }
+    sig.starts_with(SIG_OPENAI).then_some(sig)
+}
+
+/// A signature destined for a Responses client. Unknown provenance is
+/// treated as an OpenAI blob: the client only echoes it, and the upstream
+/// request path still refuses to send a foreign blob onward.
+pub fn normalize_reasoning_signature(sig: &str) -> String {
+    if sig.starts_with("nv1:") {
+        sig.to_string()
+    } else {
+        wrap_openai_blob(sig)
+    }
+}
+
+/// A canonical reasoning block, with the provenance envelope already applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningKind {
+    Thinking,
+    Redacted,
+}
+
+/// Classify a `reasoning_details` entry, accepting both the canonical
+/// `thinking` / `redacted_thinking` names and OpenRouter's variants.
+pub fn reasoning_kind(d: &Value) -> Option<ReasoningKind> {
+    match d.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+        "thinking" | "reasoning.text" | "reasoning.summary" => Some(ReasoningKind::Thinking),
+        "redacted_thinking" | "reasoning.encrypted" => Some(ReasoningKind::Redacted),
+        _ => None,
+    }
+}
+
+/// Visible text of a reasoning detail, across canonical and OpenRouter field
+/// names. `reasoning.summary` stores it in `summary`.
+pub fn reasoning_text(d: &Value) -> &str {
+    d.get("thinking")
+        .or_else(|| d.get("text"))
+        .or_else(|| d.get("summary"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+}
+
+/// Opaque replay token of a reasoning detail. `redacted` blobs live in
+/// `data`; ordinary blocks carry `signature`.
+pub fn reasoning_signature(d: &Value) -> Option<&str> {
+    d.get("signature")
+        .and_then(|x| x.as_str())
+        .or_else(|| d.get("data").and_then(|x| x.as_str()))
+        .filter(|s| !s.is_empty())
+}
+
+/// The `id` an upstream attached to a reasoning block, if any.
+pub fn reasoning_id(d: &Value) -> Option<&str> {
+    d.get("id")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// Normalize one `reasoning_details` entry to the canonical shape.
+///
+/// Chat upstreams disagree on the member names: this gateway and Anthropic
+/// use `thinking` / `redacted_thinking`, while OpenRouter uses
+/// `reasoning.text` / `reasoning.summary` / `reasoning.encrypted`. Both are
+/// accepted here so a client that natively speaks either shape can replay.
+/// A signature from a known provider family is wrapped with the matching
+/// provenance prefix; an unknown signature is kept raw so neither upstream
+/// family will replay it accidentally.
+pub fn normalize_reasoning_detail(d: &Value) -> Option<Value> {
+    let kind = reasoning_kind(d)?;
+    let ty = d.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let format = d.get("format").and_then(|x| x.as_str()).unwrap_or("");
+    let id = reasoning_id(d);
+    let mut out = match kind {
+        ReasoningKind::Thinking => {
+            let mut out = json!({
+                "type": "thinking",
+                "thinking": reasoning_text(d)
+            });
+            if let Some(sig) = reasoning_signature(d) {
+                let wrapped = if sig.starts_with("nv1:") {
+                    sig.to_string()
+                } else if format.starts_with("anthropic") || ty == "thinking" {
+                    wrap_anthropic_signature(sig)
+                } else if format.contains("openai")
+                    || format.contains("responses")
+                    || format.contains("xai")
+                {
+                    wrap_openai_blob(sig)
+                } else {
+                    sig.to_string()
+                };
+                out["signature"] = json!(wrapped);
+            }
+            out
+        }
+        ReasoningKind::Redacted => {
+            let data = d.get("data").and_then(|x| x.as_str()).unwrap_or("");
+            if data.is_empty() {
+                return None;
+            }
+            if ty == "reasoning.encrypted" {
+                if format.contains("openai")
+                    || format.contains("responses")
+                    || format.contains("xai")
+                {
+                    // OpenRouter's generic encrypted entry may hold an
+                    // OpenAI Responses blob; keep it replayable there.
+                    json!({
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": wrap_openai_blob(data)
+                    })
+                } else if format.is_empty() || format.starts_with("anthropic") {
+                    json!({"type": "redacted_thinking", "data": data})
+                } else {
+                    // Google/Gemini or unknown provenance cannot be replayed
+                    // to either family; dropping it is safer than a 400.
+                    return None;
+                }
+            } else {
+                json!({"type": "redacted_thinking", "data": data})
+            }
+        }
+    };
+    if let Some(id) = id {
+        out["id"] = json!(id);
+    }
+    Some(out)
+}
+
+/// Render a canonical reasoning detail in OpenRouter's Chat Completions
+/// schema. Used when forwarding to an upstream that understands the field.
+pub fn reasoning_detail_to_openrouter(d: &Value) -> Option<Value> {
+    let kind = reasoning_kind(d)?;
+    let id = reasoning_id(d).unwrap_or("");
+    let index = d.get("index").and_then(|x| x.as_i64());
+    let out = match kind {
+        ReasoningKind::Thinking => {
+            let text = reasoning_text(d);
+            let sig = d
+                .get("signature")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty());
+            if sig.is_none() && text.is_empty() {
+                return None;
+            }
+            let mut out = match sig {
+                Some(sig) if sig.starts_with(SIG_ANTHROPIC) => json!({
+                    "type": "reasoning.text",
+                    "text": text,
+                    "signature": unwrap_anthropic_signature(sig).unwrap_or(""),
+                    "format": "anthropic-claude-v1"
+                }),
+                Some(sig) if sig.starts_with(SIG_OPENAI) => json!({
+                    "type": "reasoning.encrypted",
+                    "data": unwrap_openai_blob(sig).unwrap_or(""),
+                    "format": "openai-responses-v1"
+                }),
+                Some(sig) => json!({
+                    "type": "reasoning.text",
+                    "text": text,
+                    "signature": sig,
+                    "format": "unknown"
+                }),
+                None => json!({"type": "reasoning.summary", "summary": text}),
+            };
+            // Leave id out rather than inventing an identity the upstream
+            // cannot resolve.
+            if !id.is_empty() {
+                out["id"] = json!(id);
+            }
+            if let Some(index) = index {
+                out["index"] = json!(index);
+            }
+            out
+        }
+        ReasoningKind::Redacted => {
+            let data = d.get("data").and_then(|x| x.as_str()).unwrap_or("");
+            if data.is_empty() {
+                return None;
+            }
+            let mut out = json!({
+                "type": "reasoning.encrypted",
+                "data": data,
+                "format": "anthropic-claude-v1"
+            });
+            if !id.is_empty() {
+                out["id"] = json!(id);
+            }
+            if let Some(index) = index {
+                out["index"] = json!(index);
+            }
+            out
+        }
+    };
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Content conversions
 // ---------------------------------------------------------------------------
 

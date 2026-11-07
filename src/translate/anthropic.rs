@@ -138,6 +138,89 @@ pub fn openai_to_anthropic(req: &Value, thinking: ThinkingMode) -> Value {
     openai_to_anthropic_with_max(req, thinking, ANTHROPIC_DEFAULT_MAX_TOKENS)
 }
 
+/// Canonical reasoning detail -> Anthropic content block.
+///
+/// `wire` selects the signature policy: an outgoing response may pass an
+/// `nv1:o:` blob through as an opaque marker for the client to echo, while an
+/// outgoing request only replays an `nv1:a:` signature this gateway issued
+/// for an Anthropic upstream.
+fn reasoning_detail_to_anth_block(d: &Value, wire: bool) -> Option<Value> {
+    let d = normalize_reasoning_detail(d)?;
+    match reasoning_kind(&d)? {
+        ReasoningKind::Thinking => {
+            let sig = d.get("signature").and_then(|x| x.as_str())?;
+            let sig = if wire {
+                anthropic_signature_for_wire(sig)?
+            } else {
+                unwrap_anthropic_signature(sig)?
+            };
+            Some(json!({
+                "type": "thinking",
+                "thinking": reasoning_text(&d),
+                "signature": sig
+            }))
+        }
+        ReasoningKind::Redacted => Some(json!({
+            "type": "redacted_thinking",
+            "data": d.get("data").and_then(|x| x.as_str()).filter(|s| !s.is_empty())?
+        })),
+    }
+}
+
+/// A translated reasoning block plus the number of tool calls that preceded
+/// it upstream (when the egress recorded that position).
+fn reasoning_block_with_position(d: &Value, wire: bool) -> Option<(Option<usize>, Value)> {
+    let pos = d
+        .get("tool_calls_before")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize);
+    reasoning_detail_to_anth_block(d, wire).map(|b| (pos, b))
+}
+
+/// Assemble an Anthropic assistant content array, honouring the recorded
+/// interleaving of thinking blocks and tool calls. Without positions the
+/// historical order (thinking, text, tools) is kept.
+fn ordered_assistant_blocks(
+    details: Vec<(Option<usize>, Value)>,
+    text: &str,
+    tool_blocks: Vec<Value>,
+) -> Vec<Value> {
+    let mut blocks = vec![];
+    if details.iter().any(|(pos, _)| pos.is_some()) {
+        let mut used = vec![false; details.len()];
+        for (i, (pos, block)) in details.iter().enumerate() {
+            if pos.is_none() || *pos == Some(0) {
+                blocks.push(block.clone());
+                used[i] = true;
+            }
+        }
+        if !text.is_empty() {
+            blocks.push(json!({"type":"text","text":text}));
+        }
+        for (idx, tool) in tool_blocks.iter().enumerate() {
+            blocks.push(tool.clone());
+            for (i, (pos, block)) in details.iter().enumerate() {
+                if !used[i] && pos.is_some_and(|p| p <= idx + 1) {
+                    blocks.push(block.clone());
+                    used[i] = true;
+                }
+            }
+        }
+        for (i, (_, block)) in details.iter().enumerate() {
+            if !used[i] {
+                blocks.push(block.clone());
+            }
+        }
+    } else {
+        blocks.extend(details.into_iter().map(|(_, block)| block));
+        if !text.is_empty() {
+            blocks.push(json!({"type":"text","text":text}));
+        }
+        blocks.extend(tool_blocks);
+    }
+    blocks
+}
+
 pub fn openai_to_anthropic_with_max(
     req: &Value,
     thinking: ThinkingMode,
@@ -212,18 +295,23 @@ pub fn openai_to_anthropic_with_max(
                 }
                 "assistant" => {
                     let mut blocks: Vec<Value> = vec![];
-                    if let Some(r) = m.get("reasoning_content").and_then(|x| x.as_str()) {
-                        if !r.is_empty() {
-                            blocks.push(json!({"type":"thinking","thinking":r,"signature":""}));
+                    // Only a signature that this gateway issued for an
+                    // Anthropic upstream can be replayed. `reasoning_content`
+                    // alone has no signature, and Anthropic rejects a
+                    // thinking block with an empty one (400).
+                    let mut details: Vec<(Option<usize>, Value)> = vec![];
+                    if let Some(ds) = m.get("reasoning_details").and_then(|x| x.as_array()) {
+                        for d in ds {
+                            if let Some(entry) = reasoning_block_with_position(d, false) {
+                                details.push(entry);
+                            }
                         }
                     }
                     // Falls back to the top-level `refusal` when `content`
                     // is empty, so a refusal-only turn is not turned into a
                     // blank assistant message.
                     let text = chat_message_text(m);
-                    if !text.is_empty() {
-                        blocks.push(json!({"type":"text","text":text}));
-                    }
+                    let mut tool_blocks: Vec<Value> = vec![];
                     if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                         for tc in tcs {
                             let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
@@ -236,10 +324,11 @@ pub fn openai_to_anthropic_with_max(
                                 .and_then(|x| x.as_str())
                                 .unwrap_or("{}");
                             let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
-                            blocks
+                            tool_blocks
                                 .push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
                         }
                     }
+                    blocks = ordered_assistant_blocks(details, &text, tool_blocks);
                     push_anthropic_blocks(&mut msgs, "assistant", blocks);
                 }
                 _ => {
@@ -259,14 +348,21 @@ pub fn openai_to_anthropic_with_max(
         .get("tools")
         .and_then(|t| t.as_array())
         .map(|tools| {
+            // Anthropic rejects a tool with an empty name (400), so a
+            // nameless Chat tool (a built-in the client cannot represent
+            // here) is dropped rather than forwarded.
             tools
                 .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or(""),
+                .filter_map(|t| {
+                    let name = t
+                        .pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())?;
+                    Some(json!({
+                        "name": name,
                         "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
                         "input_schema": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type":"object"}))
-                    })
+                    }))
                 })
                 .collect::<Vec<Value>>()
         })
@@ -396,6 +492,7 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
     let id = gen_id("chatcmpl-");
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_details: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
 
     if let Some(blocks) = resp.get("content").and_then(|c| c.as_array()) {
@@ -407,8 +504,34 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
                     }
                 }
                 Some("thinking") => {
-                    if let Some(t) = b.get("thinking").and_then(|x| x.as_str()) {
-                        reasoning.push_str(t);
+                    let thinking = b.get("thinking").and_then(|x| x.as_str()).unwrap_or("");
+                    if !thinking.is_empty() {
+                        reasoning.push_str(thinking);
+                    }
+                    if let Some(sig) = b
+                        .get("signature")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        reasoning_details.push(json!({
+                            "type": "thinking",
+                            "thinking": thinking,
+                            "signature": wrap_anthropic_signature(sig),
+                            // Position among the assistant's tool calls, so
+                            // interleaved thinking can be rebuilt in order.
+                            "tool_calls_before": tool_calls.len()
+                        }));
+                    }
+                }
+                Some("redacted_thinking") => {
+                    if let Some(data) = b.get("data").and_then(|x| x.as_str()) {
+                        if !data.is_empty() {
+                            reasoning_details.push(json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                                "tool_calls_before": tool_calls.len()
+                            }));
+                        }
                     }
                 }
                 Some("tool_use") => {
@@ -460,6 +583,9 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Value {
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
     }
+    if !reasoning_details.is_empty() {
+        message["reasoning_details"] = Value::Array(reasoning_details);
+    }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
         message["content"] = Value::Null;
@@ -483,6 +609,14 @@ pub struct AnthropicStream {
     role_sent: bool,
     tool_index: i64,
     block_ty: String,
+    /// Signature fragments for the current thinking block. Anthropic sends
+    /// them as `signature_delta` right before `content_block_stop`; they are
+    /// attached to the block's `reasoning_details` entry emitted at stop.
+    thinking_sig: String,
+    /// Visible text of the current thinking block. The signature detail is
+    /// emitted at stop with the whole block text, not just the signature, so
+    /// a Chat client replaying `reasoning_details` has a complete block.
+    thinking_text: String,
     in_tok: i64,
     out_tok: i64,
     cached: i64,
@@ -498,6 +632,8 @@ impl AnthropicStream {
             role_sent: false,
             tool_index: 0,
             block_ty: String::new(),
+            thinking_sig: String::new(),
+            thinking_text: String::new(),
             in_tok: 0,
             out_tok: 0,
             cached: 0,
@@ -544,6 +680,33 @@ impl AnthropicStream {
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
                 self.block_ty = bt.to_string();
+                self.thinking_sig.clear();
+                self.thinking_text.clear();
+                if bt == "thinking" {
+                    if let Some(t) = ev
+                        .pointer("/content_block/thinking")
+                        .and_then(|x| x.as_str())
+                    {
+                        self.thinking_text.push_str(t);
+                    }
+                }
+                if bt == "redacted_thinking" {
+                    if let Some(data) = ev
+                        .pointer("/content_block/data")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(chunk(
+                            &self.id,
+                            &self.model,
+                            json!({"reasoning_details": [{
+                                "type": "redacted_thinking",
+                                "data": data
+                            }]}),
+                            None,
+                        ));
+                    }
+                }
                 if bt == "tool_use" {
                     let id = ev
                         .pointer("/content_block/id")
@@ -577,6 +740,7 @@ impl AnthropicStream {
                 } else if dt == "thinking_delta" {
                     if let Some(t) = ev.pointer("/delta/thinking").and_then(|x| x.as_str()) {
                         if !t.is_empty() {
+                            self.thinking_text.push_str(t);
                             out.push(chunk(
                                 &self.id,
                                 &self.model,
@@ -584,6 +748,10 @@ impl AnthropicStream {
                                 None,
                             ));
                         }
+                    }
+                } else if dt == "signature_delta" {
+                    if let Some(sig) = ev.pointer("/delta/signature").and_then(|x| x.as_str()) {
+                        self.thinking_sig.push_str(sig);
                     }
                 } else if dt == "input_json_delta" {
                     if let Some(t) = ev.pointer("/delta/partial_json").and_then(|x| x.as_str()) {
@@ -597,11 +765,28 @@ impl AnthropicStream {
                 }
             }
             "content_block_stop" => {
+                if self.block_ty == "thinking" && !self.thinking_sig.is_empty() {
+                    let sig = wrap_anthropic_signature(&self.thinking_sig);
+                    let text = std::mem::take(&mut self.thinking_text);
+                    self.thinking_sig.clear();
+                    out.push(chunk(
+                        &self.id,
+                        &self.model,
+                        json!({"reasoning_details": [{
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": sig
+                        }]}),
+                        None,
+                    ));
+                }
                 // Only tool_use blocks consume a tool_calls index.
                 if self.block_ty == "tool_use" {
                     self.tool_index += 1;
                 }
                 self.block_ty.clear();
+                self.thinking_sig.clear();
+                self.thinking_text.clear();
             }
             "message_delta" => {
                 if let Some(r) = ev.pointer("/delta/stop_reason").and_then(|x| x.as_str()) {
@@ -673,6 +858,137 @@ pub fn chat_to_anthropic_thinking_conflict(req: &Value) -> Vec<&'static str> {
     out
 }
 
+#[derive(Default)]
+struct AssistantSegment {
+    parts: Vec<Value>,
+    tools: Vec<Value>,
+    reasoning: String,
+    details: Vec<Value>,
+}
+
+impl AssistantSegment {
+    fn push_message(self, messages: &mut Vec<Value>) {
+        if self.parts.is_empty()
+            && self.tools.is_empty()
+            && self.reasoning.is_empty()
+            && self.details.is_empty()
+        {
+            return;
+        }
+        let content = if self.parts.is_empty() {
+            Value::Null
+        } else if self
+            .parts
+            .iter()
+            .all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        {
+            // Text alongside tool calls stays a string for Chat compatibility.
+            json!(content_text(&Value::Array(self.parts)))
+        } else {
+            Value::Array(self.parts)
+        };
+        let mut msg = json!({"role": "assistant", "content": content});
+        if !self.reasoning.is_empty() {
+            msg["reasoning_content"] = json!(self.reasoning);
+        }
+        if !self.details.is_empty() {
+            msg["reasoning_details"] = Value::Array(self.details);
+        }
+        if !self.tools.is_empty() {
+            msg["tool_calls"] = Value::Array(self.tools);
+        }
+        messages.push(msg);
+    }
+}
+
+/// Split one Anthropic assistant message into contiguous Chat assistant
+/// messages. Chat keeps text, tool calls and reasoning in separate fields, so
+/// a single message would regroup the blocks (all thinking first, then all
+/// tool calls). Splitting preserves the original order for the next
+/// translation pass.
+fn push_anthropic_assistant_segments(messages: &mut Vec<Value>, blocks: &[Value]) {
+    let mut seg = AssistantSegment::default();
+    for b in blocks {
+        let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+        match ty {
+            "thinking" => {
+                if !seg.parts.is_empty() || !seg.tools.is_empty() {
+                    std::mem::take(&mut seg).push_message(messages);
+                }
+                let thinking = b.get("thinking").and_then(|x| x.as_str()).unwrap_or("");
+                if !thinking.is_empty() {
+                    seg.reasoning.push_str(thinking);
+                }
+                if let Some(sig) = b
+                    .get("signature")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    seg.details.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": wrap_anthropic_signature(sig)
+                    }));
+                }
+            }
+            "redacted_thinking" => {
+                if !seg.parts.is_empty() || !seg.tools.is_empty() {
+                    std::mem::take(&mut seg).push_message(messages);
+                }
+                if let Some(data) = b
+                    .get("data")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    seg.details
+                        .push(json!({"type": "redacted_thinking", "data": data}));
+                }
+            }
+            "text" => {
+                if !seg.tools.is_empty() {
+                    std::mem::take(&mut seg).push_message(messages);
+                }
+                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                    if !t.is_empty() {
+                        seg.parts.push(json!({"type": "text", "text": t}));
+                    }
+                }
+            }
+            "image" => {
+                if !seg.tools.is_empty() {
+                    std::mem::take(&mut seg).push_message(messages);
+                }
+                if let Some(img) = anthropic_image_to_openai(b) {
+                    seg.parts.push(img);
+                }
+            }
+            "tool_use" => {
+                let id = b.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                let input = b.get("input").cloned().unwrap_or(json!({}));
+                let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                seg.tools.push(json!({
+                    "id": id, "type": "function",
+                    "function": {"name": name, "arguments": args}
+                }));
+            }
+            "tool_result" => {
+                // A tool_result inside an assistant turn is malformed but
+                // still worth preserving as a Chat tool message.
+                std::mem::take(&mut seg).push_message(messages);
+                let id = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+                let content = b.get("content").cloned().unwrap_or(json!(""));
+                messages.push(json!({
+                    "role": "tool", "tool_call_id": id,
+                    "content": content_text(&content)
+                }));
+            }
+            other => warn_dropped_block("anthropic_to_chat_request", other),
+        }
+    }
+    seg.push_message(messages);
+}
+
 pub fn anthropic_to_chat_request(req: &Value) -> Value {
     let mut messages: Vec<Value> = vec![];
 
@@ -707,9 +1023,14 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                     messages.push(json!({"role": role, "content": s}));
                 }
                 Some(Value::Array(blocks)) => {
+                    if role == "assistant" {
+                        push_anthropic_assistant_segments(&mut messages, blocks);
+                        continue;
+                    }
                     let mut parts: Vec<Value> = vec![];
                     let mut tool_calls: Vec<Value> = vec![];
                     let mut reasoning = String::new();
+                    let mut reasoning_details: Vec<Value> = vec![];
                     for b in blocks {
                         match b.get("type").and_then(|t| t.as_str()).unwrap_or("text") {
                             "text" => {
@@ -747,8 +1068,30 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                                 }));
                             }
                             "thinking" => {
-                                if let Some(t) = b.get("thinking").and_then(|x| x.as_str()) {
-                                    reasoning.push_str(t);
+                                let thinking =
+                                    b.get("thinking").and_then(|x| x.as_str()).unwrap_or("");
+                                if !thinking.is_empty() {
+                                    reasoning.push_str(thinking);
+                                }
+                                if let Some(sig) = b
+                                    .get("signature")
+                                    .and_then(|x| x.as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    reasoning_details.push(json!({
+                                        "type": "thinking",
+                                        "thinking": thinking,
+                                        "signature": wrap_anthropic_signature(sig)
+                                    }));
+                                }
+                            }
+                            "redacted_thinking" => {
+                                if let Some(data) = b.get("data").and_then(|x| x.as_str()) {
+                                    if !data.is_empty() {
+                                        reasoning_details.push(
+                                            json!({"type": "redacted_thinking", "data": data}),
+                                        );
+                                    }
                                 }
                             }
                             other => warn_dropped_block("anthropic_to_chat_request", other),
@@ -759,13 +1102,19 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                         if !reasoning.is_empty() {
                             msg["reasoning_content"] = json!(reasoning);
                         }
+                        if !reasoning_details.is_empty() {
+                            msg["reasoning_details"] = Value::Array(reasoning_details.clone());
+                        }
                         if !parts.is_empty() {
                             // text alongside tool calls belongs in `content`
                             msg["content"] = json!(content_text(&Value::Array(parts.clone())));
                         }
                         msg["tool_calls"] = Value::Array(tool_calls);
                         messages.push(msg);
-                    } else if !parts.is_empty() || !reasoning.is_empty() {
+                    } else if !parts.is_empty()
+                        || !reasoning.is_empty()
+                        || !reasoning_details.is_empty()
+                    {
                         // Plain-text stays a string (best Chat compatibility);
                         // structured parts (images) keep their array form.
                         let content = if parts
@@ -779,6 +1128,9 @@ pub fn anthropic_to_chat_request(req: &Value) -> Value {
                         let mut msg = json!({"role": role, "content": content});
                         if !reasoning.is_empty() {
                             msg["reasoning_content"] = json!(reasoning);
+                        }
+                        if !reasoning_details.is_empty() {
+                            msg["reasoning_details"] = Value::Array(reasoning_details);
                         }
                         messages.push(msg);
                     }
@@ -869,22 +1221,29 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
         .pointer("/choices/0/message")
         .cloned()
         .unwrap_or(json!({}));
-    let mut blocks: Vec<Value> = vec![];
-
-    if let Some(r) = msg.get("reasoning_content").and_then(|x| x.as_str()) {
-        if !r.is_empty() {
-            blocks.push(json!({"type": "thinking", "thinking": r, "signature": ""}));
+    let mut details: Vec<(Option<usize>, Value)> = vec![];
+    if let Some(ds) = msg.get("reasoning_details").and_then(|x| x.as_array()) {
+        for d in ds {
+            if let Some(entry) = reasoning_block_with_position(d, true) {
+                details.push(entry);
+            }
         }
     }
+    // `reasoning_content` without a signature is deliberately not turned
+    // into a thinking block: Anthropic rejects `signature: ""` (400), and a
+    // missing block is the documented safe degradation.
     let text = msg.get("content").and_then(|x| x.as_str()).unwrap_or("");
     let refusal = msg.get("refusal").and_then(|x| x.as_str()).unwrap_or("");
-    if !text.is_empty() {
-        blocks.push(json!({"type": "text", "text": text}));
+    let text = if !text.is_empty() {
+        text
     } else if !refusal.is_empty() {
         // Anthropic reports a refusal through `stop_reason: "refusal"` with
         // the explanation in the text block; keeping the text preserves it.
-        blocks.push(json!({"type": "text", "text": refusal}));
-    }
+        refusal
+    } else {
+        ""
+    };
+    let mut tool_blocks: Vec<Value> = vec![];
     if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tcs {
             let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
@@ -897,9 +1256,10 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
                 .and_then(|x| x.as_str())
                 .unwrap_or("{}");
             let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
-            blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+            tool_blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
         }
     }
+    let mut blocks = ordered_assistant_blocks(details, text, tool_blocks);
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": ""}));
     }
@@ -933,12 +1293,6 @@ pub fn chat_to_anthropic_response(chat: &Value, model: &str) -> Value {
 // Chat chunks -> Anthropic Messages SSE stream (egress)
 // ---------------------------------------------------------------------------
 
-#[derive(PartialEq)]
-pub enum AnthBlock {
-    Text,
-    Thinking,
-}
-
 /// Stateful translator for OpenAI chat chunks into Anthropic Messages SSE
 /// events (`message_start` ... `message_stop`). Each returned [`SseEvent`]
 /// carries an `event:` name, which is mandatory for Anthropic clients.
@@ -948,9 +1302,13 @@ pub struct ChatToAnthropicStream {
     started: bool,
     terminated: bool,
     index: usize,
-    /// The currently open block, tagged with the content index it was
-    /// emitted at. `index - 1` is wrong once blocks interleave.
-    open: Option<(AnthBlock, usize)>,
+    /// Index of the currently open text block.
+    open: Option<usize>,
+    /// Thinking text held back until its signature arrives. Anthropic rejects
+    /// a `thinking` block with an empty `signature`, and the signature is only
+    /// known at the end of the upstream block, so the block is emitted whole
+    /// in one go.
+    pending_thinking: String,
     /// Tool calls seen so far, in first-seen order so parallel calls keep
     /// their relative ordering in the Anthropic message.
     tools: Vec<(ToolKey, PendingTool)>,
@@ -965,6 +1323,7 @@ impl ChatToAnthropicStream {
             terminated: false,
             index: 0,
             open: None,
+            pending_thinking: String::new(),
             tools: vec![],
         }
     }
@@ -1044,12 +1403,12 @@ impl ChatToAnthropicStream {
                     "content_block": {"type": "text", "text": ""}
                 }),
             ));
-            self.open = Some((AnthBlock::Text, index));
+            self.open = Some(index);
         }
     }
 
     fn close_open(&mut self, out: &mut Vec<SseEvent>) {
-        if let Some((_, index)) = self.open.take() {
+        if let Some(index) = self.open.take() {
             out.push(SseEvent::ev(
                 "content_block_stop",
                 json!({"type": "content_block_stop", "index": index}),
@@ -1057,7 +1416,71 @@ impl ChatToAnthropicStream {
         }
     }
 
+    /// Emit one complete thinking block. Called only once the upstream
+    /// signature is known, because an empty signature is a hard 400.
+    fn flush_thinking(&mut self, out: &mut Vec<SseEvent>, signature: &str) {
+        if signature.is_empty() {
+            self.pending_thinking.clear();
+            return;
+        }
+        self.close_open(out);
+        let index = self.index;
+        self.index += 1;
+        let text = std::mem::take(&mut self.pending_thinking);
+        out.push(SseEvent::ev(
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            }),
+        ));
+        if !text.is_empty() {
+            out.push(SseEvent::ev(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
+                }),
+            ));
+        }
+        out.push(SseEvent::ev(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "signature_delta", "signature": signature}
+            }),
+        ));
+        out.push(SseEvent::ev(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+
+    fn emit_redacted(&mut self, out: &mut Vec<SseEvent>, data: &str) {
+        if data.is_empty() {
+            return;
+        }
+        self.pending_thinking.clear();
+        self.close_open(out);
+        let index = self.index;
+        self.index += 1;
+        out.push(SseEvent::ev(
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "redacted_thinking", "data": data}
+            }),
+        ));
+        out.push(SseEvent::ev(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+
     fn terminal(&mut self, stop_reason: &str, out: &mut Vec<SseEvent>) {
+        // Unsigned thinking is not replayable; drop it rather than emitting a
+        // block Anthropic will reject.
+        self.pending_thinking.clear();
         // Tool blocks already satisfy Anthropic's "at least one content
         // block" rule, so only add an empty text block when there are none.
         let had_tools = self.flush_tools(out);
@@ -1088,40 +1511,66 @@ impl ChatToAnthropicStream {
         let choice = ch.pointer("/choices/0").cloned().unwrap_or(json!({}));
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
-        if let Some(t) = delta.get("reasoning_content").and_then(|x| x.as_str()) {
+        if let Some(t) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(|x| x.as_str())
+        {
             if !t.is_empty() {
-                let ci = match &self.open {
-                    Some((AnthBlock::Thinking, ci)) => *ci,
-                    _ => {
-                        self.close_open(&mut out);
-                        let ci = self.index;
-                        self.index += 1;
-                        out.push(SseEvent::ev(
-                            "content_block_start",
-                            json!({
-                                "type": "content_block_start", "index": ci,
-                                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                            }),
-                        ));
-                        self.open = Some((AnthBlock::Thinking, ci));
-                        ci
-                    }
+                self.pending_thinking.push_str(t);
+            }
+        }
+
+        // A `reasoning_details` delta carries the opaque signature. The
+        // thinking block is flushed here, once the signature is available.
+        if let Some(details) = delta.get("reasoning_details").and_then(|x| x.as_array()) {
+            for d in details {
+                let Some(d) = normalize_reasoning_detail(d) else {
+                    continue;
                 };
-                out.push(SseEvent::ev(
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta", "index": ci,
-                        "delta": {"type": "thinking_delta", "thinking": t}
-                    }),
-                ));
+                match reasoning_kind(&d) {
+                    Some(ReasoningKind::Thinking) => {
+                        let text = reasoning_text(&d);
+                        if !text.is_empty() && self.pending_thinking.is_empty() {
+                            self.pending_thinking.push_str(text);
+                        }
+                        if let Some(sig) = d
+                            .get("signature")
+                            .and_then(|x| x.as_str())
+                            .and_then(anthropic_signature_for_wire)
+                        {
+                            // A blob that only arrives in the terminal event
+                            // after text has started cannot be placed before
+                            // that text any more. Drop it rather than emit an
+                            // out-of-order thinking block.
+                            if self.open.is_some() {
+                                self.pending_thinking.clear();
+                            } else {
+                                self.flush_thinking(&mut out, sig);
+                            }
+                        }
+                    }
+                    Some(ReasoningKind::Redacted) => {
+                        if let Some(data) = d.get("data").and_then(|x| x.as_str()) {
+                            if self.open.is_some() {
+                                continue;
+                            }
+                            self.emit_redacted(&mut out, data);
+                        }
+                    }
+                    None => {}
+                }
             }
         }
 
         if let Some(t) = delta.get("content").and_then(|x| x.as_str()) {
             if !t.is_empty() {
-                let ci = match &self.open {
-                    Some((AnthBlock::Text, ci)) => *ci,
-                    _ => {
+                // Text cannot come before its thinking block: a buffered
+                // block without a signature is not replayable.
+                self.pending_thinking.clear();
+                let ci = match self.open {
+                    Some(ci) => ci,
+                    None => {
                         self.close_open(&mut out);
                         let ci = self.index;
                         self.index += 1;
@@ -1132,7 +1581,7 @@ impl ChatToAnthropicStream {
                                 "content_block": {"type": "text", "text": ""}
                             }),
                         ));
-                        self.open = Some((AnthBlock::Text, ci));
+                        self.open = Some(ci);
                         ci
                     }
                 };
@@ -1239,6 +1688,7 @@ impl ChatToAnthropicStream {
         }
         let mut out = vec![];
         self.start(&mut out);
+        self.pending_thinking.clear();
         self.flush_tools(&mut out);
         self.close_open(&mut out);
         out

@@ -98,6 +98,11 @@ pub struct ModelCfg {
     /// `auto` picks bearer when the base URL points at AI Platform.
     #[serde(default)]
     pub google_auth: GoogleAuth,
+    /// Forward `reasoning_details` to an OpenAI-compatible upstream instead
+    /// of stripping it. Enable for providers that understand the field
+    /// (OpenRouter). Default off: vanilla Chat APIs may reject it.
+    #[serde(default)]
+    pub forward_reasoning_details: bool,
     /// Whether the model accepts image input (advertised via /v1/models).
     /// `None` (unset) lets models.dev inference fill it in; `Some(_)`
     /// always wins over inferred metadata.
@@ -227,6 +232,7 @@ impl ModelCfg {
             extra_headers: HashMap::new(),
             thinking_type: None,
             google_auth: GoogleAuth::Auto,
+            forward_reasoning_details: false,
             vision: None,
             models_dev_id: None,
             display_name: None,
@@ -636,6 +642,26 @@ thinking_type = "adaptive"
 "#;
         let cfg: Config = toml::from_str(text).expect("parse toml");
         assert_eq!(cfg.models[0].thinking_mode(), ThinkingMode::Adaptive);
+    }
+
+    #[test]
+    fn forward_reasoning_details_defaults_off_and_parses() {
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "openai-compatible"
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert!(!cfg.models[0].forward_reasoning_details);
+
+        let text = r#"
+[[models]]
+name = "m"
+protocol = "openai-compatible"
+forward_reasoning_details = true
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse toml");
+        assert!(cfg.models[0].forward_reasoning_details);
     }
 
     #[test]

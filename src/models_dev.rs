@@ -518,6 +518,7 @@ mod tests {
             extra_headers: HashMap::new(),
             thinking_type: None,
             google_auth: crate::config::GoogleAuth::Auto,
+            forward_reasoning_details: false,
             vision: None,
             models_dev_id: None,
             display_name: None,

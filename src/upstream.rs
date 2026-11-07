@@ -10,7 +10,9 @@ use axum::http::header;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use crate::config::{Config, GoogleAuth, ModelCfg, Protocol};
-use crate::translate::{chat_to_responses_request, openai_to_anthropic_with_max};
+use crate::translate::{
+    chat_to_responses_request, openai_to_anthropic_with_max, reasoning_detail_to_openrouter,
+};
 use crate::translate::google::chat_to_google_request;
 
 pub(crate) fn upstream_headers(st: &St, m: &ModelCfg) -> HeaderMap {
@@ -141,7 +143,43 @@ pub(crate) fn build_body(
             Protocol::OpenAiCompatible => {
                 let mut v = req.clone();
                 // The reserved passthrough key never goes on the wire.
-                v.as_object_mut().map(|o| o.remove("x_nervogate"));
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("x_nervogate");
+                }
+                if let Some(msgs) = v.get_mut("messages").and_then(|x| x.as_array_mut()) {
+                    for msg in msgs {
+                        let Some(details) = msg.get_mut("reasoning_details") else {
+                            continue;
+                        };
+                        if !m.forward_reasoning_details {
+                            if let Some(o) = msg.as_object_mut() {
+                                o.remove("reasoning_details");
+                            }
+                        } else if let Some(arr) = details.as_array_mut() {
+                            // OpenRouter understands the field, but only in
+                            // its own schema; translate the canonical
+                            // entries instead of leaking Anthropic-style
+                            // member names upstream.
+                            arr.retain_mut(|d| {
+                                // Already in the upstream's schema: preserve
+                                // the provider-specific `format` verbatim.
+                                if d.get("type")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(|t| t.starts_with("reasoning."))
+                                {
+                                    return true;
+                                }
+                                match reasoning_detail_to_openrouter(d) {
+                                    Some(converted) => {
+                                        *d = converted;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            });
+                        }
+                    }
+                }
                 v
             }
             Protocol::Anthropic => {
@@ -169,6 +207,88 @@ pub(crate) fn build_body(
     body
 }
 
+/// Drop every canonical reasoning block. Used by the one-shot retry after a
+/// reasoning 400: the documented safe degradation is to send no thinking
+/// block at all (dropping the whole block is accepted, an empty signature or
+/// a foreign blob is not).
+fn strip_reasoning_details(req: &Value) -> Value {
+    let mut v = req.clone();
+    if let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in msgs {
+            if let Some(o) = m.as_object_mut() {
+                o.remove("reasoning_details");
+            }
+        }
+    }
+    v
+}
+
+/// Native-path counterpart: remove thinking blocks from an Anthropic body.
+///
+/// An assistant message that held *only* thinking would become
+/// `content: []`, which Anthropic rejects. Drop such a message instead of
+/// sending an empty turn.
+fn strip_thinking_blocks(native: &Value) -> Value {
+    let mut v = native.clone();
+    if let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in msgs.iter_mut() {
+            if let Some(blocks) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+                blocks.retain(|b| {
+                    !matches!(
+                        b.get("type").and_then(|t| t.as_str()),
+                        Some("thinking") | Some("redacted_thinking")
+                    )
+                });
+            }
+        }
+        msgs.retain(|m| {
+            if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                return true;
+            }
+            match m.get("content") {
+                Some(Value::Array(a)) => !a.is_empty(),
+                _ => true,
+            }
+        });
+    }
+    v
+}
+
+/// Native-path counterpart: remove `reasoning` input items from a Responses
+/// body.
+fn strip_reasoning_items(native: &Value) -> Value {
+    let mut v = native.clone();
+    if let Some(items) = v.get_mut("input").and_then(|x| x.as_array_mut()) {
+        items.retain(|it| it.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+    }
+    v
+}
+
+fn is_reasoning_error(text: &str, protocol: Protocol) -> bool {
+    let lower = text.to_ascii_lowercase();
+    match protocol {
+        Protocol::Anthropic => lower.contains("signature") && lower.contains("thinking"),
+        Protocol::OpenAi => {
+            lower.contains("encrypted content") || lower.contains("invalid_encrypted_content")
+        }
+        _ => false,
+    }
+}
+
+async fn post_json(
+    st: &St,
+    m: &ModelCfg,
+    url: &str,
+    body: &Value,
+) -> Result<reqwest::Response, reqwest::Error> {
+    st.client
+        .post(url)
+        .headers(upstream_headers(st, m))
+        .json(body)
+        .send()
+        .await
+}
+
 pub(crate) async fn call_upstream(
     st: &St,
     m: &ModelCfg,
@@ -192,14 +312,7 @@ pub(crate) async fn call_upstream(
     );
     let t0 = now_ms();
     let stream_tag = if stream { "stream" } else { "nonstream" };
-    let resp = match st
-        .client
-        .post(&url)
-        .headers(upstream_headers(st, m))
-        .json(&body)
-        .send()
-        .await
-    {
+    let mut resp = match post_json(st, m, &url, &body).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -214,6 +327,69 @@ pub(crate) async fn call_upstream(
             )));
         }
     };
+
+    // A rejected reasoning blob is fatal upstream but recoverable here: the
+    // documented degradation is to send the history without thinking /
+    // reasoning blocks. Retry exactly once so a bad blob cannot amplify
+    // traffic.
+    if resp.status() == StatusCode::BAD_REQUEST
+        && matches!(m.protocol, Protocol::Anthropic | Protocol::OpenAi)
+    {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if is_reasoning_error(&text, m.protocol) {
+            let max_tokens = st.cfg.read().unwrap().anthropic_max_tokens;
+            let retry_body = match (m.protocol, native) {
+                (Protocol::Anthropic, Some(n)) => {
+                    let stripped = strip_thinking_blocks(n);
+                    build_body(m, req, stream, Some(&stripped), max_tokens)
+                }
+                (Protocol::OpenAi, Some(n)) => {
+                    let stripped = strip_reasoning_items(n);
+                    build_body(m, req, stream, Some(&stripped), max_tokens)
+                }
+                (_, None) => {
+                    let stripped = strip_reasoning_details(req);
+                    build_body(m, &stripped, stream, None, max_tokens)
+                }
+                _ => body.clone(),
+            };
+            eprintln!(
+                "[gw] retry model={} stream={} without reasoning blocks after an {} 400",
+                m.name,
+                stream_tag,
+                m.protocol.as_str()
+            );
+            match post_json(st, m, &url, &retry_body).await {
+                Ok(r) => resp = r,
+                Err(e) => {
+                    eprintln!(
+                        "[gw] retry model={} stream={} -> connect-error: {}",
+                        m.name, stream_tag, e
+                    );
+                    return Err(UpstreamError::Message(format!(
+                        "upstream request failed: {e}"
+                    )));
+                }
+            }
+        } else {
+            eprintln!(
+                "[gw] req model={} stream={} upstream={} ms={} ERROR url={} body={}",
+                m.name,
+                stream_tag,
+                status.as_u16(),
+                now_ms() - t0,
+                url,
+                trunc(&text, 2000)
+            );
+            eprintln!(
+                "[gw] outgoing model={} keys={}",
+                m.name,
+                body_summary(&body)
+            );
+            return Err(UpstreamError::Status(status, text));
+        }
+    }
 
     if resp.status().is_success() {
         eprintln!(
@@ -301,5 +477,39 @@ mod tests {
             body.get("x_nervogate").is_none(),
             "reserved key leaked upstream: {body}"
         );
+    }
+
+    #[test]
+    fn stripping_thinking_never_leaves_an_empty_assistant_turn() {
+        // Anthropic rejects `content: []`; an assistant turn that contained
+        // only thinking must be dropped after the fallback strips it.
+        let native = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig"}
+                ]},
+                {"role": "user", "content": "more"}
+            ]
+        });
+        let stripped = strip_thinking_blocks(&native);
+        let msgs = stripped["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "empty assistant turn survived: {stripped}");
+        assert!(msgs
+            .iter()
+            .all(|m| m["role"] == "user" || !m["content"].as_array().unwrap().is_empty()));
+    }
+
+    #[test]
+    fn stripping_reasoning_details_removes_the_field() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "hi", "reasoning_details": [
+                {"type": "thinking", "thinking": "x", "signature": "nv1:a:s"}
+            ]}]
+        });
+        let stripped = strip_reasoning_details(&req);
+        assert!(stripped["messages"][0].get("reasoning_details").is_none());
     }
 }

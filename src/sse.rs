@@ -89,6 +89,7 @@ impl Inbound {
                 }
                 out
             }
+            Inbound::Responses(s) => s.flush(),
             _ => vec![],
         }
     }

@@ -12,19 +12,42 @@ Translation details worth knowing:
   including multi-call turns and tool results. Gemini has no call ids, so the
   gateway synthesizes `call_*` ids on the way to Chat and matches
   `functionResponse` back by function name; tool output text that is not a
-  JSON object is wrapped as `{"result": ...}`.
+  JSON object is wrapped as `{"result": ...}`. A nameless tool (Responses
+  built-ins such as `web_search`) has no Chat or Anthropic equivalent and is
+  dropped rather than forwarded with an empty name, which both reject.
 - **Reasoning/thinking** maps to `message.reasoning_content` in the canonical
-  Chat shape. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
+  Chat shape, plus a per-block `reasoning_details` array carrying the opaque
+  replay token. Parameter mapping: `reasoning_effort` ↔ `reasoning.effort` ↔
   `thinking` ↔ Gemini `thinkingConfig.thinkingBudget` (+`includeThoughts`).
   For `anthropic` upstreams the per-model `thinking_type` picks
   the shape: `adaptive` (default) sends `thinking: {"type":"adaptive"}` +
   `output_config.effort`; `enabled` sends `thinking.budget_tokens`. For
   `google` upstreams the effort renders as a budget (low 4k / medium 8k /
   high 16k) and thought parts (`{"thought": true, ...}`) round-trip as
-  `reasoning_content`. Across a
-  _protocol change_, Anthropic thinking block _signatures_ arrive as `""`, so
-  multi-turn thinking replay against a strict Anthropic upstream may be
-  rejected. Same-protocol requests skip translation and keep their signatures.
+  `reasoning_content`.
+  Across a protocol change the opaque token is wrapped with a provenance
+  prefix: `nv1:a:` for an Anthropic `thinking.signature`, `nv1:o:` for a
+  Responses `encrypted_content`, `nv1:r:` for `redacted_thinking`. A blob is
+  replayed only to the upstream family that issued it; foreign provenance is
+  dropped. Responses reasoning input items keep their original `id` (or get a
+  synthesized `rs_` id when the client protocol, such as Anthropic, has no
+  field for it). An unsigned `reasoning_content` is never emitted as an
+  Anthropic thinking block (`signature: ""` is a hard 400) — the block is
+  omitted.
+  Interleaved thinking/tool turns are split into consecutive canonical
+  assistant messages on request translation; response egress also records a
+  block's `tool_calls_before`, so the order can be rebuilt when a Chat client
+  echoes it. A streamed signature that arrives only after text has started is
+  dropped rather than rendered as an out-of-order thinking block.
+  Besides the canonical `thinking` / `redacted_thinking` entries, the
+  `reasoning_details` reader accepts OpenRouter's `reasoning.text` /
+  `reasoning.summary` / `reasoning.encrypted` schema. Chat upstreams strip
+  the field by default; `forward_reasoning_details = true` forwards it in
+  OpenRouter's schema instead.
+  If an Anthropic or Responses upstream rejects the blob with a 400, the
+  gateway retries once with every thinking/reasoning block stripped, the
+  documented safe degradation; assistant turns left with no content are
+  dropped.
   On Chat egress the global `reasoning_output` picks the render:
   `reasoning_content` (default), `think_tag` (`<think>` inside `content`,
   for tag-parsing clients like OpenWebUI), or `both`. Translated paths only;

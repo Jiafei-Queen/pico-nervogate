@@ -50,6 +50,43 @@ pub fn assistant_output_parts(c: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Canonical reasoning detail -> Responses `reasoning` input item.
+///
+/// Only an OpenAI-origin blob is forwarded. An Anthropic signature would be
+/// rejected upstream as `invalid_encrypted_content`, and a redacted payload
+/// has no Responses equivalent. Summary-only history is kept because the
+/// upstream ignores it (B5/B9) and it preserves 1:1 block count.
+///
+/// `id` is required by `ResponseReasoningItemParam`; preserve the original
+/// item id when the client echoed one, otherwise synthesize an `rs_` id.
+pub fn reasoning_detail_to_responses_item(d: &Value) -> Option<Value> {
+    let d = normalize_reasoning_detail(d)?;
+    if reasoning_kind(&d) != Some(ReasoningKind::Thinking) {
+        return None;
+    }
+    let text = reasoning_text(&d);
+    let sig = d.get("signature").and_then(|x| x.as_str());
+    let enc = sig.and_then(unwrap_openai_blob);
+    if sig.is_some() && enc.is_none() {
+        return None;
+    }
+    let mut item = json!({
+        "id": reasoning_id(&d).map(str::to_string).unwrap_or_else(|| gen_id("rs_")),
+        "type": "reasoning"
+    });
+    if text.is_empty() {
+        item["summary"] = json!([]);
+    } else {
+        item["summary"] = json!([{"type": "summary_text", "text": text}]);
+    }
+    if let Some(enc) = enc {
+        item["encrypted_content"] = json!(enc);
+    } else if text.is_empty() {
+        return None;
+    }
+    Some(item)
+}
+
 pub fn chat_to_responses_request(req: &Value) -> Value {
     let mut input: Vec<Value> = vec![];
     let mut instructions = String::new();
@@ -77,10 +114,20 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
                     }));
                 }
                 "assistant" => {
-                    let parts = assistant_output_parts(m.get("content").unwrap_or(&Value::Null));
-                    if !parts.is_empty() {
-                        input.push(json!({"role": "assistant", "content": parts}));
+                    let mut details: Vec<(Option<usize>, Value)> = vec![];
+                    if let Some(ds) = m.get("reasoning_details").and_then(|x| x.as_array()) {
+                        for d in ds {
+                            let pos = d
+                                .get("tool_calls_before")
+                                .and_then(|x| x.as_u64())
+                                .map(|x| x as usize);
+                            if let Some(item) = reasoning_detail_to_responses_item(d) {
+                                details.push((pos, item));
+                            }
+                        }
                     }
+                    let parts = assistant_output_parts(m.get("content").unwrap_or(&Value::Null));
+                    let mut calls: Vec<Value> = vec![];
                     if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                         for tc in tcs {
                             let call_id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
@@ -92,13 +139,49 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
                                 .pointer("/function/arguments")
                                 .and_then(|x| x.as_str())
                                 .unwrap_or("{}");
-                            input.push(json!({
+                            calls.push(json!({
                                 "type": "function_call",
                                 "call_id": call_id,
                                 "name": name,
                                 "arguments": args
                             }));
                         }
+                    }
+                    if details.iter().any(|(pos, _)| pos.is_some()) {
+                        // Rebuild the interleaved reasoning/function_call
+                        // sequence recorded by the egress.
+                        let mut used = vec![false; details.len()];
+                        for (i, (pos, item)) in details.iter().enumerate() {
+                            if pos.is_none() || *pos == Some(0) {
+                                input.push(item.clone());
+                                used[i] = true;
+                            }
+                        }
+                        if !parts.is_empty() {
+                            input.push(json!({"role": "assistant", "content": parts}));
+                        }
+                        for (idx, call) in calls.iter().enumerate() {
+                            input.push(call.clone());
+                            for (i, (pos, item)) in details.iter().enumerate() {
+                                if !used[i] && pos.is_some_and(|p| p <= idx + 1) {
+                                    input.push(item.clone());
+                                    used[i] = true;
+                                }
+                            }
+                        }
+                        for (i, (_, item)) in details.iter().enumerate() {
+                            if !used[i] {
+                                input.push(item.clone());
+                            }
+                        }
+                    } else {
+                        for (_, item) in details {
+                            input.push(item);
+                        }
+                        if !parts.is_empty() {
+                            input.push(json!({"role": "assistant", "content": parts}));
+                        }
+                        input.extend(calls);
                     }
                 }
                 _ => {
@@ -129,7 +212,9 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
     }
     if let Some(e) = req.get("reasoning_effort").and_then(|x| x.as_str()) {
         if e != "none" {
-            out.insert("reasoning".into(), json!({"effort": e}));
+            // `summary: "auto"` gives Anthropic clients readable thinking
+            // text; the blob is independent of the summary (B9).
+            out.insert("reasoning".into(), json!({"effort": e, "summary": "auto"}));
         }
     }
     if let Some(rf) = req.get("response_format") {
@@ -199,9 +284,20 @@ pub fn chat_to_responses_request(req: &Value) -> Value {
     }
     // This gateway is stateless: never ask the upstream to keep a copy.
     out.insert("store".into(), json!(false));
-    if let Some(inc) = req.pointer("/x_nervogate/include") {
-        out.insert("include".into(), inc.clone());
+    // Reasoning is only replayable as an opaque blob, so always ask for it.
+    // Merge instead of overwrite: the client may have requested more.
+    let mut include = vec![json!("reasoning.encrypted_content")];
+    if let Some(extra) = req
+        .pointer("/x_nervogate/include")
+        .and_then(|x| x.as_array())
+    {
+        for v in extra {
+            if v.as_str() != Some("reasoning.encrypted_content") {
+                include.push(v.clone());
+            }
+        }
     }
+    out.insert("include".into(), Value::Array(include));
     Value::Object(out)
 }
 
@@ -238,6 +334,7 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
     let id = gen_id("chatcmpl-");
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_details: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
 
     if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
@@ -263,6 +360,7 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
                     }
                 }
                 "reasoning" => {
+                    let mut item_text = String::new();
                     for s in item
                         .get("summary")
                         .and_then(|x| x.as_array())
@@ -270,7 +368,7 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
                         .flatten()
                     {
                         if let Some(t) = s.get("text").and_then(|x| x.as_str()) {
-                            reasoning.push_str(t);
+                            item_text.push_str(t);
                         }
                     }
                     for s in item
@@ -280,8 +378,39 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
                         .flatten()
                     {
                         if let Some(t) = s.get("text").and_then(|x| x.as_str()) {
-                            reasoning.push_str(t);
+                            item_text.push_str(t);
                         }
+                    }
+                    if !item_text.is_empty() {
+                        reasoning.push_str(&item_text);
+                    }
+                    let enc = item
+                        .get("encrypted_content")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty());
+                    let mut detail = json!({"type": "thinking", "thinking": item_text});
+                    if let Some(id) = item
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        detail["id"] = json!(id);
+                    }
+                    if let Some(enc) = enc {
+                        detail["signature"] = json!(wrap_openai_blob(enc));
+                    }
+                    // Position among the turn's tool calls, so a later
+                    // translation can rebuild interleaved item order.
+                    detail["tool_calls_before"] = json!(tool_calls.len());
+                    // A summary-only item still carries visible text for Chat
+                    // upstreams; it just has no replayable blob.
+                    if detail.get("signature").is_some()
+                        || detail
+                            .get("thinking")
+                            .and_then(|x| x.as_str())
+                            .is_some_and(|t| !t.is_empty())
+                    {
+                        reasoning_details.push(detail);
                     }
                 }
                 "function_call" => {
@@ -341,6 +470,9 @@ pub fn responses_to_openai(resp: &Value, model: &str) -> Value {
     let mut message = json!({"role": "assistant", "content": text});
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
+    }
+    if !reasoning_details.is_empty() {
+        message["reasoning_details"] = Value::Array(reasoning_details);
     }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
@@ -402,6 +534,15 @@ pub struct ResponsesStream {
     out_tok: i64,
     cached: i64,
     reasoning_tok: i64,
+    /// Reasoning item ids whose `encrypted_content` has already been
+    /// forwarded, so the terminal event does not emit it twice.
+    reasoning_done: Vec<String>,
+    /// Reasoning items that are done but whose blob may still appear in the
+    /// terminal response object. Output produced after them is held back so
+    /// the canonical stream keeps thinking before text/tool calls.
+    pending_reasoning: Vec<String>,
+    /// Chunks held while a reasoning blob is still pending.
+    pending_chunks: Vec<Value>,
     finish: Option<String>,
 }
 
@@ -417,7 +558,40 @@ impl ResponsesStream {
             out_tok: 0,
             cached: 0,
             reasoning_tok: 0,
+            reasoning_done: vec![],
+            pending_reasoning: vec![],
+            pending_chunks: vec![],
             finish: None,
+        }
+    }
+
+    /// Hold a chunk while a reasoning item is still waiting for its terminal
+    /// blob. Once the blob is known the held chunks are released in order.
+    fn emit_or_hold(&mut self, out: &mut Vec<Value>, c: Value) {
+        if self.pending_reasoning.is_empty() {
+            out.push(c);
+        } else {
+            self.pending_chunks.push(c);
+        }
+    }
+
+    fn reasoning_key(ev: &Value) -> String {
+        ev.pointer("/item/id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "index:{}",
+                    ev.get("output_index").and_then(|x| x.as_u64()).unwrap_or(0)
+                )
+            })
+    }
+
+    fn release_reasoning(&mut self, key: &str, out: &mut Vec<Value>) {
+        self.pending_reasoning.retain(|k| k != key);
+        if self.pending_reasoning.is_empty() {
+            out.append(&mut self.pending_chunks);
         }
     }
 
@@ -433,39 +607,106 @@ impl ResponsesStream {
         }
     }
 
+    /// Forward one reasoning item's opaque blob into the canonical stream.
+    /// Called from `response.output_item.done` and again from the terminal
+    /// event, because some upstreams only include `encrypted_content` in the
+    /// final response object.
+    fn emit_reasoning_blob(&mut self, out: &mut Vec<Value>, item: &Value) -> bool {
+        if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
+            return false;
+        }
+        let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        if let Some(enc) = item
+            .get("encrypted_content")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Some upstreams omit the item id; the blob itself is a stable
+            // enough key to avoid emitting it twice.
+            let key = if id.is_empty() {
+                enc.to_string()
+            } else {
+                id.to_string()
+            };
+            if self.reasoning_done.iter().any(|x| x == &key) {
+                return true;
+            }
+            let mut detail = json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": wrap_openai_blob(enc)
+            });
+            if !id.is_empty() {
+                // The Responses item id is required when the client replays
+                // this block; keep it in the canonical detail.
+                detail["id"] = json!(id);
+            }
+            out.push(chunk(
+                &self.id,
+                &self.model,
+                json!({"reasoning_details": [detail]}),
+                None,
+            ));
+            self.reasoning_done.push(key);
+            return true;
+        }
+        false
+    }
+
+    /// Release output held while a reasoning blob was pending. Used when the
+    /// upstream closes without a terminal event, so truncation does not also
+    /// swallow text that was already received.
+    pub fn flush(&mut self) -> Vec<Value> {
+        self.pending_reasoning.clear();
+        std::mem::take(&mut self.pending_chunks)
+    }
+
     pub fn handle(&mut self, ev: &Value) -> Vec<Value> {
         let mut out = vec![];
         match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "response.output_item.added" => {
                 self.ensure_role(&mut out);
                 let item = ev.get("item").cloned().unwrap_or(json!({}));
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    let call_id = item
-                        .get("call_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    self.cur_call = Some((call_id.clone(), name.clone()));
-                    out.push(chunk(
-                        &self.id,
-                        &self.model,
-                        json!({"tool_calls":[{"index": self.tool_index, "id": call_id, "type": "function",
-                            "function": {"name": name, "arguments": ""}}]}),
-                        None,
-                    ));
+                match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "reasoning" => {
+                        // The blob is only guaranteed at done/terminal time.
+                        // Hold later output so thinking stays before text.
+                        let key = Self::reasoning_key(ev);
+                        if !self.pending_reasoning.iter().any(|k| k == &key) {
+                            self.pending_reasoning.push(key);
+                        }
+                    }
+                    "function_call" => {
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.cur_call = Some((call_id.clone(), name.clone()));
+                        let c = chunk(
+                            &self.id,
+                            &self.model,
+                            json!({"tool_calls":[{"index": self.tool_index, "id": call_id, "type": "function",
+                                "function": {"name": name, "arguments": ""}}]}),
+                            None,
+                        );
+                        self.emit_or_hold(&mut out, c);
+                    }
+                    _ => {}
                 }
             }
             "response.output_text.delta" => {
                 self.ensure_role(&mut out);
                 if let Some(t) = ev.get("delta").and_then(|x| x.as_str()) {
                     if !t.is_empty() {
-                        out.push(chunk(&self.id, &self.model, json!({"content": t}), None));
+                        let c = chunk(&self.id, &self.model, json!({"content": t}), None);
+                        self.emit_or_hold(&mut out, c);
                     }
                 }
             }
@@ -473,11 +714,12 @@ impl ResponsesStream {
                 self.ensure_role(&mut out);
                 if let Some(t) = ev.get("delta").and_then(|x| x.as_str()) {
                     if !t.is_empty() {
-                        out.push(chunk(&self.id, &self.model, json!({"content": t}), None));
+                        let c = chunk(&self.id, &self.model, json!({"content": t}), None);
+                        self.emit_or_hold(&mut out, c);
                     }
                 }
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 self.ensure_role(&mut out);
                 if let Some(t) = ev.get("delta").and_then(|x| x.as_str()) {
                     if !t.is_empty() {
@@ -492,12 +734,13 @@ impl ResponsesStream {
             }
             "response.function_call_arguments.delta" => {
                 if let Some(t) = ev.get("delta").and_then(|x| x.as_str()) {
-                    out.push(chunk(
+                    let c = chunk(
                         &self.id,
                         &self.model,
                         json!({"tool_calls":[{"index": self.tool_index, "function": {"arguments": t}}]}),
                         None,
-                    ));
+                    );
+                    self.emit_or_hold(&mut out, c);
                 }
             }
             "response.output_item.done" => {
@@ -506,9 +749,25 @@ impl ResponsesStream {
                     self.tool_index += 1;
                     self.cur_call = None;
                 }
+                if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                    let key = Self::reasoning_key(ev);
+                    let emitted = self.emit_reasoning_blob(&mut out, &item);
+                    if emitted {
+                        self.release_reasoning(&key, &mut out);
+                    }
+                }
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
                 self.ensure_role(&mut out);
+                if let Some(items) = ev.pointer("/response/output").and_then(|x| x.as_array()) {
+                    for item in items {
+                        self.emit_reasoning_blob(&mut out, item);
+                    }
+                }
+                // The terminal event is the last chance for a blob. Release
+                // anything held even if the upstream never provided one.
+                self.pending_reasoning.clear();
+                out.append(&mut self.pending_chunks);
                 self.in_tok = ev
                     .pointer("/response/usage/input_tokens")
                     .and_then(|x| x.as_i64())
@@ -674,9 +933,59 @@ pub fn push_chat_tool_call(messages: &mut Vec<Value>, id: &str, name: &str, args
     messages.push(json!({"role": "assistant", "content": Value::Null, "tool_calls": [tc]}));
 }
 
+/// Attach pending Responses reasoning to a canonical assistant message.
+///
+/// Append rather than overwrite: several Responses blocks can map onto one
+/// Chat assistant message (for example a message item followed by a
+/// function_call item), and assigning would silently drop the earlier block.
+fn attach_pending_reasoning(msg: &mut Value, details: &mut Vec<Value>, text: &mut String) {
+    if !details.is_empty() {
+        match msg
+            .get_mut("reasoning_details")
+            .and_then(|x| x.as_array_mut())
+        {
+            Some(arr) => arr.append(details),
+            None => msg["reasoning_details"] = Value::Array(std::mem::take(details)),
+        }
+    }
+    if !text.is_empty() {
+        match msg
+            .get("reasoning_content")
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+        {
+            Some(mut combined) => {
+                combined.push_str(text);
+                msg["reasoning_content"] = json!(combined);
+                text.clear();
+            }
+            None => msg["reasoning_content"] = json!(std::mem::take(text)),
+        }
+    }
+}
+
+/// A reasoning item only belongs to the assistant turn that follows it.
+/// Without one it would become an orphan assistant message, which changes
+/// the reconstructed history.
+fn attach_pending_to_last_assistant(
+    messages: &mut [Value],
+    details: &mut Vec<Value>,
+    text: &mut String,
+) {
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            attach_pending_reasoning(last, details, text);
+            return;
+        }
+    }
+    details.clear();
+    text.clear();
+}
+
 pub fn responses_to_chat_request(req: &Value) -> Value {
     let mut messages: Vec<Value> = vec![];
-    let mut pending_reasoning = String::new();
+    let mut pending_details: Vec<Value> = vec![];
+    let mut pending_text = String::new();
 
     if let Some(inst) = req.get("instructions").and_then(|x| x.as_str()) {
         if !inst.is_empty() {
@@ -684,18 +993,10 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
         }
     }
 
-    let flush_reasoning = |messages: &mut Vec<Value>, pending: &mut String| {
-        if !pending.is_empty() {
-            messages.push(
-                json!({"role": "assistant", "content": "", "reasoning_content": pending.clone()}),
-            );
-            pending.clear();
-        }
-    };
-
     match req.get("input") {
         Some(Value::String(s)) => {
-            flush_reasoning(&mut messages, &mut pending_reasoning);
+            pending_details.clear();
+            pending_text.clear();
             messages.push(json!({"role": "user", "content": s}));
         }
         Some(Value::Array(items)) => {
@@ -706,18 +1007,24 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
                         let c = it.get("content").unwrap_or(&Value::Null);
                         if role == "assistant" {
                             let mut msg = json!({"role": "assistant", "content": content_text(c)});
-                            if !pending_reasoning.is_empty() {
-                                msg["reasoning_content"] = json!(pending_reasoning.clone());
-                                pending_reasoning.clear();
-                            }
+                            attach_pending_reasoning(
+                                &mut msg,
+                                &mut pending_details,
+                                &mut pending_text,
+                            );
                             messages.push(msg);
                         } else if role == "system" || role == "developer" {
+                            pending_details.clear();
+                            pending_text.clear();
                             let text = content_text(c);
                             if !text.is_empty() {
                                 messages.push(json!({"role": "system", "content": text}));
                             }
                         } else {
-                            flush_reasoning(&mut messages, &mut pending_reasoning);
+                            // Reasoning with no assistant turn is not replayable
+                            // and must not become a synthetic assistant message.
+                            pending_details.clear();
+                            pending_text.clear();
                             let parts = responses_content_to_chat_parts(c);
                             if !parts.is_empty() {
                                 messages.push(json!({"role": "user", "content": parts}));
@@ -732,9 +1039,28 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
                             .unwrap_or("");
                         let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
                         let args = it.get("arguments").and_then(|x| x.as_str()).unwrap_or("{}");
+                        let has_pending = !pending_details.is_empty() || !pending_text.is_empty();
+                        if has_pending {
+                            // The reasoning belongs to *this* call. Keep it in
+                            // its own assistant message so interleaved
+                            // reasoning/function_call sequences survive the
+                            // round trip instead of overwriting each other.
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": Value::Null,
+                                "tool_calls": []
+                            }));
+                        }
                         push_chat_tool_call(&mut messages, call_id, name, args);
+                        attach_pending_to_last_assistant(
+                            &mut messages,
+                            &mut pending_details,
+                            &mut pending_text,
+                        );
                     }
                     "function_call_output" => {
+                        pending_details.clear();
+                        pending_text.clear();
                         let call_id = it.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
                         let output = it.get("output").cloned().unwrap_or(json!(""));
                         messages.push(json!({
@@ -743,6 +1069,7 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
                         }));
                     }
                     "reasoning" => {
+                        let mut text = String::new();
                         for s in it
                             .get("summary")
                             .and_then(|x| x.as_array())
@@ -750,7 +1077,7 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
                             .flatten()
                         {
                             if let Some(t) = s.get("text").and_then(|x| x.as_str()) {
-                                pending_reasoning.push_str(t);
+                                text.push_str(t);
                             }
                         }
                         for s in it
@@ -760,8 +1087,42 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
                             .flatten()
                         {
                             if let Some(t) = s.get("text").and_then(|x| x.as_str()) {
-                                pending_reasoning.push_str(t);
+                                text.push_str(t);
                             }
+                        }
+                        if !text.is_empty() {
+                            pending_text.push_str(&text);
+                        }
+                        let id = it
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .filter(|s| !s.is_empty());
+                        if let Some(enc) = it
+                            .get("encrypted_content")
+                            .and_then(|x| x.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut detail = if let Some(data) = unwrap_redacted(enc) {
+                                json!({"type": "redacted_thinking", "data": data})
+                            } else {
+                                json!({
+                                    "type": "thinking",
+                                    "thinking": text,
+                                    "signature": wrap_openai_blob(enc)
+                                })
+                            };
+                            if let Some(id) = id {
+                                detail["id"] = json!(id);
+                            }
+                            pending_details.push(detail);
+                        } else if !text.is_empty() {
+                            // Summary-only history: keep the visible text for
+                            // Chat upstreams, but it has no replayable blob.
+                            let mut detail = json!({"type": "thinking", "thinking": text});
+                            if let Some(id) = id {
+                                detail["id"] = json!(id);
+                            }
+                            pending_details.push(detail);
                         }
                     }
                     _ => {}
@@ -770,7 +1131,9 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
         }
         _ => {}
     }
-    flush_reasoning(&mut messages, &mut pending_reasoning);
+    // Leftover reasoning at the end has no assistant turn to attach to.
+    pending_details.clear();
+    pending_text.clear();
 
     let mut out = json!({
         "model": req.get("model").cloned().unwrap_or(json!("")),
@@ -807,17 +1170,26 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
     }
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         if !tools.is_empty() {
+            // Responses tools are flat, and built-ins like `web_search`
+            // carry no name. Chat has no equivalent for those, and emitting
+            // an empty function name is a hard 400 upstream.
             let ot: Vec<Value> = tools
                 .iter()
-                .map(|t| {
-                    json!({"type":"function","function":{
-                        "name": t.get("name").cloned().unwrap_or(json!("")),
+                .filter_map(|t| {
+                    let name = t
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())?;
+                    Some(json!({"type":"function","function":{
+                        "name": name,
                         "description": t.get("description").cloned().unwrap_or(json!("")),
                         "parameters": t.get("parameters").cloned().unwrap_or(json!({"type":"object"}))
-                    }})
+                    }}))
                 })
                 .collect();
-            out["tools"] = Value::Array(ot);
+            if !ot.is_empty() {
+                out["tools"] = Value::Array(ot);
+            }
         }
     }
     if let Some(tc) = req.get("tool_choice") {
@@ -854,6 +1226,55 @@ pub fn responses_to_chat_request(req: &Value) -> Value {
     out
 }
 
+/// Canonical reasoning detail -> Responses *output* item.
+///
+/// Unlike the input helper this keeps the provenance envelope in
+/// `encrypted_content`: the client only echoes it back, and the upstream
+/// request path is where a foreign blob is filtered out.
+pub fn reasoning_detail_to_responses_output(d: &Value) -> Option<Value> {
+    let d = normalize_reasoning_detail(d)?;
+    let id = reasoning_id(&d)
+        .map(str::to_string)
+        .unwrap_or_else(|| gen_id("rs_"));
+    match reasoning_kind(&d)? {
+        ReasoningKind::Thinking => {
+            let text = reasoning_text(&d);
+            let sig = d
+                .get("signature")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty());
+            if sig.is_none() && text.is_empty() {
+                return None;
+            }
+            let mut item = json!({
+                "id": id,
+                "type": "reasoning",
+                "summary": if text.is_empty() {
+                    json!([])
+                } else {
+                    json!([{"type": "summary_text", "text": text}])
+                }
+            });
+            if let Some(sig) = sig {
+                item["encrypted_content"] = json!(normalize_reasoning_signature(sig));
+            }
+            Some(item)
+        }
+        ReasoningKind::Redacted => {
+            let data = d
+                .get("data")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())?;
+            Some(json!({
+                "id": id,
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": wrap_redacted(data)
+            }))
+        }
+    }
+}
+
 /// Chat completion -> Responses API response object.
 pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
     let msg = chat
@@ -862,16 +1283,31 @@ pub fn chat_to_responses_response(chat: &Value, model: &str) -> Value {
         .unwrap_or(json!({}));
     let mut output: Vec<Value> = vec![];
 
-    let reasoning = msg
-        .get("reasoning_content")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    if !reasoning.is_empty() {
-        output.push(json!({
-            "id": gen_id("rs_"),
-            "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning}]
-        }));
+    let mut emitted_reasoning = false;
+    if let Some(details) = msg.get("reasoning_details").and_then(|x| x.as_array()) {
+        for d in details {
+            if let Some(item) = reasoning_detail_to_responses_output(d) {
+                output.push(item);
+                emitted_reasoning = true;
+            }
+        }
+    }
+    // Fallback for a Chat upstream that only produced visible text. It has no
+    // replayable blob, but the client still sees the summary.
+    if !emitted_reasoning {
+        if let Some(reasoning) = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(|x| x.as_str())
+        {
+            if !reasoning.is_empty() {
+                output.push(json!({
+                    "id": gen_id("rs_"),
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": reasoning}]
+                }));
+            }
+        }
     }
 
     let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -943,6 +1379,9 @@ pub enum OpenOut {
         index: usize,
         item_id: String,
         text: String,
+        /// Provenance envelope carried into `encrypted_content` when the item
+        /// closes. `None` for summary-only reasoning.
+        signature: Option<String>,
     },
     Message {
         index: usize,
@@ -1017,6 +1456,29 @@ impl ChatToResponsesStream {
         }
     }
 
+    /// Open a reasoning item unless one is already open. An Anthropic
+    /// thinking block with `display: "omitted"` has no text deltas, so the
+    /// item is created here when only its signature arrives.
+    fn ensure_reasoning(&mut self, out: &mut Vec<SseEvent>) {
+        if matches!(self.open, Some(OpenOut::Reasoning { .. })) {
+            return;
+        }
+        self.close_open(out);
+        let index = self.next_index;
+        self.next_index += 1;
+        let item_id = gen_id("rs_");
+        out.push(SseEvent::data(json!({
+            "type": "response.output_item.added", "output_index": index,
+            "item": {"id": item_id, "type": "reasoning", "summary": []}
+        })));
+        self.open = Some(OpenOut::Reasoning {
+            index,
+            item_id,
+            text: String::new(),
+            signature: None,
+        });
+    }
+
     fn terminal(&mut self, ty: &str, status: &str, incomplete: Value, out: &mut Vec<SseEvent>) {
         self.flush_tools(out);
         self.close_open(out);
@@ -1084,19 +1546,31 @@ impl ChatToResponsesStream {
                 index,
                 item_id,
                 text,
+                signature,
             } => {
-                out.push(SseEvent::data(json!({
-                    "type": "response.reasoning_summary_text.done",
-                    "item_id": item_id, "output_index": index, "summary_index": 0, "text": text
-                })));
+                let mut item = json!({
+                    "id": item_id,
+                    "type": "reasoning",
+                    "summary": if text.is_empty() {
+                        json!([])
+                    } else {
+                        json!([{"type": "summary_text", "text": text}])
+                    }
+                });
+                if let Some(sig) = signature {
+                    item["encrypted_content"] = json!(sig);
+                }
+                if !text.is_empty() {
+                    out.push(SseEvent::data(json!({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id, "output_index": index, "summary_index": 0, "text": text
+                    })));
+                }
                 out.push(SseEvent::data(json!({
                     "type": "response.output_item.done", "output_index": index,
-                    "item": {"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": text}]}
+                    "item": item
                 })));
-                self.items.push(json!({
-                    "id": item_id, "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": text}]
-                }));
+                self.items.push(item);
             }
             OpenOut::Message {
                 index,
@@ -1161,29 +1635,20 @@ impl ChatToResponsesStream {
         let choice = ch.pointer("/choices/0").cloned().unwrap_or(json!({}));
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
-        // Reasoning deltas open a reasoning output item.
-        if let Some(t) = delta.get("reasoning_content").and_then(|x| x.as_str()) {
+        // Reasoning deltas open a reasoning output item. OpenRouter also
+        // accepts `reasoning` as an alias of `reasoning_content`.
+        if let Some(t) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(|x| x.as_str())
+        {
             if !t.is_empty() {
-                let needs_open = !matches!(self.open, Some(OpenOut::Reasoning { .. }));
-                if needs_open {
-                    self.close_open(&mut out);
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    let item_id = gen_id("rs_");
-                    out.push(SseEvent::data(json!({
-                        "type": "response.output_item.added", "output_index": index,
-                        "item": {"id": item_id, "type": "reasoning", "summary": []}
-                    })));
-                    self.open = Some(OpenOut::Reasoning {
-                        index,
-                        item_id,
-                        text: String::new(),
-                    });
-                }
+                self.ensure_reasoning(&mut out);
                 if let Some(OpenOut::Reasoning {
                     index,
                     item_id,
                     text,
+                    ..
                 }) = &mut self.open
                 {
                     text.push_str(t);
@@ -1191,6 +1656,51 @@ impl ChatToResponsesStream {
                         "type": "response.reasoning_summary_text.delta",
                         "item_id": item_id, "output_index": index, "summary_index": 0, "delta": t
                     })));
+                }
+            }
+        }
+
+        // A `reasoning_details` delta carries the opaque signature. The item
+        // is closed here so every upstream block becomes exactly one output
+        // item, and an empty-text block still carries its blob.
+        if let Some(details) = delta.get("reasoning_details").and_then(|x| x.as_array()) {
+            for d in details {
+                let Some(d) = normalize_reasoning_detail(d) else {
+                    continue;
+                };
+                match reasoning_kind(&d) {
+                    Some(ReasoningKind::Thinking) => {
+                        let text = reasoning_text(&d);
+                        if !text.is_empty() {
+                            self.ensure_reasoning(&mut out);
+                            if let Some(OpenOut::Reasoning { text: buf, .. }) = &mut self.open {
+                                if buf.is_empty() {
+                                    buf.push_str(text);
+                                }
+                            }
+                        }
+                        if let Some(sig) = d.get("signature").and_then(|x| x.as_str()) {
+                            if !sig.is_empty() {
+                                self.ensure_reasoning(&mut out);
+                                if let Some(OpenOut::Reasoning { signature, .. }) = &mut self.open {
+                                    *signature = Some(normalize_reasoning_signature(sig));
+                                }
+                                self.close_open(&mut out);
+                            }
+                        }
+                    }
+                    Some(ReasoningKind::Redacted) => {
+                        if let Some(data) = d.get("data").and_then(|x| x.as_str()) {
+                            if !data.is_empty() {
+                                self.ensure_reasoning(&mut out);
+                                if let Some(OpenOut::Reasoning { signature, .. }) = &mut self.open {
+                                    *signature = Some(wrap_redacted(data));
+                                }
+                                self.close_open(&mut out);
+                            }
+                        }
+                    }
+                    None => {}
                 }
             }
         }

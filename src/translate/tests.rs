@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
-use crate::config::ThinkingMode;
 use super::*;
+use crate::config::ThinkingMode;
 
 fn types(events: &[SseEvent]) -> Vec<String> {
     events
@@ -442,6 +442,16 @@ fn chat_to_anthropic_stream_emits_event_names() {
     let mut s = ChatToAnthropicStream::new("m");
     let mut events: Vec<SseEvent> = vec![];
     events.extend(s.handle(&chunk("i", "m", json!({"reasoning_content": "hmm"}), None)));
+    // The signature is what makes the thinking block replayable; without it
+    // the buffered text is dropped.
+    events.extend(s.handle(&chunk(
+        "i",
+        "m",
+        json!({"reasoning_details": [
+            {"type": "thinking", "thinking": "", "signature": "nv1:a:sig"}
+        ]}),
+        None,
+    )));
     events.extend(s.handle(&chunk("i", "m", json!({"content": "hi"}), None)));
     events.extend(s.handle(&chunk(
         "i",
@@ -465,26 +475,42 @@ fn chat_to_anthropic_stream_emits_event_names() {
     assert_eq!(names[0], "message_start");
     assert_eq!(names[1], "content_block_start"); // thinking
     assert_eq!(names[2], "content_block_delta"); // thinking_delta
-    assert_eq!(names[3], "content_block_stop");
-    assert_eq!(names[4], "content_block_start"); // text
-    assert_eq!(names[5], "content_block_delta"); // text_delta
-    assert_eq!(names[6], "content_block_stop");
-    assert_eq!(names[7], "content_block_start"); // tool_use
-    assert_eq!(names[8], "content_block_delta"); // input_json_delta
-    assert_eq!(names[9], "content_block_stop");
-    assert_eq!(names[10], "message_delta");
-    assert_eq!(names[11], "message_stop");
+    assert_eq!(names[3], "content_block_delta"); // signature_delta
+    assert_eq!(names[4], "content_block_stop");
+    assert_eq!(names[5], "content_block_start"); // text
+    assert_eq!(names[6], "content_block_delta"); // text_delta
+    assert_eq!(names[7], "content_block_stop");
+    assert_eq!(names[8], "content_block_start"); // tool_use
+    assert_eq!(names[9], "content_block_delta"); // input_json_delta
+    assert_eq!(names[10], "content_block_stop");
+    assert_eq!(names[11], "message_delta");
+    assert_eq!(names[12], "message_stop");
 
-    let delta = &events[8].data;
+    assert_eq!(events[3].data["delta"]["type"], "signature_delta");
+    assert_eq!(events[3].data["delta"]["signature"], "sig");
+    let delta = &events[9].data;
     assert_eq!(delta["delta"]["type"], "input_json_delta");
     assert_eq!(delta["delta"]["partial_json"], "{\"a\":1}");
-    let msg_delta = &events[10].data;
+    let msg_delta = &events[11].data;
     assert_eq!(msg_delta["delta"]["stop_reason"], "tool_use");
     // prompt_tokens 3 includes 1 cached read, so Anthropic's
     // input_tokens is 2 and the read is reported separately.
     assert_eq!(msg_delta["usage"]["input_tokens"], 2);
     assert_eq!(msg_delta["usage"]["cache_read_input_tokens"], 1);
     assert_eq!(msg_delta["usage"]["output_tokens"], 4);
+}
+
+#[test]
+fn unsigned_reasoning_is_dropped_on_anthropic_stream_egress() {
+    let mut s = ChatToAnthropicStream::new("m");
+    let mut events = s.handle(&chunk("i", "m", json!({"reasoning_content": "hmm"}), None));
+    events.extend(s.handle(&chunk("i", "m", json!({"content": "hi"}), None)));
+    let names: Vec<&str> = events.iter().map(|e| e.event.as_deref().unwrap()).collect();
+    assert!(names.contains(&"content_block_start"));
+    assert!(events
+        .iter()
+        .filter(|e| e.event.as_deref() == Some("content_block_start"))
+        .all(|e| e.data["content_block"]["type"] != "thinking"));
 }
 
 // ---- anthropic ingress -----------------------------------------------
@@ -1133,6 +1159,9 @@ fn chat_to_anthropic_response_with_thinking_and_tools() {
             "role": "assistant",
             "content": "calling",
             "reasoning_content": "hmm",
+            "reasoning_details": [
+                {"type": "thinking", "thinking": "hmm", "signature": "nv1:a:sig"}
+            ],
             "tool_calls": [{"id": "c1", "type": "function",
                 "function": {"name": "f", "arguments": "{\"x\":1}"}}]
         }}],
@@ -1146,10 +1175,26 @@ fn chat_to_anthropic_response_with_thinking_and_tools() {
     let blocks = out["content"].as_array().unwrap();
     assert_eq!(blocks[0]["type"], "thinking");
     assert_eq!(blocks[0]["thinking"], "hmm");
+    assert_eq!(blocks[0]["signature"], "sig");
     assert_eq!(blocks[1]["type"], "text");
     assert_eq!(blocks[2]["type"], "tool_use");
     assert_eq!(blocks[2]["input"], json!({"x": 1}));
     assert_eq!(out["usage"]["cache_read_input_tokens"], json!(1));
+}
+
+#[test]
+fn unsigned_reasoning_is_not_replayed_as_a_thinking_block() {
+    // Anthropic rejects `signature: ""`; dropping the block is the documented
+    // safe degradation.
+    let chat = json!({
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "hi", "reasoning_content": "hmm"
+        }}]
+    });
+    let out = chat_to_anthropic_response(&chat, "m");
+    let blocks = out["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["type"], "text");
 }
 
 // ---- responses upstream -> chat --------------------------------------
@@ -1211,7 +1256,10 @@ fn chat_to_responses_request_maps_params_and_passthrough() {
     assert_eq!(out["instructions"], json!("sys"));
     assert_eq!(out["max_output_tokens"], json!(9));
     assert_eq!(out["top_p"], json!(0.8));
-    assert_eq!(out["reasoning"], json!({"effort": "low"}));
+    assert_eq!(
+        out["reasoning"],
+        json!({"effort": "low", "summary": "auto"})
+    );
     assert_eq!(out["text"], json!({"format": {"type": "json_object"}}));
     assert_eq!(out["tool_choice"], json!({"type": "function", "name": "f"}));
     assert_eq!(out["store"], json!(false));
@@ -1287,4 +1335,763 @@ fn reasoning_output_stream_closes_on_finish_without_content() {
         c2.pointer("/choices/0/delta/content").unwrap(),
         "\n</think>\n"
     );
+}
+
+// ---- reasoning provenance round trips --------------------------------
+
+#[test]
+fn anthropic_signature_round_trips_through_a_responses_client() {
+    // alpha: Anthropic upstream -> Responses client -> Anthropic upstream.
+    let up = json!({
+        "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig-abc"},
+            {"type": "text", "text": "hi"}
+        ],
+        "stop_reason": "end_turn"
+    });
+    let chat = anthropic_to_openai(&up, "m");
+    let responses = chat_to_responses_response(&chat, "m");
+    let reasoning = responses["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item")
+        .clone();
+    assert_eq!(reasoning["encrypted_content"], "nv1:a:sig-abc");
+    assert_eq!(reasoning["summary"][0]["text"], "plan");
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            reasoning,
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let chat_req = responses_to_chat_request(&follow);
+    let anth = openai_to_anthropic(&chat_req, ThinkingMode::Adaptive);
+    let blocks = anth["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "plan");
+    assert_eq!(blocks[0]["signature"], "sig-abc");
+}
+
+#[test]
+fn redacted_thinking_round_trips_through_a_responses_client() {
+    let up = json!({
+        "content": [
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "hi"}
+        ],
+        "stop_reason": "end_turn"
+    });
+    let chat = anthropic_to_openai(&up, "m");
+    let responses = chat_to_responses_response(&chat, "m");
+    let reasoning = responses["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item")
+        .clone();
+    assert_eq!(reasoning["encrypted_content"], "nv1:r:opaque");
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            reasoning,
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let chat_req = responses_to_chat_request(&follow);
+    let anth = openai_to_anthropic(&chat_req, ThinkingMode::Adaptive);
+    let blocks = anth["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "redacted_thinking");
+    assert_eq!(blocks[0]["data"], "opaque");
+    assert_eq!(blocks[1]["type"], "text");
+}
+
+#[test]
+fn responses_blob_round_trips_through_an_anthropic_client() {
+    // beta: Responses upstream -> Anthropic client -> Responses upstream.
+    let up = json!({
+        "status": "completed",
+        "output": [
+            {"id": "rs_1", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "blob"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}]}
+        ]
+    });
+    let chat = responses_to_openai(&up, "m");
+    let anth = chat_to_anthropic_response(&chat, "m");
+    let thinking = anth["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "thinking")
+        .expect("thinking block")
+        .clone();
+    assert_eq!(thinking["thinking"], "plan");
+    assert_eq!(thinking["signature"], "nv1:o:blob");
+
+    let follow = json!({
+        "model": "m", "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant",
+             "content": [thinking, {"type": "text", "text": "hi"}]},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let chat_req = anthropic_to_chat_request(&follow);
+    let resp_req = chat_to_responses_request(&chat_req);
+    let input = resp_req["input"].as_array().unwrap();
+    let r = input
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item");
+    assert_eq!(r["encrypted_content"], "blob");
+    // Anthropic thinking blocks have no place to store the Responses item
+    // id, so the replay path synthesizes a schema-valid one.
+    assert!(
+        r["id"].as_str().is_some_and(|s| s.starts_with("rs_")),
+        "reasoning input items require an id: {r}"
+    );
+    assert_eq!(resp_req["include"], json!(["reasoning.encrypted_content"]));
+}
+
+#[test]
+fn foreign_provenance_is_not_sent_to_an_upstream() {
+    let chat_req = json!({
+        "model": "m",
+        "messages": [{"role": "assistant", "content": "hi", "reasoning_details": [
+            {"type": "thinking", "thinking": "x", "signature": "nv1:a:sig"}
+        ]}]
+    });
+    let resp_req = chat_to_responses_request(&chat_req);
+    assert!(resp_req["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["type"] != "reasoning"));
+
+    let anth_req = json!({
+        "model": "m",
+        "messages": [{"role": "assistant", "content": "hi", "reasoning_details": [
+            {"type": "thinking", "thinking": "x", "signature": "nv1:o:blob"}
+        ]}]
+    });
+    let out = openai_to_anthropic(&anth_req, ThinkingMode::Adaptive);
+    let blocks = out["messages"][0]["content"].as_array().unwrap();
+    assert!(blocks.iter().all(|b| b["type"] != "thinking"));
+}
+
+#[test]
+fn orphan_reasoning_does_not_become_an_assistant_turn() {
+    let req = json!({
+        "input": [
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "x"}]},
+            {"type": "message", "role": "user", "content": "hi"}
+        ]
+    });
+    let out = responses_to_chat_request(&req);
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn anthropic_stream_forwards_signature_as_reasoning_details() {
+    let mut s = AnthropicStream::new("m");
+    let evs = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+        json!({"type": "content_block_start",
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+        json!({"type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+        json!({"type": "content_block_delta",
+            "delta": {"type": "signature_delta", "signature": "sig-1"}}),
+        json!({"type": "content_block_stop"}),
+        json!({"type": "message_delta",
+            "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+        json!({"type": "message_stop"}),
+    ];
+    let mut chunks = vec![];
+    for ev in &evs {
+        chunks.extend(s.handle(ev));
+    }
+    assert!(chunks
+        .iter()
+        .any(|c| c.pointer("/choices/0/delta/reasoning_content").is_some()));
+    let detail = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/reasoning_details/0"))
+        .expect("signature chunk");
+    assert_eq!(detail["type"], "thinking");
+    assert_eq!(detail["signature"], "nv1:a:sig-1");
+}
+
+#[test]
+fn responses_stream_forwards_encrypted_content_as_reasoning_details() {
+    let mut s = ResponsesStream::new("m");
+    let evs = [
+        json!({"type": "response.output_item.added",
+            "item": {"id": "rs_1", "type": "reasoning"}}),
+        json!({"type": "response.reasoning_summary_text.delta", "delta": "plan"}),
+        json!({"type": "response.output_item.done", "item": {
+            "id": "rs_1", "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "plan"}],
+            "encrypted_content": "blob"
+        }}),
+        json!({"type": "response.output_text.delta", "delta": "hi"}),
+        json!({"type": "response.completed", "response": {"usage": {}}}),
+    ];
+    let mut chunks = vec![];
+    for ev in &evs {
+        chunks.extend(s.handle(ev));
+    }
+    let detail = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/reasoning_details/0"))
+        .expect("blob chunk");
+    assert_eq!(detail["signature"], "nv1:o:blob");
+}
+
+#[test]
+fn responses_stream_egress_attaches_encrypted_content() {
+    let mut s = ChatToResponsesStream::new("m");
+    let mut events = s.handle(&chunk("i", "m", json!({"reasoning_content": "plan"}), None));
+    events.extend(s.handle(&chunk(
+        "i",
+        "m",
+        json!({"reasoning_details": [
+            {"type": "thinking", "thinking": "", "signature": "nv1:a:sig"}
+        ]}),
+        None,
+    )));
+    events.extend(s.handle(&chunk("i", "m", json!({"content": "hi"}), None)));
+    events.extend(s.handle(&chunk("i", "m", json!({}), Some("stop"))));
+
+    let done = events
+        .iter()
+        .find(|e| {
+            e.data["type"] == "response.output_item.done" && e.data["item"]["type"] == "reasoning"
+        })
+        .expect("reasoning item done");
+    assert_eq!(done.data["item"]["summary"][0]["text"], "plan");
+    assert_eq!(done.data["item"]["encrypted_content"], "nv1:a:sig");
+}
+
+#[test]
+fn responses_stream_egress_keeps_a_signature_with_no_visible_text() {
+    let mut s = ChatToResponsesStream::new("m");
+    let mut events = s.handle(&chunk(
+        "i",
+        "m",
+        json!({"reasoning_details": [
+            {"type": "thinking", "thinking": "", "signature": "nv1:a:sig"}
+        ]}),
+        None,
+    ));
+    events.extend(s.handle(&chunk("i", "m", json!({"content": "hi"}), None)));
+    events.extend(s.handle(&chunk("i", "m", json!({}), Some("stop"))));
+
+    let done = events
+        .iter()
+        .find(|e| {
+            e.data["type"] == "response.output_item.done" && e.data["item"]["type"] == "reasoning"
+        })
+        .expect("reasoning item done");
+    assert_eq!(done.data["item"]["summary"], json!([]));
+    assert_eq!(done.data["item"]["encrypted_content"], "nv1:a:sig");
+}
+
+// ---- tools the wire format cannot name --------------------------------
+
+#[test]
+fn responses_nameless_tools_are_dropped() {
+    // Codex sends `{"type":"web_search"}` alongside its function tools. Chat
+    // has no equivalent, and an empty function name is a hard 400 upstream.
+    let req = json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {"type": "function", "name": "exec_command", "description": "run",
+             "parameters": {"type": "object", "properties": {}}},
+            {"type": "web_search"}
+        ]
+    });
+    let out = responses_to_chat_request(&req);
+    let tools = out["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "exec_command");
+}
+
+#[test]
+fn chat_nameless_tools_are_dropped_for_anthropic() {
+    let req = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+        ]
+    });
+    let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+    let tools = out["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "f");
+}
+
+#[test]
+fn all_nameless_tools_leave_no_tools_key() {
+    let req = json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": ""}}]
+    });
+    let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+    assert!(out.get("tools").is_none());
+}
+
+// ---- reasoning ordering, ids and alternate schemas -------------------
+
+#[test]
+fn responses_reasoning_input_keeps_the_original_item_id() {
+    let up = json!({
+        "status": "completed",
+        "output": [
+            {"id": "rs_original", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "blob"},
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}]}
+        ]
+    });
+    let chat = responses_to_openai(&up, "m");
+    let msg = chat.pointer("/choices/0/message").unwrap().clone();
+    assert_eq!(msg["reasoning_details"][0]["id"], "rs_original");
+
+    let req = json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "go"},
+            msg,
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let out = chat_to_responses_request(&req);
+    let reasoning = out["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item");
+    assert_eq!(reasoning["id"], "rs_original");
+    assert_eq!(reasoning["encrypted_content"], "blob");
+}
+
+#[test]
+fn responses_interleaved_reasoning_and_calls_are_not_overwritten() {
+    let req = json!({
+        "model": "m",
+        "input": [
+            {"type": "reasoning", "id": "rs_a",
+             "summary": [{"type": "summary_text", "text": "first"}],
+             "encrypted_content": "nv1:o:a"},
+            {"type": "function_call", "call_id": "c1", "name": "f",
+             "arguments": "{\"n\":1}"},
+            {"type": "reasoning", "id": "rs_b",
+             "summary": [{"type": "summary_text", "text": "second"}],
+             "encrypted_content": "nv1:o:b"},
+            {"type": "function_call", "call_id": "c2", "name": "f",
+             "arguments": "{\"n\":2}"}
+        ]
+    });
+    let chat = responses_to_chat_request(&req);
+    let msgs = chat["messages"].as_array().unwrap();
+    let assistants: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "assistant").collect();
+    assert_eq!(assistants.len(), 2, "each call keeps its own reasoning turn");
+    assert_eq!(assistants[0]["reasoning_details"][0]["thinking"], "first");
+    assert_eq!(assistants[1]["reasoning_details"][0]["thinking"], "second");
+    assert_eq!(assistants[0]["tool_calls"][0]["id"], "c1");
+    assert_eq!(assistants[1]["tool_calls"][0]["id"], "c2");
+
+    let back = chat_to_responses_request(&chat);
+    let input = back["input"].as_array().unwrap();
+    let kinds: Vec<(String, String)> = input
+        .iter()
+        .filter_map(|x| {
+            let ty = x["type"].as_str()?;
+            match ty {
+                "reasoning" => Some((ty.to_string(), x["id"].as_str()?.to_string())),
+                "function_call" => Some((ty.to_string(), x["call_id"].as_str()?.to_string())),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("reasoning".to_string(), "rs_a".to_string()),
+            ("function_call".to_string(), "c1".to_string()),
+            ("reasoning".to_string(), "rs_b".to_string()),
+            ("function_call".to_string(), "c2".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn responses_interleaving_survives_a_chat_round_trip() {
+    let up = json!({
+        "status": "completed",
+        "output": [
+            {"id": "rs_a", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "first"}],
+             "encrypted_content": "a"},
+            {"id": "fc_1", "type": "function_call", "call_id": "c1",
+             "name": "f", "arguments": "{}"},
+            {"id": "rs_b", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "second"}],
+             "encrypted_content": "b"},
+            {"id": "fc_2", "type": "function_call", "call_id": "c2",
+             "name": "f", "arguments": "{}"}
+        ]
+    });
+    let chat = responses_to_openai(&up, "m");
+    let msg = chat.pointer("/choices/0/message").unwrap().clone();
+    assert_eq!(msg["reasoning_details"][0]["tool_calls_before"], 0);
+    assert_eq!(msg["reasoning_details"][1]["tool_calls_before"], 1);
+
+    let req = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "go"}, msg]
+    });
+    let back = chat_to_responses_request(&req);
+    let kinds: Vec<(String, String)> = back["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| {
+            let ty = x["type"].as_str()?;
+            match ty {
+                "reasoning" => Some((ty.to_string(), x["id"].as_str()?.to_string())),
+                "function_call" => Some((ty.to_string(), x["call_id"].as_str()?.to_string())),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("reasoning".to_string(), "rs_a".to_string()),
+            ("function_call".to_string(), "c1".to_string()),
+            ("reasoning".to_string(), "rs_b".to_string()),
+            ("function_call".to_string(), "c2".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn anthropic_interleaved_thinking_and_tools_keep_their_order() {
+    let req = json!({
+        "model": "m", "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "one", "signature": "s1"},
+                {"type": "tool_use", "id": "c1", "name": "f", "input": {}},
+                {"type": "thinking", "thinking": "two", "signature": "s2"},
+                {"type": "tool_use", "id": "c2", "name": "f", "input": {}}
+            ]}
+        ]
+    });
+    let chat = anthropic_to_chat_request(&req);
+    let assistants: Vec<&Value> = chat["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2, "thinking blocks split the turn");
+
+    let out = openai_to_anthropic(&chat, ThinkingMode::Adaptive);
+    let blocks = out["messages"][1]["content"].as_array().unwrap();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| {
+            (
+                b["type"].as_str().unwrap_or(""),
+                b["id"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("thinking", ""),
+            ("tool_use", "c1"),
+            ("thinking", ""),
+            ("tool_use", "c2"),
+        ]
+    );
+    assert_eq!(blocks[0]["signature"], "s1");
+    assert_eq!(blocks[2]["signature"], "s2");
+}
+
+#[test]
+fn anthropic_response_interleaving_survives_a_chat_round_trip() {
+    // A Chat completion is one message, so the egress records each thinking
+    // block's position among the tool calls. The ingress uses it to rebuild
+    // the original block order.
+    let up = json!({
+        "content": [
+            {"type": "thinking", "thinking": "one", "signature": "s1"},
+            {"type": "tool_use", "id": "c1", "name": "f", "input": {}},
+            {"type": "thinking", "thinking": "two", "signature": "s2"},
+            {"type": "tool_use", "id": "c2", "name": "f", "input": {}}
+        ],
+        "stop_reason": "tool_use"
+    });
+    let chat = anthropic_to_openai(&up, "m");
+    let msg = chat.pointer("/choices/0/message").unwrap().clone();
+    assert_eq!(msg["reasoning_details"][1]["tool_calls_before"], 1);
+
+    // Anthropic egress uses the same positions, so a Chat client that
+    // echoes the message sees the original interleaving.
+    let anth = chat_to_anthropic_response(&chat, "m");
+    let blocks = anth["content"].as_array().unwrap();
+    assert_eq!(
+        blocks.iter().map(|b| b["type"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["thinking", "tool_use", "thinking", "tool_use"]
+    );
+
+    let req = json!({
+        "model": "m", "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "go"},
+            msg
+        ]
+    });
+    let out = openai_to_anthropic(&req, ThinkingMode::Adaptive);
+    let blocks = out["messages"][1]["content"].as_array().unwrap();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| {
+            (
+                b["type"].as_str().unwrap_or(""),
+                b["id"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("thinking", ""),
+            ("tool_use", "c1"),
+            ("thinking", ""),
+            ("tool_use", "c2"),
+        ],
+        "interleaved order was regrouped: {blocks:?}"
+    );
+}
+
+#[test]
+fn openrouter_reasoning_details_are_accepted_on_every_egress() {
+    let detail = json!({
+        "type": "reasoning.text",
+        "text": "plan",
+        "signature": "sig",
+        "format": "anthropic-claude-v1"
+    });
+    let chat_req = json!({
+        "model": "m", "messages": [{"role": "assistant", "content": "hi",
+            "reasoning_details": [detail.clone()]}]
+    });
+    let anth = openai_to_anthropic(&chat_req, ThinkingMode::Adaptive);
+    let blocks = anth["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "plan");
+    assert_eq!(blocks[0]["signature"], "sig");
+
+    let openai_detail = json!({
+        "type": "reasoning.text",
+        "text": "plan",
+        "signature": "blob",
+        "format": "openai-responses-v1"
+    });
+    let chat_req = json!({
+        "model": "m", "messages": [{"role": "assistant", "content": "hi",
+            "reasoning_details": [openai_detail]}]
+    });
+    let resp = chat_to_responses_request(&chat_req);
+    let reasoning = resp["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item");
+    assert_eq!(reasoning["encrypted_content"], "blob");
+
+    let chat = json!({
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "hi",
+            "reasoning_details": [detail]
+        }}]
+    });
+    let resp = chat_to_responses_response(&chat, "m");
+    assert_eq!(resp["output"][0]["type"], "reasoning");
+    assert_eq!(resp["output"][0]["summary"][0]["text"], "plan");
+}
+
+#[test]
+fn chat_upstream_reasoning_details_are_stripped_unless_opted_in() {
+    use crate::config::{ModelCfg, Protocol};
+    use crate::upstream::build_body;
+
+    let req = json!({
+        "model": "m",
+        "messages": [{"role": "assistant", "content": "hi", "reasoning_details": [
+            {"type": "thinking", "thinking": "plan", "signature": "nv1:a:sig"}
+        ]}]
+    });
+    let mut m = ModelCfg::discovered(
+        "m".to_string(),
+        Protocol::OpenAiCompatible,
+        "https://openrouter.ai/api/v1".into(),
+    );
+    let body = build_body(&m, &req, false, None, 4096);
+    assert!(body["messages"][0].get("reasoning_details").is_none());
+
+    m.forward_reasoning_details = true;
+    let body = build_body(&m, &req, false, None, 4096);
+    let details = body["messages"][0]["reasoning_details"]
+        .as_array()
+        .expect("details forwarded");
+    assert_eq!(details[0]["type"], "reasoning.text");
+    assert_eq!(details[0]["text"], "plan");
+    assert_eq!(details[0]["signature"], "sig");
+    assert_eq!(details[0]["format"], "anthropic-claude-v1");
+}
+
+#[test]
+fn terminal_only_blob_is_emitted_before_text() {
+    let mut s = ResponsesStream::new("m");
+    let mut chunks = s.handle(&json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning", "summary": []}
+    }));
+    chunks.extend(s.handle(&json!({
+        "type": "response.reasoning_summary_text.delta",
+        "item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "plan"
+    })));
+    chunks.extend(s.handle(&json!({
+        "type": "response.output_item.done", "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning",
+                 "summary": [{"type": "summary_text", "text": "plan"}]}
+    })));
+    chunks.extend(s.handle(&json!({
+        "type": "response.output_text.delta", "item_id": "msg_1",
+        "output_index": 1, "content_index": 0, "delta": "hi"
+    })));
+    chunks.extend(s.handle(&json!({
+        "type": "response.completed",
+        "response": {"usage": {}, "output": [
+            {"id": "rs_1", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "blob"},
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}]}
+        ]}
+    })));
+
+    let blob_at = chunks
+        .iter()
+        .position(|c| c.pointer("/choices/0/delta/reasoning_details/0").is_some())
+        .expect("blob chunk");
+    let text_at = chunks
+        .iter()
+        .position(|c| c.pointer("/choices/0/delta/content").is_some())
+        .expect("content chunk");
+    assert!(
+        blob_at < text_at,
+        "thinking must precede text: {chunks:?}"
+    );
+}
+
+#[test]
+fn truncated_reasoning_stream_releases_held_output() {
+    let mut s = ResponsesStream::new("m");
+    let chunks = s.handle(&json!({
+        "type": "response.output_item.added", "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning"}
+    }));
+    assert!(chunks.is_empty() || chunks.iter().all(|c| c.get("choices").is_some()));
+    let held = s.handle(&json!({
+        "type": "response.output_text.delta", "item_id": "msg_1",
+        "output_index": 1, "content_index": 0, "delta": "hi"
+    }));
+    assert!(
+        held.iter()
+            .all(|c| c.pointer("/choices/0/delta/content").is_none()),
+        "content should be held until the blob or EOF: {held:?}"
+    );
+    let flushed = s.flush();
+    assert!(flushed
+        .iter()
+        .any(|c| c.pointer("/choices/0/delta/content").is_some()));
+}
+
+#[test]
+fn late_signature_does_not_open_a_thinking_block_after_text() {
+    let mut s = ChatToAnthropicStream::new("m");
+    let mut events = s.handle(&chunk("i", "m", json!({"content": "hi"}), None));
+    events.extend(s.handle(&chunk(
+        "i",
+        "m",
+        json!({"reasoning_details": [
+            {"type": "thinking", "thinking": "plan", "signature": "nv1:a:sig"}
+        ]}),
+        None,
+    )));
+    events.extend(s.handle(&chunk("i", "m", json!({}), Some("stop"))));
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.event.as_deref() == Some("content_block_start"))
+            .all(|e| e.data["content_block"]["type"] != "thinking"),
+        "late thinking block would be out of order"
+    );
+}
+
+#[test]
+fn anthropic_signature_chunk_carries_the_block_text() {
+    let mut s = AnthropicStream::new("m");
+    let evs = [
+        json!({"type": "content_block_start",
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+        json!({"type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+        json!({"type": "content_block_delta",
+            "delta": {"type": "signature_delta", "signature": "sig"}}),
+        json!({"type": "content_block_stop"}),
+    ];
+    let mut chunks = vec![];
+    for ev in &evs {
+        chunks.extend(s.handle(ev));
+    }
+    let detail = chunks
+        .iter()
+        .find_map(|c| c.pointer("/choices/0/delta/reasoning_details/0"))
+        .expect("signature detail");
+    assert_eq!(detail["thinking"], "hmm");
+    assert_eq!(detail["signature"], "nv1:a:sig");
 }

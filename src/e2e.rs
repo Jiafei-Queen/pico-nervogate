@@ -121,6 +121,18 @@ enum Upstream {
         queue: Arc<Mutex<VecDeque<Value>>>,
         seen: Arc<Mutex<Vec<Value>>>,
     },
+    /// Answer with a fixed body when non-streaming and fixed raw SSE frames
+    /// when streaming, recording each inbound request. Used by reasoning
+    /// round-trip tests whose responses carry blocks the generic `Speak`
+    /// fixture does not produce.
+    Frames {
+        body: Value,
+        frames: Vec<String>,
+        seen: Arc<Mutex<Vec<Value>>>,
+        /// Return a 400 with this message on the first request, then the
+        /// normal body. Exercises the one-shot reasoning-strip fallback.
+        fail_first: Option<String>,
+    },
 }
 
 /// A mock upstream listening on an ephemeral port.
@@ -167,6 +179,65 @@ impl Mock {
         let m: ModelCfg = crate::config::test_model("m", protocol, &self.base);
         test_state(crate::state::config_for(&self.base, vec![m]))
     }
+}
+
+/// Reject a retry that still carries a reasoning block or an empty assistant
+/// turn. Without this the fixture would accept any retry body, hiding the
+/// very bug the fallback is meant to fix.
+fn retry_rejection(req: &Value) -> Option<String> {
+    if let Some(items) = req.get("input").and_then(|x| x.as_array()) {
+        if items
+            .iter()
+            .any(|it| it.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+        {
+            return Some("retry still contains a reasoning item".into());
+        }
+    }
+    if let Some(msgs) = req.get("messages").and_then(|x| x.as_array()) {
+        for m in msgs {
+            if let Some(details) = m.get("reasoning_details").and_then(|x| x.as_array()) {
+                if !details.is_empty() {
+                    return Some("retry still contains reasoning_details".into());
+                }
+            }
+            if m.get("reasoning_content")
+                .and_then(|x| x.as_str())
+                .is_some_and(|s| !s.is_empty())
+                || m.get("reasoning")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty())
+            {
+                return Some("retry still contains reasoning text".into());
+            }
+            if m.get("content")
+                .and_then(|x| x.as_array())
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        matches!(
+                            b.get("type").and_then(|t| t.as_str()),
+                            Some("thinking") | Some("redacted_thinking")
+                        )
+                    })
+                })
+            {
+                return Some("retry still contains a thinking block".into());
+            }
+            if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                match m.get("content") {
+                    Some(Value::Array(a)) if a.is_empty() => {
+                        return Some("retry left an empty assistant content array".into());
+                    }
+                    Some(Value::String(s))
+                        if s.is_empty() && m.get("tool_calls").is_none() =>
+                    {
+                        return Some("retry left an empty assistant message".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
 }
 
 fn respond(kind: &Upstream, req: &Value, stream_override: Option<bool>) -> Response {
@@ -236,6 +307,43 @@ fn respond(kind: &Upstream, req: &Value, stream_override: Option<bool>) -> Respo
                         json(StatusCode::OK, &completion(*proto, ANSWER))
                     }
                 }
+            }
+        }
+        Upstream::Frames {
+            body,
+            frames,
+            seen,
+            fail_first,
+        } => {
+            let n = {
+                let mut s = seen.lock().unwrap();
+                s.push(req.clone());
+                s.len()
+            };
+            if let Some(msg) = fail_first {
+                if n == 1 {
+                    return json(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": {
+                            "type": "invalid_request_error",
+                            "message": msg
+                        }}),
+                    );
+                }
+                if let Some(violation) = retry_rejection(req) {
+                    return json(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": {
+                            "type": "invalid_request_error",
+                            "message": format!("mock strict retry: {violation}")
+                        }}),
+                    );
+                }
+            }
+            if wants_stream {
+                sse(frames)
+            } else {
+                json(StatusCode::OK, body)
             }
         }
         Upstream::Truncated(p) => {
@@ -653,6 +761,23 @@ fn new_scripted(proto: Protocol, steps: Vec<Value>) -> (Upstream, Arc<Mutex<Vec<
     let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     (
         Upstream::Scripted { proto, queue: Arc::clone(&queue), seen: Arc::clone(&seen) },
+        seen,
+    )
+}
+
+fn new_frames(
+    body: Value,
+    frames: Vec<String>,
+    fail_first: Option<String>,
+) -> (Upstream, Arc<Mutex<Vec<Value>>>) {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    (
+        Upstream::Frames {
+            body,
+            frames,
+            seen: Arc::clone(&seen),
+            fail_first,
+        },
         seen,
     )
 }
@@ -2067,5 +2192,683 @@ async fn google_streaming_empty_400_becomes_a_readable_gateway_error() {
     assert!(
         v.pointer("/error/message").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()),
         "no readable message in {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D. reasoning provenance: Anthropic `signature` <-> Responses
+//    `encrypted_content`
+// ---------------------------------------------------------------------------
+
+fn anthropic_thinking_completion() -> Value {
+    json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+        "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig-abc"},
+            {"type": "text", "text": ANSWER}
+        ],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 3, "output_tokens": 2}
+    })
+}
+
+fn anthropic_thinking_frames() -> Vec<String> {
+    vec![
+        named(
+            "message_start",
+            json!({"type": "message_start", "message": {
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude", "content": [],
+                "usage": {"input_tokens": 3, "output_tokens": 0}}}),
+        ),
+        named(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+        ),
+        named(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+        ),
+        named(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "sig-abc"}}),
+        ),
+        named(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        named(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "text", "text": ""}}),
+        ),
+        named(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "text_delta", "text": ANSWER}}),
+        ),
+        named(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 1}),
+        ),
+        named(
+            "message_delta",
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                   "usage": {"output_tokens": 2}}),
+        ),
+        named("message_stop", json!({"type": "message_stop"})),
+    ]
+}
+
+fn responses_thinking_completion() -> Value {
+    json!({
+        "id": "resp_1", "object": "response", "created_at": 1, "model": "gpt",
+        "status": "completed",
+        "output": [
+            {"id": "rs_1", "type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "blob-xyz"},
+            {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": ANSWER, "annotations": []}]}
+        ],
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    })
+}
+
+fn responses_thinking_frames() -> Vec<String> {
+    let skeleton = |status: &str| {
+        json!({"id": "resp_1", "object": "response", "created_at": 1,
+               "model": "gpt", "status": status, "output": [],
+               "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}})
+    };
+    let message_done = json!({"id": "msg_1", "type": "message", "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": ANSWER, "annotations": []}]});
+    let mut done = skeleton("completed");
+    done["output"] = json!([
+        {"id": "rs_1", "type": "reasoning",
+         "summary": [{"type": "summary_text", "text": "plan"}],
+         "encrypted_content": "blob-xyz"},
+        message_done
+    ]);
+    vec![
+        plain(json!({"type": "response.created", "response": skeleton("in_progress")})),
+        plain(json!({"type": "response.in_progress", "response": skeleton("in_progress")})),
+        plain(json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}})),
+        plain(json!({"type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "plan"})),
+        plain(json!({"type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning",
+                     "summary": [{"type": "summary_text", "text": "plan"}],
+                     "encrypted_content": "blob-xyz"}})),
+        plain(json!({"type": "response.output_item.added", "output_index": 1,
+            "item": {"id": "msg_1", "type": "message", "role": "assistant",
+                     "status": "in_progress", "content": []}})),
+        plain(json!({"type": "response.content_part.added", "item_id": "msg_1",
+            "output_index": 1, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}})),
+        plain(json!({"type": "response.output_text.delta", "item_id": "msg_1",
+            "output_index": 1, "content_index": 0, "delta": ANSWER})),
+        plain(json!({"type": "response.output_text.done", "item_id": "msg_1",
+            "output_index": 1, "content_index": 0, "text": ANSWER})),
+        plain(json!({"type": "response.content_part.done", "item_id": "msg_1",
+            "output_index": 1, "content_index": 0,
+            "part": {"type": "output_text", "text": ANSWER, "annotations": []}})),
+        plain(json!({"type": "response.output_item.done", "output_index": 1,
+            "item": message_done})),
+        plain(json!({"type": "response.completed", "response": done})),
+    ]
+}
+
+fn reasoning_item(client: Value, body: &Value) -> Value {
+    let items = match client.as_str() {
+        Some("anthropic") => body["content"].as_array(),
+        _ => body["output"].as_array(),
+    }
+    .unwrap_or_else(|| panic!("no content array in {body}"));
+    items
+        .iter()
+        .find(|x| x["type"] == "reasoning" || x["type"] == "thinking")
+        .cloned()
+        .unwrap_or_else(|| panic!("no reasoning block in {body}"))
+}
+
+#[tokio::test]
+async fn anthropic_signature_reaches_a_responses_client_and_comes_back() {
+    let (kind, seen) = new_frames(
+        anthropic_thinking_completion(),
+        anthropic_thinking_frames(),
+        None,
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Anthropic));
+
+    let first = post(
+        router.clone(),
+        "/v1/responses",
+        &json!({"model": "m", "input": [{"type": "message", "role": "user", "content": "go"}]}),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = parse_json("/v1/responses", &text(first).await);
+    let reasoning = reasoning_item(json!("responses"), &body);
+    assert_eq!(reasoning["encrypted_content"], "nv1:a:sig-abc");
+    assert_eq!(reasoning["summary"][0]["text"], "plan");
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            reasoning,
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": ANSWER}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let second = post(router, "/v1/responses", &follow).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let blocks = seen[1]["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "plan");
+    assert_eq!(blocks[0]["signature"], "sig-abc");
+}
+
+#[tokio::test]
+async fn anthropic_signature_streams_to_a_responses_client_and_comes_back() {
+    let (kind, seen) = new_frames(
+        anthropic_thinking_completion(),
+        anthropic_thinking_frames(),
+        None,
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Anthropic));
+
+    let first = post(
+        router.clone(),
+        "/v1/responses",
+        &json!({
+            "model": "m", "stream": true,
+            "input": [{"type": "message", "role": "user", "content": "go"}]
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let events = parse_sse(&text(first).await);
+    let done = events
+        .iter()
+        .filter_map(|(_, d)| serde_json::from_str::<Value>(d).ok())
+        .find(|v| {
+            v["type"] == "response.output_item.done" && v["item"]["type"] == "reasoning"
+        })
+        .expect("reasoning item done");
+    assert_eq!(done["item"]["encrypted_content"], "nv1:a:sig-abc");
+    assert_eq!(done["item"]["summary"][0]["text"], "plan");
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            done["item"].clone(),
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": ANSWER}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let second = post(router, "/v1/responses", &follow).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let seen = seen.lock().unwrap().clone();
+    let blocks = seen[1]["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["signature"], "sig-abc");
+}
+
+#[tokio::test]
+async fn responses_blob_reaches_an_anthropic_client_and_comes_back() {
+    let (kind, seen) = new_frames(
+        responses_thinking_completion(),
+        responses_thinking_frames(),
+        None,
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAi));
+
+    let first = post(
+        router.clone(),
+        "/v1/messages",
+        &json!({
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "go"}]
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = parse_json("/v1/messages", &text(first).await);
+    let thinking = reasoning_item(json!("anthropic"), &body);
+    assert_eq!(thinking["thinking"], "plan");
+    assert_eq!(thinking["signature"], "nv1:o:blob-xyz");
+
+    let follow = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [thinking, {"type": "text", "text": ANSWER}]},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let second = post(router, "/v1/messages", &follow).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let req = &seen[1];
+    let reasoning = req["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item");
+    assert_eq!(reasoning["encrypted_content"], "blob-xyz");
+    // The Anthropic client cannot carry the Responses item id, so the
+    // gateway synthesizes the id the input schema requires.
+    assert!(
+        reasoning["id"].as_str().is_some_and(|s| s.starts_with("rs_")),
+        "reasoning input items require an id: {reasoning}"
+    );
+    assert!(req["include"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "reasoning.encrypted_content"));
+}
+
+#[tokio::test]
+async fn responses_blob_streams_to_an_anthropic_client_and_comes_back() {
+    let (kind, seen) = new_frames(
+        responses_thinking_completion(),
+        responses_thinking_frames(),
+        None,
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAi));
+
+    let first = post(
+        router.clone(),
+        "/v1/messages",
+        &json!({
+            "model": "m", "max_tokens": 64, "stream": true,
+            "messages": [{"role": "user", "content": "go"}]
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let events = parse_sse(&text(first).await);
+    let done = events
+        .iter()
+        .filter_map(|(_, d)| serde_json::from_str::<Value>(d).ok())
+        .find(|v| {
+            v["type"] == "content_block_start" && v["content_block"]["type"] == "thinking"
+        })
+        .expect("thinking block start");
+    assert_eq!(done["content_block"]["signature"], "");
+
+    let signature = events
+        .iter()
+        .filter_map(|(_, d)| serde_json::from_str::<Value>(d).ok())
+        .find(|v| v["type"] == "content_block_delta" && v["delta"]["type"] == "signature_delta")
+        .expect("signature delta");
+    assert_eq!(signature["delta"]["signature"], "nv1:o:blob-xyz");
+
+    let follow = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "nv1:o:blob-xyz"},
+                {"type": "text", "text": ANSWER}
+            ]},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let second = post(router, "/v1/messages", &follow).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let seen = seen.lock().unwrap().clone();
+    let req = &seen[1];
+    let reasoning = req["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["type"] == "reasoning")
+        .expect("reasoning item");
+    assert_eq!(reasoning["encrypted_content"], "blob-xyz");
+}
+
+#[tokio::test]
+async fn chat_reasoning_without_a_signature_is_not_sent_to_an_anthropic_client() {
+    let (kind, _) = new_frames(
+        json!({
+            "id": "x", "object": "chat.completion", "created": 1, "model": "c",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "hi", "reasoning_content": "hmm"
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }),
+        vec![],
+        None,
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAiCompatible));
+    let resp = post(
+        router,
+        "/v1/messages",
+        &json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_json("/v1/messages", &text(resp).await);
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"),
+        "empty-signature thinking block leaked: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_signature_400_is_retried_without_thinking_blocks() {
+    let (kind, seen) = new_frames(
+        anthropic_thinking_completion(),
+        anthropic_thinking_frames(),
+        Some(
+            "messages.1.content.0: Invalid `signature` in `thinking` block".to_string(),
+        ),
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Anthropic));
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "nv1:a:sig-abc"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": ANSWER}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let resp = post(router, "/v1/responses", &follow).await;
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should recover");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "expected exactly one retry");
+    assert!(
+        seen[0]["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["type"] == "thinking"),
+        "first attempt should carry the signature"
+    );
+    assert!(
+        seen[1]["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"),
+        "retry must strip thinking blocks"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_content_400_is_retried_without_reasoning_items() {
+    let (kind, seen) = new_frames(
+        responses_thinking_completion(),
+        responses_thinking_frames(),
+        Some(
+            "The encrypted content could not be verified. \
+             code: invalid_encrypted_content"
+                .to_string(),
+        ),
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAi));
+
+    let follow = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "nv1:o:blob-xyz"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": ANSWER}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let resp = post(router, "/v1/responses", &follow).await;
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should recover");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "expected exactly one retry");
+    assert!(
+        seen[0]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["type"] == "reasoning"),
+        "first attempt should carry the blob"
+    );
+    assert!(
+        seen[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["type"] != "reasoning"),
+        "retry must strip reasoning items"
+    );
+}
+
+#[tokio::test]
+async fn a_native_anthropic_signature_400_is_retried_without_thinking_blocks() {
+    let (kind, seen) = new_frames(
+        anthropic_thinking_completion(),
+        anthropic_thinking_frames(),
+        Some(
+            "messages.1.content.0: Invalid `signature` in `thinking` block".to_string(),
+        ),
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Anthropic));
+
+    let body = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig-abc"},
+                {"type": "text", "text": ANSWER}
+            ]},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let resp = post(router, "/v1/messages", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should recover");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "expected exactly one retry");
+    assert!(seen[0]["messages"][1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == "thinking"));
+    assert!(seen[1]["messages"][1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|b| b["type"] != "thinking"));
+}
+
+#[tokio::test]
+async fn a_native_encrypted_content_400_is_retried_without_reasoning_items() {
+    let (kind, seen) = new_frames(
+        responses_thinking_completion(),
+        responses_thinking_frames(),
+        Some(
+            "The encrypted content could not be verified. \
+             code: invalid_encrypted_content"
+                .to_string(),
+        ),
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAi));
+
+    let body = json!({
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "reasoning", "id": "rs_1",
+             "summary": [{"type": "summary_text", "text": "plan"}],
+             "encrypted_content": "blob-xyz"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": ANSWER}]},
+            {"type": "message", "role": "user", "content": "more"}
+        ]
+    });
+    let resp = post(router, "/v1/responses", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should recover");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "expected exactly one retry");
+    assert!(seen[0]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["type"] == "reasoning"));
+    assert!(seen[1]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["type"] != "reasoning"));
+}
+
+#[tokio::test]
+async fn a_terminal_only_blob_still_orders_thinking_before_text() {
+    let skeleton = |status: &str| {
+        json!({"id": "resp_1", "object": "response", "created_at": 1,
+               "model": "gpt", "status": status, "output": [],
+               "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}})
+    };
+    let message = json!({"id": "msg_1", "type": "message", "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": ANSWER, "annotations": []}]});
+    let mut done = skeleton("completed");
+    done["output"] = json!([
+        {"id": "rs_1", "type": "reasoning",
+         "summary": [{"type": "summary_text", "text": "plan"}],
+         "encrypted_content": "blob-xyz"},
+        message
+    ]);
+    let frames = vec![
+        plain(json!({"type": "response.created", "response": skeleton("in_progress")})),
+        plain(json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}})),
+        plain(json!({"type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "plan"})),
+        // No encrypted_content here: only the terminal object carries it.
+        plain(json!({"type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning",
+                     "summary": [{"type": "summary_text", "text": "plan"}]}})),
+        plain(json!({"type": "response.output_text.delta", "item_id": "msg_1",
+            "output_index": 1, "content_index": 0, "delta": ANSWER})),
+        plain(json!({"type": "response.output_item.done", "output_index": 1,
+            "item": message})),
+        plain(json!({"type": "response.completed", "response": done})),
+    ];
+    let (kind, _) = new_frames(json!({}), frames, None);
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::OpenAi));
+
+    let resp = post(
+        router,
+        "/v1/messages",
+        &json!({
+            "model": "m", "max_tokens": 64, "stream": true,
+            "messages": [{"role": "user", "content": "go"}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events: Vec<Value> = parse_sse(&text(resp).await)
+        .into_iter()
+        .filter_map(|(_, d)| serde_json::from_str::<Value>(&d).ok())
+        .collect();
+    let thinking_at = events
+        .iter()
+        .position(|v| {
+            v["type"] == "content_block_start" && v["content_block"]["type"] == "thinking"
+        })
+        .expect("thinking block");
+    let text_at = events
+        .iter()
+        .position(|v| v["type"] == "content_block_start" && v["content_block"]["type"] == "text")
+        .expect("text block");
+    assert!(
+        thinking_at < text_at,
+        "thinking block must precede text: {events:?}"
+    );
+    assert!(events.iter().any(|v| {
+        v["type"] == "content_block_delta" && v["delta"]["type"] == "signature_delta"
+    }));
+    assert!(events.iter().any(|v| {
+        v["type"] == "content_block_delta"
+            && v["delta"]["type"] == "text_delta"
+            && v["delta"]["text"] == ANSWER
+    }));
+}
+
+#[tokio::test]
+async fn retry_drops_an_assistant_turn_that_held_only_thinking() {
+    let (kind, seen) = new_frames(
+        anthropic_thinking_completion(),
+        anthropic_thinking_frames(),
+        Some("messages.1.content.0: Invalid `signature` in `thinking` block".to_string()),
+    );
+    let mock = Mock::start(kind).await;
+    let router = app(mock.state_with(Protocol::Anthropic));
+
+    let body = json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig-abc"}
+            ]},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let resp = post(router, "/v1/messages", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should recover");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "expected exactly one retry");
+    assert!(
+        seen[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] != "assistant"),
+        "empty assistant turn survived: {}",
+        seen[1]
     );
 }
